@@ -1014,6 +1014,7 @@ fn emit_with_layout(
     storage: Option<&crate::storage::Policy>,
     layout: &crate::snapshot_wire::Layout,
 ) -> LangResult<String> {
+    if narrow && certificate.is_none() {return Err("bounded cache admission requires a source-bound representation entry".into());}
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
     let execution = action_ir.execution()?;
