@@ -428,7 +428,7 @@ impl Emitter<'_> {
                     }
                     let call = format!("self.{prefix}_{}({})", ident(n), values.join(","));
                     let call = if is_change {
-                        format!("match {call} {{value @ Ok(_)=>value,Err(e)=>return Err(e)}}")
+                        format!("transaction::nested_change({call})?")
                     } else {
                         call
                     };
@@ -928,6 +928,9 @@ pub fn emit_with_storage(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
     );
     out.push_str(include_str!("state_native_support.txt"));
+    out.push_str("\nmod transaction {\n");
+    out.push_str(ink_core::TRANSACTION_RUST_SOURCE);
+    out.push_str("\n}\n");
     if storage.is_some() {
         out.push_str("\nmod ordered_storage {\n");
         out.push_str(include_str!("ordered_storage.rs"));
@@ -1341,7 +1344,7 @@ impl Wire for {id} {{
                 "Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})}\n",
             );
         } else {
-            out.push_str("if result.is_err(){self.rollback();return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})}let Some(version)=self.version.checked_add(1) else {self.rollback();return Err(\"commit sequence exhausted\".into())};self.version=version;self.undo.clear();let start=self.outbox.len();self.outbox.extend(self.staged.drain(..).enumerate().map(|(position,data)|Event{commit:version,position:position as u64,data}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
+            out.push_str("let version=match transaction::decide(self.version,result.is_ok()){transaction::Decision::Rollback=>{self.rollback();return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback();return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;self.undo.clear();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }

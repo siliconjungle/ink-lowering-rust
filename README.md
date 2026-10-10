@@ -28,3 +28,8 @@ and access. Compute v2 numeric/vector values remain outside the stateful Wire
 ABI and are rejected explicitly at the state boundary.
 
 `state_native::emit_selected` accepts the shared checked semantic selection witness. Only proved pure helpers are changed; transaction bodies, state declarations and the existing maintenance obligations remain intact.
+
+Stateful emission embeds `ink_core::TRANSACTION_RUST_SOURCE` verbatim for the
+base commit decision, sticky nested-change errors and ordered event coordinates.
+This is shared fixed semantics, not an optimisation or an action-body proof.
+Physical rollback, codecs, payload lowering and Rust/LLVM remain trusted.
