@@ -76,7 +76,14 @@ impl Emitter<'_> {
             },
             Expr::Float(b) => format!("f32::from_bits({b}u32)"),
             Expr::Bool(b) => b.to_string(),
-            Expr::Var(n) => format!("{}.clone()", env.get(n).ok_or("missing binding")?.0),
+            Expr::Var(n) => {
+                let v = &env.get(n).ok_or("missing binding")?.0;
+                if ink_core::local_collections::owned(&t, self.p) {
+                    v.clone()
+                } else {
+                    format!("{v}.clone()")
+                }
+            }
             Expr::Neg(x) => {
                 if let (Type::I32, Expr::Num(2147483648)) = (&t, x.as_ref()) {
                     return Ok("i32::MIN".into());
@@ -137,7 +144,13 @@ impl Emitter<'_> {
                         .find(|(f, _)| f == n)
                         .ok_or("field")?
                         .1;
-                    if crate::state_native::boxed_field(&owner, ft, self.p) {
+                    if ink_core::local_collections::owned(ft, self.p) {
+                        if crate::state_native::boxed_field(&owner, ft, self.p) {
+                            format!("*({x}).l_{n}")
+                        } else {
+                            format!("({x}).l_{n}")
+                        }
+                    } else if crate::state_native::boxed_field(&owner, ft, self.p) {
                         format!("(*({x}).l_{n}).clone()")
                     } else {
                         format!("({x}).l_{n}.clone()")
@@ -198,6 +211,102 @@ impl Emitter<'_> {
                     String::new()
                 };
                 format!("{{let {av}={a};let {bv}={b};if {bv}==0 {overflow} {{{fallback}}} else {{{av} {} {bv}}}}}",if n=="quot_or"{"/"}else{"%"})
+            }
+            Expr::Call(n, args) if n == "length" => {
+                let xs = if let Expr::Var(n) = &args[0] {
+                    env.get(n).ok_or("list binding")?.0.clone()
+                } else {
+                    self.expr(&args[0], env, None)?
+                };
+                format!("({xs}).len() as u32")
+            }
+            Expr::Call(n, args) if n == "repeat_until" => {
+                let limit = self.expr(&args[0], env, Some(&Type::U32))?;
+                let initial = self.expr(&args[1], env, Some(&t))?;
+                let (stopvars, stop) = self.lambda(&args[2], env, &[t.clone()], &Type::Bool)?;
+                let (vs, body) = self.lambda(&args[3], env, &[Type::U32, t.clone()], &t)?;
+                let acc = self.fresh();
+                let bound = self.fresh();
+                let observed = if ink_core::local_collections::owned(&t, self.p) {
+                    format!("&{acc}")
+                } else {
+                    format!("{acc}.clone()")
+                };
+                format!("{{let {bound}={limit};let mut {acc}={initial};for {} in 0..{bound} {{let {}={observed};if {stop} {{break;}}let {}={acc};{acc}={body};}}{acc}}}",vs[0],stopvars[0],vs[1])
+            }
+            Expr::Call(n, args) if n == "buffer" || n == "buffer_fill" => {
+                let Type::Buffer(inner) = &t else {
+                    unreachable!()
+                };
+                if n == "buffer" {
+                    format!(
+                        "OwnedBuffer::new({})",
+                        self.expr(&args[0], env, Some(&Type::List(inner.clone())))?
+                    )
+                } else {
+                    let len = self.expr(&args[0], env, Some(&Type::U32))?;
+                    let value = self.expr(&args[1], env, Some(inner))?;
+                    let lv = self.fresh();
+                    let vv = self.fresh();
+                    format!("{{let {lv}={len};let {vv}={value};OwnedBuffer::new(vec![{vv};{lv} as usize])}}")
+                }
+            }
+            Expr::Method(x, n, args) if matches!(x.as_ref(),Expr::Var(v) if v=="Buffer" || v=="Map") =>
+            {
+                format!(
+                    "{}::new({})",
+                    if matches!(t, Type::Buffer(_)) {
+                        "OwnedBuffer"
+                    } else {
+                        "OwnedMap"
+                    },
+                    if matches!(t, Type::Buffer(_)) {
+                        "vec![]"
+                    } else {
+                        ""
+                    }
+                )
+            }
+            Expr::Method(x, n, args)
+                if matches!(self.infer(x, env, None)?, Type::Buffer(_) | Type::Map(..)) =>
+            {
+                let xt = self.infer(x, env, None)?;
+                let xv = self.expr(x, env, None)?;
+                let (key, value) = match &xt {
+                    Type::Buffer(inner) => (Type::U32, inner.as_ref()),
+                    Type::Map(k, v) => (*k.clone(), v.as_ref()),
+                    _ => unreachable!(),
+                };
+                match n.as_str() {
+                    "len" | "pop" | "freeze" | "keys" | "values" => format!("({xv}).{n}()"),
+                    "at_or" | "get_or" => {
+                        let k = self.expr(&args[0], env, Some(&key))?;
+                        let fallback = self.expr(&args[1], env, Some(value))?;
+                        format!(
+                            "({xv}).get({}{k}).unwrap_or_else(||{fallback})",
+                            if matches!(xt, Type::Map(..)) { "&" } else { "" }
+                        )
+                    }
+                    "set" => {
+                        let k = self.expr(&args[0], env, Some(&key))?;
+                        let v = self.expr(&args[1], env, Some(value))?;
+                        format!("({xv}).set({k},{v})")
+                    }
+                    "swap" => {
+                        let a = self.expr(&args[0], env, Some(&Type::U32))?;
+                        let b = self.expr(&args[1], env, Some(&Type::U32))?;
+                        format!("({xv}).swap({a},{b})")
+                    }
+                    "push" => format!("({xv}).push({})", self.expr(&args[0], env, Some(value))?),
+                    "truncate" => format!(
+                        "({xv}).truncate({})",
+                        self.expr(&args[0], env, Some(&Type::U32))?
+                    ),
+                    "contains" | "remove" => {
+                        format!("({xv}).{n}(&{})", self.expr(&args[0], env, Some(&key))?)
+                    }
+                    _ => return Err("temporary method".into()),
+                }
             }
             Expr::Call(n, args) if n == "repeat" => {
                 let Expr::Num(bound) = args[0] else {
@@ -269,6 +378,15 @@ impl Emitter<'_> {
                         let fallback = self.expr(&args[1], env, Some(&t))?;
                         let list = self.fresh();
                         let i = self.fresh();
+                        let xs = if let Expr::Method(input, _, _) = e {
+                            if let Expr::Var(n) = input.as_ref() {
+                                format!("&{}", env.get(n).ok_or("list binding")?.0)
+                            } else {
+                                xs
+                            }
+                        } else {
+                            xs
+                        };
                         format!("{{let {list}={xs};let {i}={index};match {list}.get({i} as usize){{Some(v)=>v.clone(),None=>{fallback}}}}}")
                     }
                     "sort" => {
