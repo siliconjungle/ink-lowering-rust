@@ -1,7 +1,8 @@
 //! Typed Rust lowering for the checked stateful subset. Generated programs do
 //! not depend on this crate and do not carry an AST or expression evaluator.
+use crate::ownership::{self, Uses};
 use crate::{aggregate, check, syntax::*, LangResult};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 fn ident(s: &str) -> String {
@@ -88,6 +89,15 @@ struct Emitter<'a> {
     plans: BTreeMap<String, aggregate::Plan>,
     bounded: BTreeMap<String, BoundEvidence>,
     serial: usize,
+    /// Lexical ownership state for the action body being emitted.
+    uses: Uses,
+    binders: BTreeMap<String, usize>,
+    /// >0 while an expression is emitted only to learn its type.
+    probe: usize,
+    /// Locals currently holding a shared borrow of a table row.
+    borrowed: BTreeSet<String>,
+    /// Field snapshots taken when a borrowed row had to be released.
+    aliases: BTreeMap<(String, String), String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -191,6 +201,34 @@ impl Emitter<'_> {
             "BigInt"
         }
     }
+    fn movable(&self, n: &str) -> bool {
+        self.binders.get(n) == Some(&1) && !self.borrowed.contains(n)
+    }
+    /// Records one emitted read of local `n`; true when it is the final read
+    /// of the whole local, so the generated code may move it.
+    fn read(&mut self, n: &str) -> bool {
+        if self.probe > 0 {
+            return false;
+        }
+        let Some(left) = self.uses.var.get_mut(n) else {
+            return false;
+        };
+        *left = left.saturating_sub(1);
+        *left == 0 && self.movable(n)
+    }
+    fn reset_ownership(&mut self, params: &[(String, Type)], body: &[Statement]) {
+        self.uses = Uses::of_block(self.p, body);
+        self.binders = ownership::binders(params, body);
+        self.probe = 0;
+        self.borrowed.clear();
+        self.aliases.clear();
+    }
+    fn clear_ownership(&mut self) {
+        self.uses = Uses::default();
+        self.binders.clear();
+        self.borrowed.clear();
+        self.aliases.clear();
+    }
     fn fresh(&mut self) -> String {
         self.serial += 1;
         format!("tmp_{}", self.serial)
@@ -218,10 +256,15 @@ impl Emitter<'_> {
             Expr::Unit => ("()".into(), T::Unit),
             Expr::Var(n) => {
                 if let Some(t) = env.get(n) {
-                    (
-                        format!("<{} as Clone>::clone(&{})", ty(t)?, ident(n)),
-                        t.clone(),
-                    )
+                    if self.read(n) {
+                        // Final read of an owned local: move instead of clone.
+                        (ident(n), t.clone())
+                    } else {
+                        (
+                            format!("<{} as Clone>::clone(&{})", ty(t)?, ident(n)),
+                            t.clone(),
+                        )
+                    }
                 } else if n == "None" {
                     (
                         "None".into(),
@@ -238,15 +281,22 @@ impl Emitter<'_> {
                     if self.p.enums.contains_key(n) {
                         return Ok((format!("{}::{}", ident(n), ident(f)), T::Named(n.clone())));
                     }
+                    if let Some(alias) = self.aliases.get(&(n.clone(), f.clone())).cloned() {
+                        return self.expr(&Expr::Var(alias), env, want);
+                    }
                     // Avoid copying an entire record just to access one field.
                     if let Some(T::Named(n)) = env.get(n) {
                         if let Some(fields) = self.p.records.get(n) {
                             if let Some((_, t)) = fields.iter().find(|(s, _)| s == f) {
                                 if let Expr::Var(v) = &**base {
-                                    return Ok((
-                                        format!("{}.{}.clone()", ident(v), ident(f)),
-                                        t.clone(),
-                                    ));
+                                    // The final read of an owned record may move
+                                    // the field out (a partial move).
+                                    let code = if self.read(v) {
+                                        format!("{}.{}", ident(v), ident(f))
+                                    } else {
+                                        format!("{}.{}.clone()", ident(v), ident(f))
+                                    };
+                                    return Ok((code, t.clone()));
                                 }
                             }
                         }
@@ -288,7 +338,10 @@ impl Emitter<'_> {
             Expr::Binary(op, a, b) => {
                 let (mut ac, mut at) = self.expr(a, env, None)?;
                 if matches!(&**a, Expr::Num(_)) {
-                    let (_, bt) = self.expr(b, env, None)?;
+                    self.probe += 1;
+                    let probed = self.expr(b, env, None);
+                    self.probe -= 1;
+                    let (_, bt) = probed?;
                     if matches!(bt, T::U32 | T::Int) {
                         (ac, at) = self.expr(a, env, Some(&bt))?
                     }
@@ -399,7 +452,22 @@ impl Emitter<'_> {
                             T::List(v.clone()),
                         )
                     } else {
-                        let (key, _) = self.expr(&args[0], env, Some(k))?;
+                        // Lookups only need the key by reference.
+                        let borrowed_key = match &args[0] {
+                            Expr::Var(kn)
+                                if matches!(n.as_str(), "get" | "contains")
+                                    && env.get(kn) == Some(k.as_ref())
+                                    && !self.borrowed.contains(kn) =>
+                            {
+                                self.read(kn);
+                                Some(ident(kn))
+                            }
+                            _ => None,
+                        };
+                        let key = match borrowed_key {
+                            Some(key) => key,
+                            None => self.expr(&args[0], env, Some(k))?.0,
+                        };
                         match n.as_str() {
                             "get" => (
                                 format!("self.{field}.get(&({key})).cloned()"),
@@ -418,7 +486,48 @@ impl Emitter<'_> {
                         }
                     }
                 } else {
-                    let (s, t) = self.expr(base, env, None)?;
+                    // A pipeline stage applied directly to stored rows can read
+                    // them by reference instead of cloning every row first.
+                    let mut by_ref = None;
+                    if let Expr::Method(r, m, margs) = base.as_ref() {
+                        if let Expr::Var(root) = r.as_ref() {
+                            if let Some(state) = self.p.states.iter().find(|s| &s.name == root) {
+                                let T::Table(k, v) = &state.ty else {
+                                    unreachable!()
+                                };
+                                match (m.as_str(), margs.as_slice(), n.as_str()) {
+                                    ("values", [], "map" | "filter") => {
+                                        by_ref = Some((
+                                            format!("self.{}.values()", ident(root)),
+                                            T::List(v.clone()),
+                                        ))
+                                    }
+                                    ("get", [key], "map") => {
+                                        let key = match key {
+                                            Expr::Var(kn)
+                                                if env.get(kn) == Some(k.as_ref())
+                                                    && !self.borrowed.contains(kn) =>
+                                            {
+                                                self.read(kn);
+                                                ident(kn)
+                                            }
+                                            _ => self.expr(key, env, Some(k))?.0,
+                                        };
+                                        by_ref = Some((
+                                            format!("self.{}.get(&({key}))", ident(root)),
+                                            T::Option(v.clone()),
+                                        ))
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    let borrowed_rows = by_ref.is_some();
+                    let (s, t) = match by_ref {
+                        Some(found) => found,
+                        None => self.expr(base, env, None)?,
+                    };
                     if n == "ok_or" {
                         let T::Option(inner) = t else {
                             return Err("native ok_or needs Option".into());
@@ -441,10 +550,20 @@ impl Emitter<'_> {
                         let (code, out) = self.expr(b, &local, None)?;
                         let (s, out) = match t {
                             T::List(t) => {
-                                let mapped = format!(
-                                    "({s}).into_iter().{n}(|{}|{{{code}}}).collect::<Vec<_>>()",
-                                    ident(v)
-                                );
+                                let mapped = if !borrowed_rows {
+                                    format!(
+                                        "({s}).into_iter().{n}(|{}|{{{code}}}).collect::<Vec<_>>()",
+                                        ident(v)
+                                    )
+                                } else if n == "filter" {
+                                    // Only the retained rows are cloned.
+                                    format!(
+                                        "{s}.filter(|{}|{{{code}}}).cloned().collect::<Vec<_>>()",
+                                        ident(v)
+                                    )
+                                } else {
+                                    format!("{s}.map(|{}|{{{code}}}).collect::<Vec<_>>()", ident(v))
+                                };
                                 (
                                     mapped,
                                     if n == "filter" {
@@ -476,10 +595,135 @@ impl Emitter<'_> {
         };
         Ok((code, t))
     }
+    /// Ends every live row borrow before a statement that may take `&mut
+    /// self`. A row still read whole is cloned; otherwise only the fields that
+    /// are still read are copied into snapshot locals.
+    fn release_borrows(
+        &mut self,
+        rest: &[Statement],
+        env: &mut Env,
+        out: &mut String,
+    ) -> LangResult<()> {
+        let live: Vec<String> = self
+            .borrowed
+            .iter()
+            .filter(|b| env.contains_key(*b))
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let later = Uses::of_block(self.p, rest);
+        for b in live {
+            self.borrowed.remove(&b);
+            if later.var.get(&b).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let row_ty = env[&b].clone();
+            let fields: Vec<(String, usize)> = later
+                .field
+                .iter()
+                .filter(|((v, _), _)| *v == b)
+                .map(|((_, f), c)| (f.clone(), *c))
+                .collect();
+            let collides = fields
+                .iter()
+                .any(|(f, _)| self.binders.contains_key(&format!("{b}__{f}")));
+            let record = match &row_ty {
+                Type::Named(r) => self.p.records.get(r),
+                _ => None,
+            };
+            if later.whole.get(&b).copied().unwrap_or(0) > 0 || collides || record.is_none() {
+                writeln!(out, "let {0}:{1}=<{1} as Clone>::clone({0});", ident(&b), ty(&row_ty)?)
+                    .unwrap();
+                continue;
+            }
+            for (f, count) in fields {
+                let field_ty = record
+                    .unwrap()
+                    .iter()
+                    .find(|(x, _)| *x == f)
+                    .ok_or("native: unknown field")?
+                    .1
+                    .clone();
+                let alias = format!("{b}__{f}");
+                writeln!(
+                    out,
+                    "let {}:{}={}.{}.clone();",
+                    ident(&alias),
+                    ty(&field_ty)?,
+                    ident(&b),
+                    ident(&f)
+                )
+                .unwrap();
+                env.insert(alias.clone(), field_ty);
+                self.binders.insert(alias.clone(), 1);
+                self.uses.var.insert(alias.clone(), count);
+                self.uses.whole.insert(alias.clone(), count);
+                self.aliases.insert((b.clone(), f), alias);
+            }
+        }
+        Ok(())
+    }
+    /// `let row = T.get(key).ok_or(error)?;` may hold a shared borrow of the
+    /// stored row instead of cloning it, until `release_borrows` ends it.
+    fn borrowed_row<'e>(&self, n: &str, e: &'e Expr) -> Option<(&'e str, &'e Expr, &'e Expr)> {
+        let Expr::Try(inner) = e else { return None };
+        let Expr::Method(base, m, args) = inner.as_ref() else {
+            return None;
+        };
+        let (m, [err]) = (m.as_str(), args.as_slice()) else {
+            return None;
+        };
+        let Expr::Method(root, get, keys) = base.as_ref() else {
+            return None;
+        };
+        let (Expr::Var(r), [key]) = (root.as_ref(), keys.as_slice()) else {
+            return None;
+        };
+        let ok = m == "ok_or"
+            && get == "get"
+            && self.p.states.iter().any(|s| &s.name == r)
+            && self.binders.get(n) == Some(&1)
+            && !ownership::expr_mutates_state(self.p, key)
+            && !ownership::expr_mutates_state(self.p, err);
+        ok.then_some((r.as_str(), key, err))
+    }
     fn block(&mut self, stmts: &[Statement], env: &mut Env, result: &Type) -> LangResult<String> {
         let mut out = String::new();
-        for stmt in stmts {
+        for (i, stmt) in stmts.iter().enumerate() {
+            if ownership::mutates_state(self.p, stmt) {
+                self.release_borrows(&stmts[i..], env, &mut out)?;
+            }
             match stmt {
+                Statement::Let(n, annotation, e) if self.borrowed_row(n, e).is_some() => {
+                    let (root, key, err) = self.borrowed_row(n, e).unwrap();
+                    let state = self.p.states.iter().find(|s| s.name == root).unwrap();
+                    let Type::Table(k, v) = &state.ty else {
+                        unreachable!()
+                    };
+                    if annotation.as_ref().is_some_and(|a| a != v.as_ref()) {
+                        return Err("native: row binding annotation mismatch".into());
+                    }
+                    let key = match key {
+                        Expr::Var(kn) if env.get(kn) == Some(k.as_ref()) && !self.borrowed.contains(kn) => {
+                            self.read(kn);
+                            ident(kn)
+                        }
+                        _ => self.expr(key, env, Some(k))?.0,
+                    };
+                    let (err, _) = self.expr(err, env, None)?;
+                    writeln!(
+                        out,
+                        "let {}:&{}=self.{}.get(&({key})).ok_or({err})?;",
+                        ident(n),
+                        ty(v)?,
+                        ident(root)
+                    )
+                    .unwrap();
+                    env.insert(n.clone(), *v.clone());
+                    self.borrowed.insert(n.clone());
+                }
                 Statement::Let(n, annotation, e) => {
                     let (s, inferred) = self.expr(e, env, annotation.as_ref())?;
                     let t = annotation.as_ref().unwrap_or(&inferred);
@@ -661,6 +905,11 @@ pub fn emit_with_storage(
             BTreeMap::new()
         },
         serial: 0,
+        uses: Uses::default(),
+        binders: BTreeMap::new(),
+        probe: 0,
+        borrowed: BTreeSet::new(),
+        aliases: BTreeMap::new(),
     };
     let mut out = String::from(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
@@ -1070,7 +1319,9 @@ impl Wire for {id} {{
             .collect::<Vec<_>>()
             .join(",");
         let result = ty(&a.result)?;
+        emitter.reset_ownership(&a.params, &a.body);
         let body = emitter.block(&a.body, &mut a.params.iter().cloned().collect(), &a.result)?;
+        emitter.clear_ownership();
         writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}\npub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{let result=self.action_{id}({args});").unwrap();
         if a.kind == ActionKind::Query {
             out.push_str(
