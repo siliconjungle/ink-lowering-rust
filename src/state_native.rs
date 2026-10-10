@@ -1,7 +1,7 @@
 //! Typed Rust lowering for the checked stateful subset. Generated programs do
 //! not depend on this crate and do not carry an AST or expression evaluator.
 use crate::ownership::{self, Uses};
-use crate::{aggregate, check, syntax::*, LangResult};
+use crate::{aggregate, syntax::*, LangResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -88,6 +88,7 @@ fn exact_owned_expression(e: &Expr, owner: &str) -> LangResult<String> {
 }
 struct Emitter<'a> {
     p: &'a Program,
+    execution: &'a ink_core::action_ir::Execution,
     plans: BTreeMap<String, aggregate::Plan>,
     bounded: BTreeMap<String, BoundEvidence>,
     serial: usize,
@@ -236,6 +237,8 @@ impl Emitter<'_> {
         format!("tmp_{}", self.serial)
     }
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, Type)> {
+        let resolved = self.execution.type_of(e).cloned();
+        let want = want.or(resolved.as_ref());
         use Type as T;
         let (code, t) = match e {
             Expr::Float(_) | Expr::Neg(_) | Expr::Let(..) => {
@@ -786,19 +789,22 @@ impl Emitter<'_> {
                     } else {
                         None
                     };
-                    let s = if let Some((root, key)) = discarded_remove {
-                        let Type::Table(k, _) = &root.ty else {
+                    let (s, t) = if let Some((root, key)) = discarded_remove {
+                        let Type::Table(k, v) = &root.ty else {
                             unreachable!()
                         };
                         let (key, _) = self.expr(key, env, Some(k))?;
-                        format!(
-                            "{{let key={key};self.set_{}(key,None,false)}}",
-                            ident(&root.name)
+                        (
+                            format!(
+                                "{{let key={key};self.set_{}(key,None,false)}}",
+                                ident(&root.name)
+                            ),
+                            Type::Option(v.clone()),
                         )
                     } else {
-                        self.expr(e, env, None)?.0
+                        self.expr(e, env, None)?
                     };
-                    writeln!(out, "let _={s};").unwrap();
+                    writeln!(out, "let _:{}={s};", ty(&t)?).unwrap();
                 }
             }
         }
@@ -896,7 +902,9 @@ pub fn emit_with_storage(
     narrow: bool,
     storage: Option<&crate::storage::Policy>,
 ) -> LangResult<String> {
-    check::check(p)?;
+    let module = ink_core::core::CheckedModule::from_source(p.clone())?;
+    let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
+    let execution = action_ir.execution()?;
     if let Some(c) = certificate {
         aggregate::verify(c)?;
     }
@@ -913,6 +921,7 @@ pub fn emit_with_storage(
     };
     let mut emitter = Emitter {
         p,
+        execution: &execution,
         plans,
         bounded: if narrow && certificate.is_some() {
             bounded_caches_with_certificate(p, certificate.unwrap())
@@ -1278,7 +1287,7 @@ impl Wire for {id} {{
         out.push_str("},\n");
     }
     out.push_str("}}self.staged.clear();}\n");
-    for k in &p.keeps {
+    for k in execution.keeps() {
         let body = if emitter.plans.contains_key(&k.name) {
             if emitter.bounded.contains_key(&k.name) {
                 format!("BigInt::from(self.cache_{})", ident(&k.name))
@@ -1312,7 +1321,7 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
-    for a in &p.actions {
+    for a in execution.actions() {
         // A direct bounded keep query admits an allocation-free exact host ABI.
         // The ordinary language/JSON API still returns Int. This extra view is
         // generated from checked structure, never an application name.
