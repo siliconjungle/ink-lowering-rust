@@ -34,3 +34,5 @@ Physical rollback, codecs, payload lowering and Rust/LLVM remain trusted.
 
 Current complete execution coverage, GPU exclusions and integration evidence are documented in the [lowering parity contract](https://github.com/siliconjungle/ink-lang/blob/main/docs/lowering-parity.md).
 Pure compute functions and stateful code can coexist. Full-width values and recursive record fields use native Rust representations without changing Ink types. The runtime adds the portable native/Wasm host ABI.
+
+`state_native::emit_selected` and `emit_selected_with_storage` retain the core-authenticated original checkpoint layout while emitting selected code. Bare Program emission keeps its own namespace. Selected code generation remains trusted; the witness does not verify machine code.

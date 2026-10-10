@@ -908,7 +908,22 @@ pub fn emit_selected(
     selected: &ink_core::optimisation::CheckedSelection,
     certificate: Option<&aggregate::Certificate>,
 ) -> LangResult<String> {
-    emit(selected.module().program(), certificate)
+    emit_selected_with_storage(selected, certificate, false, None)
+}
+pub fn emit_selected_with_storage(
+    selected: &ink_core::optimisation::CheckedSelection,
+    certificate: Option<&aggregate::Certificate>,
+    narrow: bool,
+    storage: Option<&crate::storage::Policy>,
+) -> LangResult<String> {
+    let layout = crate::snapshot::selected_layout(selected)?;
+    emit_with_layout(
+        selected.module().program(),
+        certificate,
+        narrow,
+        storage,
+        &layout,
+    )
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
@@ -953,6 +968,16 @@ pub fn emit_with_storage(
     certificate: Option<&aggregate::Certificate>,
     narrow: bool,
     storage: Option<&crate::storage::Policy>,
+) -> LangResult<String> {
+    let layout = crate::snapshot::layout(p)?;
+    emit_with_layout(p, certificate, narrow, storage, &layout)
+}
+fn emit_with_layout(
+    p: &Program,
+    certificate: Option<&aggregate::Certificate>,
+    narrow: bool,
+    storage: Option<&crate::storage::Policy>,
+    layout: &crate::snapshot_wire::Layout,
 ) -> LangResult<String> {
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
@@ -1002,7 +1027,6 @@ pub fn emit_with_storage(
     out.push_str("\nmod portable {\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
-    let layout = crate::snapshot::layout(p)?;
     writeln!(out,"fn snapshot_layout()->portable::Layout{{portable::Layout{{program:{:?},schema:{:?},roots:vec![",layout.program,layout.schema).unwrap();
     for (n, k, v) in &layout.roots {
         writeln!(
