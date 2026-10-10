@@ -56,6 +56,7 @@ struct Lower<'a> {
     selected: BTreeSet<String>,
     binder: usize,
     nodes: usize,
+    shared: bool,
 }
 pub(crate) fn ty(sort: &Sort) -> LangResult<String> {
     Ok(match sort {
@@ -73,6 +74,13 @@ fn field_sort(sort: &Sort, id: &str) -> Sort {
     }
 }
 impl Lower<'_> {
+    fn storage(&self) -> &'static str {
+        if self.shared {
+            "std::sync::Arc"
+        } else {
+            "Box"
+        }
+    }
     fn fresh(&mut self) -> String {
         let name = format!("v{}", self.binder);
         self.binder += 1;
@@ -252,7 +260,7 @@ impl Lower<'_> {
                 for (t, s) in arguments.iter().zip(&c.fields) {
                     let e = self.expression(t, env, current, depth + 1)?;
                     args.push(if matches!(field_sort(s, datatype), Sort::Data(_)) {
-                        format!("Box::new({})", e.owned())
+                        format!("{}::new({})", self.storage(), e.owned())
                     } else {
                         e.owned()
                     });
@@ -369,7 +377,7 @@ impl Lower<'_> {
                 .map(|s| {
                     let t = ty(s)?;
                     Ok(if matches!(s, Sort::Data(_)) {
-                        format!("Box<{t}>")
+                        format!("{}<{t}>", self.storage())
                     } else {
                         t
                     })
@@ -389,7 +397,7 @@ impl Lower<'_> {
             for (j, s) in sorts.iter().enumerate() {
                 let decoded = decode_value(s, &format!("&arguments[{j}]"));
                 ds.push(if matches!(s, Sort::Data(_)) {
-                    format!("Box::new({decoded})")
+                    format!("{}::new({decoded})", self.storage())
                 } else {
                     decoded
                 });
@@ -445,6 +453,19 @@ pub fn emit_selected(
 }
 /// Only a core-checked witness may enter this backend.
 pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Emission> {
+    lower_with_storage(checked, false)
+}
+/// Pure immutable constructor fields may share storage. Equality and dynamic
+/// transport stay structural; no pointer identity acquires semantic meaning.
+pub(crate) fn lower_shared(
+    checked: &ink_core::definition::CheckedDefinition,
+) -> LangResult<Emission> {
+    lower_with_storage(checked, true)
+}
+fn lower_with_storage(
+    checked: &ink_core::definition::CheckedDefinition,
+    shared: bool,
+) -> LangResult<Emission> {
     let bundle = checked.bundle();
     let exports = checked.exports();
     let choices = checked.choices();
@@ -464,6 +485,7 @@ pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Em
         selected: BTreeSet::new(),
         binder: 0,
         nodes: 0,
+        shared,
     };
     for id in exports {
         if !matches!(lower.declaration(id)?, Declaration::Function { .. }) {
