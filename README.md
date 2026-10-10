@@ -26,3 +26,5 @@ repository identities do not establish correctness.
 Pure helpers support sequential bindings and numeric legacy record construction
 and access. Compute v2 numeric/vector values remain outside the stateful Wire
 ABI and are rejected explicitly at the state boundary.
+
+`state_native::emit_selected` accepts the shared checked semantic selection witness. Only proved pure helpers are changed; transaction bodies, state declarations and the existing maintenance obligations remain intact.

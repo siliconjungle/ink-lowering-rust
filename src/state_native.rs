@@ -599,6 +599,12 @@ impl Emitter<'_> {
     }
 }
 
+pub fn emit_selected(
+    selected: &ink_core::optimisation::CheckedSelection,
+    certificate: Option<&aggregate::Certificate>,
+) -> LangResult<String> {
+    emit(selected.module().program(), certificate)
+}
 pub fn emit(p: &Program, certificate: Option<&aggregate::Certificate>) -> LangResult<String> {
     emit_with_bounds(p, certificate, false)
 }
