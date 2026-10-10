@@ -22,6 +22,8 @@ fn ty(t: &Type) -> LangResult<String> {
         Type::Named(n) if n == "ArithmeticError" => "InkArithmeticError".into(),
         Type::Named(n) => ident(n),
         Type::List(a) => format!("Vec<{}>", ty(a)?),
+        Type::Buffer(a) => format!("OwnedBuffer<{}>", ty(a)?),
+        Type::Map(k, v) => format!("OwnedMap<{},{}>", ty(k)?, ty(v)?),
         Type::Option(a) => format!("Option<{}>", ty(a)?),
         Type::Result(a, b) => format!("Result<{},{}>", ty(a)?, ty(b)?),
         Type::Table(a, b) => format!("BTreeMap<{},{}>", ty(a)?, ty(b)?),
@@ -967,8 +969,12 @@ fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
             .records
             .get(n)
             .is_some_and(|fs| fs.iter().any(|(_, t)| floating(t, p, seen))),
-        Type::List(t) | Type::Vector(t, _) | Type::Option(t) => floating(t, p, seen),
-        Type::Result(a, b) | Type::Table(a, b) => floating(a, p, seen) || floating(b, p, seen),
+        Type::List(t) | Type::Buffer(t) | Type::Vector(t, _) | Type::Option(t) => {
+            floating(t, p, seen)
+        }
+        Type::Result(a, b) | Type::Map(a, b) | Type::Table(a, b) => {
+            floating(a, p, seen) || floating(b, p, seen)
+        }
         _ => false,
     }
 }
@@ -1051,6 +1057,16 @@ fn emit_with_layout(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
     );
     out.push_str(include_str!("state_native_support.txt"));
+    out.push_str("\nmod temporary {\n");
+    out.push_str(include_str!("temporary.rs.txt"));
+    out.push_str("\n}\nuse temporary::{OwnedBuffer,OwnedMap};\n");
+    out.push_str(r#"
+impl<T:Clone> Wire for OwnedBuffer<T>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
+impl<K:Ord+Clone,V:Clone> Wire for OwnedMap<K,V>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
+impl<T:Clone> InkDataEq for OwnedBuffer<T>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
+impl<K:Ord+Clone,V:Clone> InkDataEq for OwnedMap<K,V>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
+"#);
+
     out.push_str("\nmod transaction {\n");
     out.push_str(ink_core::TRANSACTION_RUST_SOURCE);
     out.push_str("\n}\n");
@@ -1456,7 +1472,16 @@ impl Wire for {id} {{
             .join(",");
         writeln!(
             out,
-            "pub fn function_{}(&mut self,{params})->{}{{{body}}}",
+            "{}fn function_{}(&mut self,{params})->{}{{{body}}}",
+            if ink_core::local_collections::owned(&f.result, p)
+                || f.params
+                    .iter()
+                    .any(|(_, t)| ink_core::local_collections::owned(t, p))
+            {
+                ""
+            } else {
+                "pub "
+            },
             ident(&f.name),
             ty(&f.result)?
         )
@@ -1502,6 +1527,19 @@ impl Wire for {id} {{
     }
     out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
     for f in &p.functions {
+        if ink_core::local_collections::owned(&f.result, p)
+            || f.params
+                .iter()
+                .any(|(_, t)| ink_core::local_collections::owned(t, p))
+        {
+            writeln!(
+                out,
+                "{:?}=>Err(\"temporary storage is internal to a pure invocation\".into()),",
+                f.name
+            )
+            .unwrap();
+            continue;
+        }
         write!(
             out,
             "{:?}=>{{if args.len()!={}{{return Err(\"argument count mismatch\".into())}}",
