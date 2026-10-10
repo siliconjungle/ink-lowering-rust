@@ -1,6 +1,6 @@
 # Ink Rust lowering
 
-Rust emission for Ink's current stateful subset and checked first-order database
+Rust emission for Ink's executable pure/stateful language and checked first-order database
 definitions. `definition_native::lower` accepts a core-owned `CheckedDefinition`;
 `machine_native::lower` accepts a core-owned `CheckedMachine`. Neither witness can
 be deserialised or constructed by assigning public fields. Proof checking and
@@ -23,9 +23,7 @@ Part of the personal siliconjungle Ink repositories. The distribution pins this
 repository as a submodule. Core schema/toolchain compatibility must be explicit;
 repository identities do not establish correctness.
 
-Pure helpers support sequential bindings and numeric legacy record construction
-and access. Compute v2 numeric/vector values remain outside the stateful Wire
-ABI and are rejected explicitly at the state boundary.
+Pure helpers support all currently executable compute expressions, including i32/f32, vectors, collections and recursive records. The source checker still restricts numeric/vector types at the state/action boundary; pure compute and stateful declarations can coexist.
 
 `state_native::emit_selected` accepts the shared checked semantic selection witness. Only proved pure helpers are changed; transaction bodies, state declarations and the existing maintenance obligations remain intact.
 
@@ -33,3 +31,6 @@ Stateful emission embeds `ink_core::TRANSACTION_RUST_SOURCE` verbatim for the
 base commit decision, sticky nested-change errors and ordered event coordinates.
 This is shared fixed semantics, not an optimisation or an action-body proof.
 Physical rollback, codecs, payload lowering and Rust/LLVM remain trusted.
+
+Current complete execution coverage, GPU exclusions and integration evidence are documented in the [lowering parity contract](https://github.com/siliconjungle/ink-lang/blob/main/docs/lowering-parity.md).
+Pure compute functions and stateful code can coexist. Full-width values and recursive record fields use native Rust representations without changing Ink types. The runtime adds the portable native/Wasm host ABI.

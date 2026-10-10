@@ -94,3 +94,5 @@ impl Wire for InkArithmeticError {
  fn to_json(&self)->Json{json!("ArithmeticError.Overflow")}
  fn from_json(v:&Json)->Result<Self,String>{if v.as_str()==Some("ArithmeticError.Overflow"){Ok(Self::Overflow)}else{Err("invalid arithmetic error".into())}}
 }
+
+impl<T:Wire> Wire for Box<T> { fn to_json(&self)->Json { (**self).to_json() } fn from_json(v:&Json)->Result<Self,String> { Ok(Box::new(T::from_json(v)?)) } }

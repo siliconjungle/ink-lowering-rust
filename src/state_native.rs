@@ -12,7 +12,7 @@ fn ty(t: &Type) -> LangResult<String> {
     Ok(match t {
         Type::I32 => "i32".into(),
         Type::F32 => "f32".into(),
-        Type::Vector(t,n) => format!("[{};{}]",ty(t)?,n),
+        Type::Vector(t, n) => format!("[{};{}]", ty(t)?, n),
         Type::U64 => "u64".into(),
         Type::U32 => "u32".into(),
         Type::Int => "BigInt".into(),
@@ -28,6 +28,31 @@ fn ty(t: &Type) -> LangResult<String> {
         Type::Unknown => {
             return Err("native state backend needs a resolved type; add an annotation".into())
         }
+    })
+}
+// Box only record fields whose inline representation reaches the enclosing
+// record again. Ink types and JSON shapes remain unchanged.
+pub(crate) fn boxed_field(owner: &str, t: &Type, p: &Program) -> bool {
+    fn reaches(owner: &str, t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
+        match t {
+            Type::Named(n) if n == owner => true,
+            Type::Named(n) if seen.insert(n.clone()) => p
+                .records
+                .get(n)
+                .is_some_and(|fs| fs.iter().any(|(_, t)| reaches(owner, t, p, seen))),
+            Type::Option(t) | Type::Vector(t, _) => reaches(owner, t, p, seen),
+            Type::Result(a, b) => reaches(owner, a, p, seen) || reaches(owner, b, p, seen),
+            _ => false, // Vec and BTreeMap already provide indirection.
+        }
+    }
+    reaches(owner, t, p, &mut BTreeSet::new())
+}
+fn field_ty(owner: &str, t: &Type, p: &Program) -> LangResult<String> {
+    let tname = ty(t)?;
+    Ok(if boxed_field(owner, t, p) {
+        format!("Box<{tname}>")
+    } else {
+        tname
     })
 }
 type Env = BTreeMap<String, Type>;
@@ -319,14 +344,29 @@ impl Emitter<'_> {
                     .ok_or("native: unknown field")?
                     .1
                     .clone();
-                (format!("({b}).{}.clone()", ident(f)), t)
+                (
+                    if boxed_field(&n, &t, self.p) {
+                        format!("(*({b}).{}).clone()", ident(f))
+                    } else {
+                        format!("({b}).{}.clone()", ident(f))
+                    },
+                    t,
+                )
             }
             Expr::Record(n, fs) => {
                 let mut fields = vec![];
                 for (f, e) in fs {
                     let t = &self.p.records[n].iter().find(|(x, _)| x == f).unwrap().1;
                     let (s, _) = self.expr(e, env, Some(t))?;
-                    fields.push(format!("{}:{s}", ident(f)))
+                    fields.push(format!(
+                        "{}:{}",
+                        ident(f),
+                        if boxed_field(n, t, self.p) {
+                            format!("Box::new({s})")
+                        } else {
+                            s
+                        }
+                    ))
                 }
                 (
                     format!("{}{{{}}}", ident(n), fields.join(",")),
@@ -870,6 +910,18 @@ pub fn emit_selected(
 ) -> LangResult<String> {
     emit(selected.module().program(), certificate)
 }
+fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
+    match t {
+        Type::F32 => true,
+        Type::Named(n) if seen.insert(n.clone()) => p
+            .records
+            .get(n)
+            .is_some_and(|fs| fs.iter().any(|(_, t)| floating(t, p, seen))),
+        Type::List(t) | Type::Vector(t, _) | Type::Option(t) => floating(t, p, seen),
+        Type::Result(a, b) | Type::Table(a, b) => floating(a, p, seen) || floating(b, p, seen),
+        _ => false,
+    }
+}
 pub fn emit(p: &Program, certificate: Option<&aggregate::Certificate>) -> LangResult<String> {
     emit_with_bounds(p, certificate, false)
 }
@@ -986,10 +1038,15 @@ impl Wire for {id} {{
         let id = ident(n);
         let fields = fs
             .iter()
-            .map(|(f, t)| Ok(format!("pub {}:{}", ident(f), ty(t)?)))
+            .map(|(f, t)| Ok(format!("pub {}:{}", ident(f), field_ty(n, t, p)?)))
             .collect::<LangResult<Vec<_>>>()?
             .join(",");
-        writeln!(out,"#[derive(Clone,Debug,PartialEq)] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{json!({{").unwrap();
+        let eq = if fs.iter().any(|(_, t)| floating(t, p, &mut BTreeSet::new())) {
+            ""
+        } else {
+            ",Eq"
+        };
+        writeln!(out,"#[derive(Clone,Debug,PartialEq{eq})] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{json!({{").unwrap();
         for (f, _) in fs {
             writeln!(out, "{f:?}:self.{}.to_json(),", ident(f)).unwrap();
         }
@@ -999,7 +1056,7 @@ impl Wire for {id} {{
                 out,
                 "{}:<{} as Wire>::from_json(obj.get({f:?}).ok_or(\"missing field\")?)?,",
                 ident(f),
-                ty(t)?
+                field_ty(n, t, p)?
             )
             .unwrap();
         }
@@ -1361,10 +1418,30 @@ impl Wire for {id} {{
     }
     out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
     for f in &p.functions {
-        write!(out,"{:?}=>{{if args.len()!={}{{return Err(\"argument count mismatch\".into())}}",f.name,f.params.len()).unwrap();
-        let mut argv=vec![];
-        for (i,(_,t)) in f.params.iter().enumerate(){write!(out,"let a{i}=<{} as Wire>::from_json(&args[{i}])?;",ty(t)?).unwrap();argv.push(format!("a{i}"));}
-        writeln!(out,"Ok(self.function_{}({}).to_json())}},",ident(&f.name),argv.join(",")).unwrap();
+        write!(
+            out,
+            "{:?}=>{{if args.len()!={}{{return Err(\"argument count mismatch\".into())}}",
+            f.name,
+            f.params.len()
+        )
+        .unwrap();
+        let mut argv = vec![];
+        for (i, (_, t)) in f.params.iter().enumerate() {
+            write!(
+                out,
+                "let a{i}=<{} as Wire>::from_json(&args[{i}])?;",
+                ty(t)?
+            )
+            .unwrap();
+            argv.push(format!("a{i}"));
+        }
+        writeln!(
+            out,
+            "Ok(self.function_{}({}).to_json())}},",
+            ident(&f.name),
+            argv.join(",")
+        )
+        .unwrap();
     }
     out.push_str("_=>Err(\"unknown function\".into())}}\n");
     out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
