@@ -489,6 +489,12 @@ impl Emitter<'_> {
                     // A pipeline stage applied directly to stored rows can read
                     // them by reference instead of cloning every row first.
                     let mut by_ref = None;
+                    // Generated helpers, queries and derived reads currently
+                    // take &mut self. Such a closure cannot run while the table
+                    // iterator holds a shared borrow; keep the owned baseline.
+                    let closure_borrows_self = args
+                        .iter()
+                        .any(|arg| ownership::expr_mutates_state(self.p, arg));
                     if let Expr::Method(r, m, margs) = base.as_ref() {
                         if let Expr::Var(root) = r.as_ref() {
                             if let Some(state) = self.p.states.iter().find(|s| &s.name == root) {
@@ -496,13 +502,13 @@ impl Emitter<'_> {
                                     unreachable!()
                                 };
                                 match (m.as_str(), margs.as_slice(), n.as_str()) {
-                                    ("values", [], "map" | "filter") => {
+                                    ("values", [], "map" | "filter") if !closure_borrows_self => {
                                         by_ref = Some((
                                             format!("self.{}.values()", ident(root)),
                                             T::List(v.clone()),
                                         ))
                                     }
-                                    ("get", [key], "map") => {
+                                    ("get", [key], "map") if !closure_borrows_self => {
                                         let key = match key {
                                             Expr::Var(kn)
                                                 if env.get(kn) == Some(k.as_ref())
@@ -634,8 +640,13 @@ impl Emitter<'_> {
                 _ => None,
             };
             if later.whole.get(&b).copied().unwrap_or(0) > 0 || collides || record.is_none() {
-                writeln!(out, "let {0}:{1}=<{1} as Clone>::clone({0});", ident(&b), ty(&row_ty)?)
-                    .unwrap();
+                writeln!(
+                    out,
+                    "let {0}:{1}=<{1} as Clone>::clone({0});",
+                    ident(&b),
+                    ty(&row_ty)?
+                )
+                .unwrap();
                 continue;
             }
             for (f, count) in fields {
@@ -706,7 +717,9 @@ impl Emitter<'_> {
                         return Err("native: row binding annotation mismatch".into());
                     }
                     let key = match key {
-                        Expr::Var(kn) if env.get(kn) == Some(k.as_ref()) && !self.borrowed.contains(kn) => {
+                        Expr::Var(kn)
+                            if env.get(kn) == Some(k.as_ref()) && !self.borrowed.contains(kn) =>
+                        {
                             self.read(kn);
                             ident(kn)
                         }
