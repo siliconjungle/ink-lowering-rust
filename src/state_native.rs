@@ -670,14 +670,19 @@ pub fn emit_with_storage(
         writeln!(
             out,
             "({n:?}.into(),{},{}),",
-            crate::snapshot::schema_code(k),
-            crate::snapshot::schema_code(v)
+            crate::snapshot_code::schema_code(k),
+            crate::snapshot_code::schema_code(v)
         )
         .unwrap();
     }
     out.push_str("],events:vec![");
     for (n, t) in &layout.events {
-        writeln!(out, "({n:?}.into(),{}),", crate::snapshot::schema_code(t)).unwrap();
+        writeln!(
+            out,
+            "({n:?}.into(),{}),",
+            crate::snapshot_code::schema_code(t)
+        )
+        .unwrap();
     }
     out.push_str("]}}\n");
     // Nominal IDs remain distinct types even though their native storage is u128.
