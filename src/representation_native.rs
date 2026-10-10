@@ -4,6 +4,14 @@ use ink_core::{
     representation::{CheckedMigration, CheckedRepresentation},
     LangResult,
 };
+fn executable_identity(d: &CheckedDefinition) -> LangResult<String> {
+    ink_core::registry::identity(&(
+        "ink-sealed-executable-v1",
+        d.bundle_sha256(),
+        d.exports(),
+        d.choices(),
+    ))
+}
 /// Compile a bounded set of pinned definitions for transaction-boundary switches.
 /// The generated executor refuses any other definition closure identity.
 pub fn lower(
@@ -31,11 +39,11 @@ pub fn lower(
         let emitted = crate::definition_native::lower(d)?;
         output.push_str(&format!("mod definition_{i} {{\n{}\n}}\n", emitted.source));
     }
-    output.push_str("pub struct Native;\nimpl ink_runtime::representation::Executor for Native {\nfn execute(&self, definition:&ink_core::definition::CheckedDefinition, _context:&ink_core::logic::Context,function:&str,args:Vec<ink_core::logic::Term>)->ink_core::LangResult<ink_core::logic::Term>{\nmatch definition.bundle_sha256(){\n");
+    output.push_str("pub struct Native;\nimpl ink_runtime::representation::Executor for Native {\nfn execute(&self, definition:&ink_core::definition::CheckedDefinition, _context:&ink_core::logic::Context,function:&str,args:Vec<ink_core::logic::Term>)->ink_core::LangResult<ink_core::logic::Term>{\nlet executable=ink_core::registry::identity(&(\"ink-sealed-executable-v1\",definition.bundle_sha256(),definition.exports(),definition.choices()))?;\nmatch executable.as_str(){\n");
     for (i, d) in definitions.iter().enumerate() {
         output.push_str(&format!(
             "{:?}=>{{\nuse definition_{i}::Value;\n",
-            d.bundle_sha256()
+            executable_identity(d)?
         ));
         output.push_str(r#"fn input(t:ink_core::logic::Term,depth:usize)->ink_core::LangResult<Value>{
 if depth>128{return Err("native representation value depth".into());}
