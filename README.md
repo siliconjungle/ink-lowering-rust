@@ -23,7 +23,7 @@ Part of the personal siliconjungle Ink repositories. The distribution pins this
 repository as a submodule. Core schema/toolchain compatibility must be explicit;
 repository identities do not establish correctness.
 
-Pure helpers support all currently executable compute expressions, including i32/f32, vectors, collections and recursive records. The source checker still restricts numeric/vector types at the state/action boundary; pure compute and stateful declarations can coexist.
+Pure helpers support all currently executable compute expressions, including i32/f32, vectors, collections and recursive records. Existing i32/f32 and fixed numerical vectors also cross state/action/keep/event boundaries. Scalar float comparisons use IEEE semantics; aggregate action equality compares stored float bits. Portable checkpoints preserve numerical representations, including NaN payloads and signed zero.
 
 `state_native::emit_selected` accepts the shared checked semantic selection witness. Only proved pure helpers are changed; transaction bodies, state declarations and the existing maintenance obligations remain intact.
 

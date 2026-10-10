@@ -96,3 +96,14 @@ impl Wire for InkArithmeticError {
 }
 
 impl<T:Wire> Wire for Box<T> { fn to_json(&self)->Json { (**self).to_json() } fn from_json(v:&Json)->Result<Self,String> { Ok(Box::new(T::from_json(v)?)) } }
+
+// Structural stored-data identity is separate from scalar IEEE equality.
+trait InkDataEq { fn ink_data_eq(&self,other:&Self)->bool; }
+macro_rules! data_eq {($($t:ty),*)=>{$(impl InkDataEq for $t{fn ink_data_eq(&self,other:&Self)->bool{self==other}})*};}
+data_eq!((),bool,u32,u64,i32,BigInt,String,InkArithmeticError);
+impl InkDataEq for f32{fn ink_data_eq(&self,other:&Self)->bool{self.to_bits()==other.to_bits()}}
+impl<T:InkDataEq> InkDataEq for Box<T>{fn ink_data_eq(&self,other:&Self)->bool{(**self).ink_data_eq(&**other)}}
+impl<T:InkDataEq> InkDataEq for Vec<T>{fn ink_data_eq(&self,other:&Self)->bool{self.len()==other.len()&&self.iter().zip(other).all(|(a,b)|a.ink_data_eq(b))}}
+impl<T:InkDataEq,const N:usize> InkDataEq for [T;N]{fn ink_data_eq(&self,other:&Self)->bool{self.iter().zip(other).all(|(a,b)|a.ink_data_eq(b))}}
+impl<T:InkDataEq> InkDataEq for Option<T>{fn ink_data_eq(&self,other:&Self)->bool{match(self,other){(Some(a),Some(b))=>a.ink_data_eq(b),(None,None)=>true,_=>false}}}
+impl<T:InkDataEq,E:InkDataEq> InkDataEq for Result<T,E>{fn ink_data_eq(&self,other:&Self)->bool{match(self,other){(Ok(a),Ok(b))=>a.ink_data_eq(b),(Err(a),Err(b))=>a.ink_data_eq(b),_=>false}}}

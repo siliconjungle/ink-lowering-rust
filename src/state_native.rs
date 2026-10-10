@@ -266,17 +266,32 @@ impl Emitter<'_> {
         let want = want.or(resolved.as_ref());
         use Type as T;
         let (code, t) = match e {
-            Expr::Float(_) | Expr::Neg(_) | Expr::Let(..) => {
-                return Err("compute expression belongs in a pure function".into())
+            Expr::Float(bits) => (format!("f32::from_bits({bits}u32)"), T::F32),
+            Expr::Neg(value) => {
+                if want == Some(&T::I32) && matches!(value.as_ref(), Expr::Num(2147483648)) {
+                    return Ok(("i32::MIN".into(), T::I32));
+                }
+                let (v, t) = self.expr(value, env, want)?;
+                let code = if t == T::F32 {
+                    format!("f32::from_bits(({v}).to_bits()^0x80000000)")
+                } else if t == T::Int {
+                    format!("-({v})")
+                } else {
+                    format!("({v}).wrapping_neg()")
+                };
+                (code, t)
             }
+            Expr::Let(..) => return Err("compute expression belongs in a pure function".into()),
             Expr::Num(n) => {
                 let t = want
-                    .filter(|t| matches!(t, T::U32 | T::Int))
+                    .filter(|t| matches!(t, T::U32 | T::Int | T::I32 | T::F32))
                     .cloned()
                     .unwrap_or(T::U64);
                 let s = match t {
                     T::Int => format!("BigInt::from({n}u64)"),
                     T::U32 => format!("{n}u32"),
+                    T::I32 => format!("{n}i32"),
+                    T::F32 => format!("f32::from_bits({}u32)", (*n as f32).to_bits()),
                     _ => format!("{n}u64"),
                 };
                 (s, t)
@@ -333,6 +348,13 @@ impl Emitter<'_> {
                     }
                 }
                 let (b, t) = self.expr(base, env, None)?;
+                if let T::Vector(t, _) = t {
+                    let i = ["x", "y", "z", "w"]
+                        .iter()
+                        .position(|s| *s == f)
+                        .ok_or("vector component")?;
+                    return Ok((format!("({b})[{i}].clone()"), *t));
+                }
                 let T::Named(n) = t else {
                     return Err("native field requires record".into());
                 };
@@ -387,13 +409,18 @@ impl Emitter<'_> {
                     let probed = self.expr(b, env, None);
                     self.probe -= 1;
                     let (_, bt) = probed?;
-                    if matches!(bt, T::U32 | T::Int) {
+                    if matches!(bt, T::U32 | T::Int | T::I32 | T::F32) {
                         (ac, at) = self.expr(a, env, Some(&bt))?
                     }
                 }
                 let (bc, _) = self.expr(b, env, Some(&at))?;
                 let arithmetic = ["+", "-", "*"].contains(&op.as_str());
-                let s = if arithmetic && matches!(at, T::U32 | T::U64) {
+                let s = if (op == "==" || op == "!=") && at != T::F32 {
+                    format!(
+                        "{}InkDataEq::ink_data_eq(&({ac}),&({bc}))",
+                        if op == "!=" { "!" } else { "" }
+                    )
+                } else if arithmetic && matches!(at, T::U32 | T::U64 | T::I32) {
                     let method = match op.as_str() {
                         "+" => "wrapping_add",
                         "-" => "wrapping_sub",
@@ -406,6 +433,14 @@ impl Emitter<'_> {
                 (s, if arithmetic { at } else { T::Bool })
             }
             Expr::Call(n, args) => match n.as_str() {
+                "vec2" | "vec3" | "vec4" => {
+                    let t = resolved.as_ref().or(want).ok_or("vector type")?;
+                    let code = args
+                        .iter()
+                        .map(|e| self.expr(e, env, None).map(|(s, _)| s))
+                        .collect::<LangResult<Vec<_>>>()?;
+                    (format!("[{}]", code.join(",")), t.clone())
+                }
                 "Ok" | "Err" | "Some" => {
                     let inner = match (n.as_str(), want) {
                         ("Ok", Some(T::Result(a, _)))
@@ -446,7 +481,7 @@ impl Emitter<'_> {
                         } else {
                             format!("0{}", ty(&t)?)
                         };
-                        let add = if *t == T::Int {
+                        let add = if matches!(*t, T::Int | T::F32) {
                             "a+b"
                         } else {
                             "a.wrapping_add(b)"
@@ -1103,6 +1138,31 @@ impl Wire for {id} {{
             .unwrap();
         }
         out.push_str("_=>Err(\"invalid enum\".into())}}}\n");
+    }
+    for n in p.ids.iter().chain(p.enums.keys()) {
+        writeln!(
+            out,
+            "impl InkDataEq for {} {{fn ink_data_eq(&self,other:&Self)->bool{{self==other}}}}",
+            ident(n)
+        )
+        .unwrap();
+    }
+    for (n, fields) in &p.records {
+        let comparisons = fields
+            .iter()
+            .map(|(f, _)| format!("self.{}.ink_data_eq(&other.{})", ident(f), ident(f)))
+            .collect::<Vec<_>>();
+        writeln!(
+            out,
+            "impl InkDataEq for {} {{fn ink_data_eq(&self,other:&Self)->bool{{{}}}}}",
+            ident(n),
+            if comparisons.is_empty() {
+                "true".into()
+            } else {
+                comparisons.join("&&")
+            }
+        )
+        .unwrap();
     }
     out.push_str("#[derive(Clone,Debug)] pub enum EventData {\n");
     for (n, t) in &p.events {
