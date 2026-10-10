@@ -1,0 +1,27 @@
+// Native ownership is represented directly. Checked source moves the owner;
+// read methods and stopping predicates borrow it. No interior aliasing.
+#[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord)]
+pub struct OwnedBuffer<T>(Vec<T>);
+impl<T:Clone> OwnedBuffer<T> {
+    pub fn new(xs:Vec<T>)->Self {Self(xs)}
+    pub fn len(&self)->u32 {self.0.len().try_into().expect("buffer exceeds u32")}
+    pub fn get(&self,i:u32)->Option<T> {self.0.get(i as usize).cloned()}
+    pub fn set(mut self,i:u32,value:T)->Self {if let Some(v)=self.0.get_mut(i as usize){*v=value;}self}
+    pub fn swap(mut self,a:u32,b:u32)->Self {if (a as usize)<self.0.len() && (b as usize)<self.0.len(){self.0.swap(a as usize,b as usize);}self}
+    pub fn push(mut self,value:T)->Self {assert!(self.len()<u32::MAX,"buffer length exhausted");self.0.push(value);self}
+    pub fn pop(mut self)->Self {self.0.pop();self}
+    pub fn truncate(mut self,n:u32)->Self {self.0.truncate(n as usize);self}
+    pub fn freeze(self)->Vec<T> {self.0}
+}
+#[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord)]
+pub struct OwnedMap<K:Ord,V>(std::collections::BTreeMap<K,V>);
+impl<K:Ord+Clone,V:Clone> OwnedMap<K,V> {
+    pub fn new()->Self {Self(std::collections::BTreeMap::new())}
+    pub fn len(&self)->u32 {self.0.len().try_into().expect("map exceeds u32")}
+    pub fn get(&self,k:&K)->Option<V> {self.0.get(k).cloned()}
+    pub fn contains(&self,k:&K)->bool {self.0.contains_key(k)}
+    pub fn set(mut self,k:K,v:V)->Self {self.0.insert(k,v);self}
+    pub fn remove(mut self,k:&K)->Self {self.0.remove(k);self}
+    pub fn keys(&self)->Vec<K> {self.0.keys().cloned().collect()}
+    pub fn values(&self)->Vec<V> {self.0.values().cloned().collect()}
+}

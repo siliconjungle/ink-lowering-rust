@@ -6,6 +6,11 @@ pub fn schema_code(s: &Schema) -> String {
         Schema::Bool => "portable::Schema::Bool".into(),
         Schema::U32 => "portable::Schema::U32".into(),
         Schema::U64 => "portable::Schema::U64".into(),
+        Schema::I32 => "portable::Schema::I32".into(),
+        Schema::F32 => "portable::Schema::F32".into(),
+        Schema::Vector(a, n) => {
+            format!("portable::Schema::Vector(Box::new({}),{n})", schema_code(a))
+        }
         Schema::Int => "portable::Schema::Int".into(),
         Schema::String => "portable::Schema::String".into(),
         Schema::Id => "portable::Schema::Id".into(),

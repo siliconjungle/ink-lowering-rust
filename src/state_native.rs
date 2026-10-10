@@ -1,7 +1,7 @@
 //! Typed Rust lowering for the checked stateful subset. Generated programs do
 //! not depend on this crate and do not carry an AST or expression evaluator.
 use crate::ownership::{self, Uses};
-use crate::{aggregate, check, syntax::*, LangResult};
+use crate::{aggregate, syntax::*, LangResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -10,22 +10,51 @@ fn ident(s: &str) -> String {
 }
 fn ty(t: &Type) -> LangResult<String> {
     Ok(match t {
-        Type::I32|Type::F32|Type::Vector(..)=>return Err("new compute types use the pure C/Wasm/GPU backend; stateful Wire support is not implemented".into()),
+        Type::I32 => "i32".into(),
+        Type::F32 => "f32".into(),
+        Type::Vector(t, n) => format!("[{};{}]", ty(t)?, n),
         Type::U64 => "u64".into(),
         Type::U32 => "u32".into(),
         Type::Int => "BigInt".into(),
         Type::Unit => "()".into(),
         Type::String => "String".into(),
         Type::Bool => "bool".into(),
-        Type::Named(n) if n == "ArithmeticError" => "()".into(),
+        Type::Named(n) if n == "ArithmeticError" => "InkArithmeticError".into(),
         Type::Named(n) => ident(n),
         Type::List(a) => format!("Vec<{}>", ty(a)?),
+        Type::Buffer(a) => format!("OwnedBuffer<{}>", ty(a)?),
+        Type::Map(k, v) => format!("OwnedMap<{},{}>", ty(k)?, ty(v)?),
         Type::Option(a) => format!("Option<{}>", ty(a)?),
         Type::Result(a, b) => format!("Result<{},{}>", ty(a)?, ty(b)?),
         Type::Table(a, b) => format!("BTreeMap<{},{}>", ty(a)?, ty(b)?),
         Type::Unknown => {
             return Err("native state backend needs a resolved type; add an annotation".into())
         }
+    })
+}
+// Box only record fields whose inline representation reaches the enclosing
+// record again. Ink types and JSON shapes remain unchanged.
+pub(crate) fn boxed_field(owner: &str, t: &Type, p: &Program) -> bool {
+    fn reaches(owner: &str, t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
+        match t {
+            Type::Named(n) if n == owner => true,
+            Type::Named(n) if seen.insert(n.clone()) => p
+                .records
+                .get(n)
+                .is_some_and(|fs| fs.iter().any(|(_, t)| reaches(owner, t, p, seen))),
+            Type::Option(t) | Type::Vector(t, _) => reaches(owner, t, p, seen),
+            Type::Result(a, b) => reaches(owner, a, p, seen) || reaches(owner, b, p, seen),
+            _ => false, // Vec and BTreeMap already provide indirection.
+        }
+    }
+    reaches(owner, t, p, &mut BTreeSet::new())
+}
+fn field_ty(owner: &str, t: &Type, p: &Program) -> LangResult<String> {
+    let tname = ty(t)?;
+    Ok(if boxed_field(owner, t, p) {
+        format!("Box<{tname}>")
+    } else {
+        tname
     })
 }
 type Env = BTreeMap<String, Type>;
@@ -86,6 +115,7 @@ fn exact_owned_expression(e: &Expr, owner: &str) -> LangResult<String> {
 }
 struct Emitter<'a> {
     p: &'a Program,
+    execution: &'a ink_core::action_ir::Execution,
     plans: BTreeMap<String, aggregate::Plan>,
     bounded: BTreeMap<String, BoundEvidence>,
     serial: usize,
@@ -234,19 +264,36 @@ impl Emitter<'_> {
         format!("tmp_{}", self.serial)
     }
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, Type)> {
+        let resolved = self.execution.type_of(e).cloned();
+        let want = want.or(resolved.as_ref());
         use Type as T;
         let (code, t) = match e {
-            Expr::Float(_) | Expr::Neg(_) | Expr::Let(..) => {
-                return Err("compute expression belongs in a pure function".into())
+            Expr::Float(bits) => (format!("f32::from_bits({bits}u32)"), T::F32),
+            Expr::Neg(value) => {
+                if want == Some(&T::I32) && matches!(value.as_ref(), Expr::Num(2147483648)) {
+                    return Ok(("i32::MIN".into(), T::I32));
+                }
+                let (v, t) = self.expr(value, env, want)?;
+                let code = if t == T::F32 {
+                    format!("f32::from_bits(({v}).to_bits()^0x80000000)")
+                } else if t == T::Int {
+                    format!("-({v})")
+                } else {
+                    format!("({v}).wrapping_neg()")
+                };
+                (code, t)
             }
+            Expr::Let(..) => return Err("compute expression belongs in a pure function".into()),
             Expr::Num(n) => {
                 let t = want
-                    .filter(|t| matches!(t, T::U32 | T::Int))
+                    .filter(|t| matches!(t, T::U32 | T::Int | T::I32 | T::F32))
                     .cloned()
                     .unwrap_or(T::U64);
                 let s = match t {
                     T::Int => format!("BigInt::from({n}u64)"),
                     T::U32 => format!("{n}u32"),
+                    T::I32 => format!("{n}i32"),
+                    T::F32 => format!("f32::from_bits({}u32)", (*n as f32).to_bits()),
                     _ => format!("{n}u64"),
                 };
                 (s, t)
@@ -303,6 +350,13 @@ impl Emitter<'_> {
                     }
                 }
                 let (b, t) = self.expr(base, env, None)?;
+                if let T::Vector(t, _) = t {
+                    let i = ["x", "y", "z", "w"]
+                        .iter()
+                        .position(|s| *s == f)
+                        .ok_or("vector component")?;
+                    return Ok((format!("({b})[{i}].clone()"), *t));
+                }
                 let T::Named(n) = t else {
                     return Err("native field requires record".into());
                 };
@@ -314,14 +368,29 @@ impl Emitter<'_> {
                     .ok_or("native: unknown field")?
                     .1
                     .clone();
-                (format!("({b}).{}.clone()", ident(f)), t)
+                (
+                    if boxed_field(&n, &t, self.p) {
+                        format!("(*({b}).{}).clone()", ident(f))
+                    } else {
+                        format!("({b}).{}.clone()", ident(f))
+                    },
+                    t,
+                )
             }
             Expr::Record(n, fs) => {
                 let mut fields = vec![];
                 for (f, e) in fs {
                     let t = &self.p.records[n].iter().find(|(x, _)| x == f).unwrap().1;
                     let (s, _) = self.expr(e, env, Some(t))?;
-                    fields.push(format!("{}:{s}", ident(f)))
+                    fields.push(format!(
+                        "{}:{}",
+                        ident(f),
+                        if boxed_field(n, t, self.p) {
+                            format!("Box::new({s})")
+                        } else {
+                            s
+                        }
+                    ))
                 }
                 (
                     format!("{}{{{}}}", ident(n), fields.join(",")),
@@ -342,13 +411,18 @@ impl Emitter<'_> {
                     let probed = self.expr(b, env, None);
                     self.probe -= 1;
                     let (_, bt) = probed?;
-                    if matches!(bt, T::U32 | T::Int) {
+                    if matches!(bt, T::U32 | T::Int | T::I32 | T::F32) {
                         (ac, at) = self.expr(a, env, Some(&bt))?
                     }
                 }
                 let (bc, _) = self.expr(b, env, Some(&at))?;
                 let arithmetic = ["+", "-", "*"].contains(&op.as_str());
-                let s = if arithmetic && matches!(at, T::U32 | T::U64) {
+                let s = if (op == "==" || op == "!=") && at != T::F32 {
+                    format!(
+                        "{}InkDataEq::ink_data_eq(&({ac}),&({bc}))",
+                        if op == "!=" { "!" } else { "" }
+                    )
+                } else if arithmetic && matches!(at, T::U32 | T::U64 | T::I32) {
                     let method = match op.as_str() {
                         "+" => "wrapping_add",
                         "-" => "wrapping_sub",
@@ -361,6 +435,14 @@ impl Emitter<'_> {
                 (s, if arithmetic { at } else { T::Bool })
             }
             Expr::Call(n, args) => match n.as_str() {
+                "vec2" | "vec3" | "vec4" => {
+                    let t = resolved.as_ref().or(want).ok_or("vector type")?;
+                    let code = args
+                        .iter()
+                        .map(|e| self.expr(e, env, None).map(|(s, _)| s))
+                        .collect::<LangResult<Vec<_>>>()?;
+                    (format!("[{}]", code.join(",")), t.clone())
+                }
                 "Ok" | "Err" | "Some" => {
                     let inner = match (n.as_str(), want) {
                         ("Ok", Some(T::Result(a, _)))
@@ -384,7 +466,7 @@ impl Emitter<'_> {
                     let (a, t) = self.expr(&args[0], env, None)?;
                     let (b, _) = self.expr(&args[1], env, Some(&t))?;
                     (
-                        format!("({a}).{n}({b}).ok_or(())"),
+                        format!("({a}).{n}({b}).ok_or(InkArithmeticError::Overflow)"),
                         T::Result(Box::new(t), Box::new(T::Named("ArithmeticError".into()))),
                     )
                 }
@@ -401,7 +483,7 @@ impl Emitter<'_> {
                         } else {
                             format!("0{}", ty(&t)?)
                         };
-                        let add = if *t == T::Int {
+                        let add = if matches!(*t, T::Int | T::F32) {
                             "a+b"
                         } else {
                             "a.wrapping_add(b)"
@@ -784,19 +866,22 @@ impl Emitter<'_> {
                     } else {
                         None
                     };
-                    let s = if let Some((root, key)) = discarded_remove {
-                        let Type::Table(k, _) = &root.ty else {
+                    let (s, t) = if let Some((root, key)) = discarded_remove {
+                        let Type::Table(k, v) = &root.ty else {
                             unreachable!()
                         };
                         let (key, _) = self.expr(key, env, Some(k))?;
-                        format!(
-                            "{{let key={key};self.set_{}(key,None,false)}}",
-                            ident(&root.name)
+                        (
+                            format!(
+                                "{{let key={key};self.set_{}(key,None,false)}}",
+                                ident(&root.name)
+                            ),
+                            Type::Option(v.clone()),
                         )
                     } else {
-                        self.expr(e, env, None)?.0
+                        self.expr(e, env, None)?
                     };
-                    writeln!(out, "let _={s};").unwrap();
+                    writeln!(out, "let _:{}={s};", ty(&t)?).unwrap();
                 }
             }
         }
@@ -860,7 +945,38 @@ pub fn emit_selected(
     selected: &ink_core::optimisation::CheckedSelection,
     certificate: Option<&aggregate::Certificate>,
 ) -> LangResult<String> {
-    emit(selected.module().program(), certificate)
+    emit_selected_with_storage(selected, certificate, false, None)
+}
+pub fn emit_selected_with_storage(
+    selected: &ink_core::optimisation::CheckedSelection,
+    certificate: Option<&aggregate::Certificate>,
+    narrow: bool,
+    storage: Option<&crate::storage::Policy>,
+) -> LangResult<String> {
+    let layout = crate::snapshot::selected_layout(selected)?;
+    emit_with_layout(
+        selected.module().program(),
+        certificate,
+        narrow,
+        storage,
+        &layout,
+    )
+}
+fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
+    match t {
+        Type::F32 => true,
+        Type::Named(n) if seen.insert(n.clone()) => p
+            .records
+            .get(n)
+            .is_some_and(|fs| fs.iter().any(|(_, t)| floating(t, p, seen))),
+        Type::List(t) | Type::Buffer(t) | Type::Vector(t, _) | Type::Option(t) => {
+            floating(t, p, seen)
+        }
+        Type::Result(a, b) | Type::Map(a, b) | Type::Table(a, b) => {
+            floating(a, p, seen) || floating(b, p, seen)
+        }
+        _ => false,
+    }
 }
 pub fn emit(p: &Program, certificate: Option<&aggregate::Certificate>) -> LangResult<String> {
     emit_with_bounds(p, certificate, false)
@@ -894,7 +1010,19 @@ pub fn emit_with_storage(
     narrow: bool,
     storage: Option<&crate::storage::Policy>,
 ) -> LangResult<String> {
-    check::check(p)?;
+    let layout = crate::snapshot::layout(p)?;
+    emit_with_layout(p, certificate, narrow, storage, &layout)
+}
+fn emit_with_layout(
+    p: &Program,
+    certificate: Option<&aggregate::Certificate>,
+    narrow: bool,
+    storage: Option<&crate::storage::Policy>,
+    layout: &crate::snapshot_wire::Layout,
+) -> LangResult<String> {
+    let module = ink_core::core::CheckedModule::from_source(p.clone())?;
+    let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
+    let execution = action_ir.execution()?;
     if let Some(c) = certificate {
         aggregate::verify(c)?;
     }
@@ -911,6 +1039,7 @@ pub fn emit_with_storage(
     };
     let mut emitter = Emitter {
         p,
+        execution: &execution,
         plans,
         bounded: if narrow && certificate.is_some() {
             bounded_caches_with_certificate(p, certificate.unwrap())
@@ -928,6 +1057,16 @@ pub fn emit_with_storage(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
     );
     out.push_str(include_str!("state_native_support.txt"));
+    out.push_str("\nmod temporary {\n");
+    out.push_str(include_str!("temporary.rs.txt"));
+    out.push_str("\n}\nuse temporary::{OwnedBuffer,OwnedMap};\n");
+    out.push_str(r#"
+impl<T:Clone> Wire for OwnedBuffer<T>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
+impl<K:Ord+Clone,V:Clone> Wire for OwnedMap<K,V>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
+impl<T:Clone> InkDataEq for OwnedBuffer<T>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
+impl<K:Ord+Clone,V:Clone> InkDataEq for OwnedMap<K,V>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
+"#);
+
     out.push_str("\nmod transaction {\n");
     out.push_str(ink_core::TRANSACTION_RUST_SOURCE);
     out.push_str("\n}\n");
@@ -939,7 +1078,6 @@ pub fn emit_with_storage(
     out.push_str("\nmod portable {\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
-    let layout = crate::snapshot::layout(p)?;
     writeln!(out,"fn snapshot_layout()->portable::Layout{{portable::Layout{{program:{:?},schema:{:?},roots:vec![",layout.program,layout.schema).unwrap();
     for (n, k, v) in &layout.roots {
         writeln!(
@@ -975,10 +1113,15 @@ impl Wire for {id} {{
         let id = ident(n);
         let fields = fs
             .iter()
-            .map(|(f, t)| Ok(format!("pub {}:{}", ident(f), ty(t)?)))
+            .map(|(f, t)| Ok(format!("pub {}:{}", ident(f), field_ty(n, t, p)?)))
             .collect::<LangResult<Vec<_>>>()?
             .join(",");
-        writeln!(out,"#[derive(Clone,Debug,PartialEq,Eq)] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{json!({{").unwrap();
+        let eq = if fs.iter().any(|(_, t)| floating(t, p, &mut BTreeSet::new())) {
+            ""
+        } else {
+            ",Eq"
+        };
+        writeln!(out,"#[derive(Clone,Debug,PartialEq{eq})] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{json!({{").unwrap();
         for (f, _) in fs {
             writeln!(out, "{f:?}:self.{}.to_json(),", ident(f)).unwrap();
         }
@@ -988,7 +1131,7 @@ impl Wire for {id} {{
                 out,
                 "{}:<{} as Wire>::from_json(obj.get({f:?}).ok_or(\"missing field\")?)?,",
                 ident(f),
-                ty(t)?
+                field_ty(n, t, p)?
             )
             .unwrap();
         }
@@ -1011,6 +1154,31 @@ impl Wire for {id} {{
             .unwrap();
         }
         out.push_str("_=>Err(\"invalid enum\".into())}}}\n");
+    }
+    for n in p.ids.iter().chain(p.enums.keys()) {
+        writeln!(
+            out,
+            "impl InkDataEq for {} {{fn ink_data_eq(&self,other:&Self)->bool{{self==other}}}}",
+            ident(n)
+        )
+        .unwrap();
+    }
+    for (n, fields) in &p.records {
+        let comparisons = fields
+            .iter()
+            .map(|(f, _)| format!("self.{}.ink_data_eq(&other.{})", ident(f), ident(f)))
+            .collect::<Vec<_>>();
+        writeln!(
+            out,
+            "impl InkDataEq for {} {{fn ink_data_eq(&self,other:&Self)->bool{{{}}}}}",
+            ident(n),
+            if comparisons.is_empty() {
+                "true".into()
+            } else {
+                comparisons.join("&&")
+            }
+        )
+        .unwrap();
     }
     out.push_str("#[derive(Clone,Debug)] pub enum EventData {\n");
     for (n, t) in &p.events {
@@ -1276,7 +1444,7 @@ impl Wire for {id} {{
         out.push_str("},\n");
     }
     out.push_str("}}self.staged.clear();}\n");
-    for k in &p.keeps {
+    for k in execution.keeps() {
         let body = if emitter.plans.contains_key(&k.name) {
             if emitter.bounded.contains_key(&k.name) {
                 format!("BigInt::from(self.cache_{})", ident(&k.name))
@@ -1304,13 +1472,22 @@ impl Wire for {id} {{
             .join(",");
         writeln!(
             out,
-            "fn function_{}(&mut self,{params})->{}{{{body}}}",
+            "{}fn function_{}(&mut self,{params})->{}{{{body}}}",
+            if ink_core::local_collections::owned(&f.result, p)
+                || f.params
+                    .iter()
+                    .any(|(_, t)| ink_core::local_collections::owned(t, p))
+            {
+                ""
+            } else {
+                "pub "
+            },
             ident(&f.name),
             ty(&f.result)?
         )
         .unwrap();
     }
-    for a in &p.actions {
+    for a in execution.actions() {
         // A direct bounded keep query admits an allocation-free exact host ABI.
         // The ordinary language/JSON API still returns Int. This extra view is
         // generated from checked structure, never an application name.
@@ -1348,6 +1525,47 @@ impl Wire for {id} {{
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }
+    out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
+    for f in &p.functions {
+        if ink_core::local_collections::owned(&f.result, p)
+            || f.params
+                .iter()
+                .any(|(_, t)| ink_core::local_collections::owned(t, p))
+        {
+            writeln!(
+                out,
+                "{:?}=>Err(\"temporary storage is internal to a pure invocation\".into()),",
+                f.name
+            )
+            .unwrap();
+            continue;
+        }
+        write!(
+            out,
+            "{:?}=>{{if args.len()!={}{{return Err(\"argument count mismatch\".into())}}",
+            f.name,
+            f.params.len()
+        )
+        .unwrap();
+        let mut argv = vec![];
+        for (i, (_, t)) in f.params.iter().enumerate() {
+            write!(
+                out,
+                "let a{i}=<{} as Wire>::from_json(&args[{i}])?;",
+                ty(t)?
+            )
+            .unwrap();
+            argv.push(format!("a{i}"));
+        }
+        writeln!(
+            out,
+            "Ok(self.function_{}({}).to_json())}},",
+            ident(&f.name),
+            argv.join(",")
+        )
+        .unwrap();
+    }
+    out.push_str("_=>Err(\"unknown function\".into())}}\n");
     out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
     for a in &p.actions {
         write!(

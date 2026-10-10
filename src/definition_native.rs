@@ -123,6 +123,11 @@ impl Lower<'_> {
             Declaration::Theorem { .. } => {
                 return Err("theorems are not executable definitions".into())
             }
+            Declaration::AbstractSort { .. }
+            | Declaration::AbstractFunction { .. }
+            | Declaration::Assumption { .. } => {
+                return Err("abstract declarations are not executable definitions".into())
+            }
         }
         Ok(())
     }
