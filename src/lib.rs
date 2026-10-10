@@ -6,3 +6,5 @@ mod ownership;
 mod pure_rust;
 pub mod snapshot_code;
 pub mod state_native;
+
+pub mod representation_native;
