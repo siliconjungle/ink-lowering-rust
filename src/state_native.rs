@@ -1472,7 +1472,16 @@ impl Wire for {id} {{
             .join(",");
         writeln!(
             out,
-            "pub fn function_{}(&mut self,{params})->{}{{{body}}}",
+            "{}fn function_{}(&mut self,{params})->{}{{{body}}}",
+            if ink_core::local_collections::owned(&f.result, p)
+                || f.params
+                    .iter()
+                    .any(|(_, t)| ink_core::local_collections::owned(t, p))
+            {
+                ""
+            } else {
+                "pub "
+            },
             ident(&f.name),
             ty(&f.result)?
         )
