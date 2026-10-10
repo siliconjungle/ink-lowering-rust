@@ -71,3 +71,26 @@ impl<T> OutcomeView<'_,T> {
 impl<T:Wire> OutcomeView<'_,T> {
     pub fn to_json(&self)->Json {json!({"result":self.result.to_json(),"committed":self.committed,"version":self.version,"events":self.events.iter().map(Event::to_json).collect::<Vec<_>>()})}
 }
+
+impl Wire for i32 {
+ fn to_json(&self)->Json{json!(self)}
+ fn from_json(v:&Json)->Result<Self,String>{v.as_i64().and_then(|n|n.try_into().ok()).ok_or("invalid i32".into())}
+}
+impl Wire for f32 {
+ fn to_json(&self)->Json{if self.is_finite(){json!(self)}else{json!({"F32Bits":self.to_bits()})}}
+ fn from_json(v:&Json)->Result<Self,String>{
+  if let Some(n)=v.as_f64(){let f=n as f32;if f.is_finite(){return Ok(f)}return Err("f32 overflow".into())}
+  if let Some(o)=v.as_object(){if o.len()==1{if let Some(b)=o.get("F32Bits").and_then(Json::as_u64).and_then(|n|u32::try_from(n).ok()){return Ok(Self::from_bits(b))}}}
+  Err("expected finite f32 or F32Bits".into())
+ }
+}
+impl<T:Wire,const N:usize> Wire for [T;N] {
+ fn to_json(&self)->Json{self.iter().map(Wire::to_json).collect()}
+ fn from_json(v:&Json)->Result<Self,String>{let a=v.as_array().ok_or("expected vector")?;if a.len()!=N{return Err("vector dimension mismatch".into())}a.iter().map(T::from_json).collect::<Result<Vec<_>,_>>()?.try_into().map_err(|_|"vector dimension mismatch".into())}
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum InkArithmeticError {Overflow}
+impl Wire for InkArithmeticError {
+ fn to_json(&self)->Json{json!("ArithmeticError.Overflow")}
+ fn from_json(v:&Json)->Result<Self,String>{if v.as_str()==Some("ArithmeticError.Overflow"){Ok(Self::Overflow)}else{Err("invalid arithmetic error".into())}}
+}

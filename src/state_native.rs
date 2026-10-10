@@ -10,14 +10,16 @@ fn ident(s: &str) -> String {
 }
 fn ty(t: &Type) -> LangResult<String> {
     Ok(match t {
-        Type::I32|Type::F32|Type::Vector(..)=>return Err("new compute types use the pure C/Wasm/GPU backend; stateful Wire support is not implemented".into()),
+        Type::I32 => "i32".into(),
+        Type::F32 => "f32".into(),
+        Type::Vector(t,n) => format!("[{};{}]",ty(t)?,n),
         Type::U64 => "u64".into(),
         Type::U32 => "u32".into(),
         Type::Int => "BigInt".into(),
         Type::Unit => "()".into(),
         Type::String => "String".into(),
         Type::Bool => "bool".into(),
-        Type::Named(n) if n == "ArithmeticError" => "()".into(),
+        Type::Named(n) if n == "ArithmeticError" => "InkArithmeticError".into(),
         Type::Named(n) => ident(n),
         Type::List(a) => format!("Vec<{}>", ty(a)?),
         Type::Option(a) => format!("Option<{}>", ty(a)?),
@@ -384,7 +386,7 @@ impl Emitter<'_> {
                     let (a, t) = self.expr(&args[0], env, None)?;
                     let (b, _) = self.expr(&args[1], env, Some(&t))?;
                     (
-                        format!("({a}).{n}({b}).ok_or(())"),
+                        format!("({a}).{n}({b}).ok_or(InkArithmeticError::Overflow)"),
                         T::Result(Box::new(t), Box::new(T::Named("ArithmeticError".into()))),
                     )
                 }
@@ -978,7 +980,7 @@ impl Wire for {id} {{
             .map(|(f, t)| Ok(format!("pub {}:{}", ident(f), ty(t)?)))
             .collect::<LangResult<Vec<_>>>()?
             .join(",");
-        writeln!(out,"#[derive(Clone,Debug,PartialEq,Eq)] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{json!({{").unwrap();
+        writeln!(out,"#[derive(Clone,Debug,PartialEq)] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{json!({{").unwrap();
         for (f, _) in fs {
             writeln!(out, "{f:?}:self.{}.to_json(),", ident(f)).unwrap();
         }
@@ -1304,7 +1306,7 @@ impl Wire for {id} {{
             .join(",");
         writeln!(
             out,
-            "fn function_{}(&mut self,{params})->{}{{{body}}}",
+            "pub fn function_{}(&mut self,{params})->{}{{{body}}}",
             ident(&f.name),
             ty(&f.result)?
         )
@@ -1348,6 +1350,14 @@ impl Wire for {id} {{
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }
+    out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
+    for f in &p.functions {
+        write!(out,"{:?}=>{{if args.len()!={}{{return Err(\"argument count mismatch\".into())}}",f.name,f.params.len()).unwrap();
+        let mut argv=vec![];
+        for (i,(_,t)) in f.params.iter().enumerate(){write!(out,"let a{i}=<{} as Wire>::from_json(&args[{i}])?;",ty(t)?).unwrap();argv.push(format!("a{i}"));}
+        writeln!(out,"Ok(self.function_{}({}).to_json())}},",ident(&f.name),argv.join(",")).unwrap();
+    }
+    out.push_str("_=>Err(\"unknown function\".into())}}\n");
     out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
     for a in &p.actions {
         write!(
