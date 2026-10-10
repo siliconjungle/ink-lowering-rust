@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 [dependencies]
-ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "d15099ea3a250fdbb02078e42d82ba16fcb91532" }
+ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "014104d6575b1e2ad690e4f33f174f679abb8d25" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

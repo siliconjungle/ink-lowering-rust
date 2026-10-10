@@ -22,3 +22,7 @@ Rust lowering, codecs, protocol control, num-bigint and Rust/LLVM remain trusted
 Part of the personal siliconjungle Ink repositories. The distribution pins this
 repository as a submodule. Core schema/toolchain compatibility must be explicit;
 repository identities do not establish correctness.
+
+Pure helpers support sequential bindings and numeric legacy record construction
+and access. Compute v2 numeric/vector values remain outside the stateful Wire
+ABI and are rejected explicitly at the state boundary.

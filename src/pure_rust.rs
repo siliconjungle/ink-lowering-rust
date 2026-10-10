@@ -15,6 +15,28 @@ impl Emitter<'_> {
         let t = check::infer_context(e, env, self.p, want)?;
         Ok(match e {
             Expr::Num(n) => format!("{n}{}", if t == Type::U32 { "u32" } else { "u64" }),
+            Expr::Let(n, annotation, x, b) => {
+                let xt = check::infer_context(x, env, self.p, annotation.as_deref())?;
+                let value = self.expr(x, env, Some(&xt))?;
+                let mut local = env.clone();
+                local.insert(n.clone(), xt);
+                let body = self.expr(b, &local, Some(&t))?;
+                format!("{{let l_{n}={value};{body}}}")
+            }
+            Expr::Field(x, n) => format!("({}).l_{n}.clone()", self.expr(x, env, None)?),
+            Expr::Record(n, fields) => {
+                let schema = self.p.records[n].clone();
+                let mut values = Vec::new();
+                for (k, t) in &schema {
+                    let e = &fields
+                        .iter()
+                        .find(|(f, _)| f == k)
+                        .ok_or("missing record field")?
+                        .1;
+                    values.push(format!("l_{k}:{}", self.expr(e, env, Some(t))?));
+                }
+                format!("l_{n}{{{}}}", values.join(","))
+            }
             Expr::Bool(b) => b.to_string(),
             Expr::Var(n) => format!("l_{n}.clone()"),
             Expr::Binary(op, a, b) => {
@@ -87,6 +109,12 @@ impl Emitter<'_> {
                 format!("{{{bindings}self.function_l_{n}({})}}", names.join(","))
             }
             Expr::Method(xs, n, args) => {
+                if !["map", "filter"].contains(&n.as_str()) {
+                    return Err(
+                        "new compute collection operations currently use the pure compute backend"
+                            .into(),
+                    );
+                }
                 let context = if n == "filter" { Some(&t) } else { None };
                 let Type::List(inner) = check::infer_context(xs, env, self.p, context)? else {
                     return Err("expected list".into());
@@ -106,10 +134,7 @@ impl Emitter<'_> {
                     Some(if n == "filter" { &Type::Bool } else { output }),
                 )?;
                 if n == "map" {
-                    format!(
-                        "({receiver}).into_iter().map(|l_{var}|{body}).collect::<Vec<{}>>()",
-                        if **output == Type::U32 { "u32" } else { "u64" }
-                    )
+                    format!("({receiver}).into_iter().map(|l_{var}|{body}).collect::<Vec<_>>()",)
                 } else {
                     format!("({receiver}).into_iter().filter(|ink_ref|{{let l_{var}=(*ink_ref).clone();{body}}}).collect::<Vec<_>>()")
                 }

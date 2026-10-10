@@ -9,6 +9,7 @@ fn ident(s: &str) -> String {
 }
 fn ty(t: &Type) -> LangResult<String> {
     Ok(match t {
+        Type::I32|Type::F32|Type::Vector(..)=>return Err("new compute types use the pure C/Wasm/GPU backend; stateful Wire support is not implemented".into()),
         Type::U64 => "u64".into(),
         Type::U32 => "u32".into(),
         Type::Int => "BigInt".into(),
@@ -197,6 +198,9 @@ impl Emitter<'_> {
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, Type)> {
         use Type as T;
         let (code, t) = match e {
+            Expr::Float(_) | Expr::Neg(_) | Expr::Let(..) => {
+                return Err("compute expression belongs in a pure function".into())
+            }
             Expr::Num(n) => {
                 let t = want
                     .filter(|t| matches!(t, T::U32 | T::Int))
