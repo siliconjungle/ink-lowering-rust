@@ -43,3 +43,14 @@ applications carry no proof package, checker context, source AST or Ink runtime
 dependency. See ink-lang/docs/database-representations.md and the shared
 `representation_parity` conformance gate. Recursive GPU state uses the complete
 host lane; device eligibility remains separate.
+
+
+Generated entry points trust the caller's declared argument types, arity, shapes,
+tags and canonical ranges. Bad data is unsafe and may crash, trap, corrupt state
+or produce incorrect results; raw native pointers also require valid alignment,
+length and lifetime. No malformed-input diagnostic or rollback is promised.
+Representation conversion/JSON parsing and explicit portable checkpoint integrity
+checks remain. Source/proof checking happens during compilation. Standalone
+representation calls skip whole-state checkpoint validation; read-only observation
+envelopes are erased when existing definitional computation establishes unchanged
+logical state/version and no events.
