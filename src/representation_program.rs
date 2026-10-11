@@ -259,15 +259,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
             &queries,
         )?);
     }
-    if !foreign {
-        for (name, d) in &queries {
-            out.push_str(&crate::definition_native::literal_function(
-                checked.definition(),
-                name,
-                d,
-            )?);
-        }
-    }
+
     out.push_str("\nuse serde_json::{Value as Json,json};\nmod portable{\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
@@ -308,39 +300,6 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     writeln!(out,"pub fn restore(bytes:&[u8])->Result<Self,String>{{let layout=snapshot_layout();let saved=portable::decode(&layout,bytes,SnapshotLimits::default())?;let logical=logical_from_tables(&saved.tables)?;Ok(Self{{physical:f_{}(&logical),version:saved.version,outbox:saved.outbox,layout}})}}",plan.encode).unwrap();
     writeln!(out,"pub fn checkpoint(&self)->Result<Vec<u8>,String>{{let logical=f_{}({});portable::encode(&self.layout,&portable::Logical{{version:self.version,tables:logical_tables(&logical)?,outbox:self.outbox.clone()}},SnapshotLimits::default())}}",plan.decode,borrowed(&plan.physical_state,"self.physical")).unwrap();
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox_json(&self)->Json{Json::Array(self.outbox.iter().map(|e|json!({\"commit\":e.commit,\"position\":e.position,\"channel\":self.layout.events[e.channel].0,\"value\":e.value})).collect())}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){self.outbox.retain(|e|(e.commit,e.position)>(commit,position));}\n");
-    // Typed query entry points bypass JSON and the complete transaction envelope.
-    for source in &p.actions {
-        let a = &plan.actions[&source.name];
-        let name = format!("q_{}", a.execute);
-        let Some(Declaration::Function { params, result, .. }) = queries.get(&name) else {
-            continue;
-        };
-        let inputs = params[2..]
-            .iter()
-            .enumerate()
-            .map(|(i, (_, s))| {
-                Ok(format!(
-                    "a{i}:{}{}",
-                    if matches!(s, Sort::Data(_)) { "&" } else { "" },
-                    crate::definition_native::ty(s)?
-                ))
-            })
-            .collect::<LangResult<Vec<_>>>()?;
-        let mut args = vec![
-            borrowed(&plan.physical_state, "self.physical"),
-            "self.version".into(),
-        ];
-        args.extend((0..inputs.len()).map(|i| format!("a{i}")));
-        writeln!(
-            out,
-            "pub fn query_{}(&self,{})->{}{{{name}({})}}",
-            source.name,
-            inputs.join(","),
-            crate::definition_native::ty(result)?,
-            args.join(",")
-        )
-        .unwrap();
-    }
     out.push_str(
         "pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{match name{\n",
     );
@@ -361,11 +320,6 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
             )
             .unwrap();
             args.push(borrowed(sort, &format!("a{i}")));
-        }
-        let query = format!("q_{}", a.execute);
-        if queries.contains_key(&query) {
-            writeln!(out,"let reply={query}({});let result={};Ok(json!({{\"result\":result,\"committed\":false,\"version\":self.version,\"events\":[]}}))}},",args.join(","),e.codec(&source.result,"write","&reply","0")?).unwrap();
-            continue;
         }
         writeln!(out, "let executed=f_{}({});", a.execute, args.join(",")).unwrap();
         let executed = borrowed(&a.result, "executed");

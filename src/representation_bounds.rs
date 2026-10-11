@@ -6,7 +6,7 @@ use ink_core::{
 };
 use std::fmt::Write;
 pub(crate) fn emit(d: &CheckedDefinition, physical: &str) -> LangResult<String> {
-    let ds = d.executable_declarations()?;
+    let ds = d.reachable_executable_declarations()?;
     let mut out = String::from("enum Storage<'a>{Scalar,");
     for (id, decl) in &ds {
         if matches!(decl, Declaration::Datatype { .. }) {
