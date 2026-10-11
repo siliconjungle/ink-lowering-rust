@@ -2,7 +2,9 @@
 use crate::{check, syntax::*, LangResult};
 use std::collections::BTreeMap;
 type Env = BTreeMap<String, (String, Type)>;
-fn references(e: &Expr, name: &str) -> bool { ink_core::analysis::references_free(e, name) }
+fn references(e: &Expr, name: &str) -> bool {
+    ink_core::analysis::references_free(e, name)
+}
 
 struct Emitter<'a> {
     p: &'a Program,
@@ -47,6 +49,7 @@ impl Emitter<'_> {
             Type::F32 => "0.0f32".into(),
             Type::I32 => "0i32".into(),
             Type::U32 => "0u32".into(),
+            Type::Int => "BigInt::from(0u8)".into(),
             _ => "0u64".into(),
         }
     }
@@ -139,15 +142,17 @@ impl Emitter<'_> {
         let t = self.infer(e, env, want)?;
         Ok(match e {
             Expr::Num(n) => match t {
+                Type::Int => format!("BigInt::from({n}u64)"),
                 Type::U32 => format!("{n}u32"),
                 Type::I32 => format!("{n}i32"),
                 Type::F32 => format!("f32::from_bits({}u32)", (*n as f32).to_bits()),
                 _ => format!("{n}u64"),
             },
-            Expr::String(s) => format!("String::from({s:?})"),
-            Expr::Unit => "()".into(),
             Expr::Float(b) => format!("f32::from_bits({b}u32)"),
             Expr::Bool(b) => b.to_string(),
+            Expr::String(s) => format!("{s:?}.to_owned()"),
+            Expr::Unit => "()".into(),
+            Expr::Var(n) if n == "None" => "None".into(),
             Expr::Var(n) => {
                 let v = &env.get(n).ok_or("missing binding")?.0;
                 if ink_core::local_collections::owned(&t, self.p) {
@@ -161,7 +166,9 @@ impl Emitter<'_> {
                     return Ok("i32::MIN".into());
                 }
                 let x = self.expr(x, env, Some(&t))?;
-                if t == Type::F32 {
+                if t == Type::Int {
+                    format!("-({x})")
+                } else if t == Type::F32 {
                     format!("f32::from_bits(({x}).to_bits() ^ 0x80000000)")
                 } else {
                     format!("({x}).wrapping_neg()")
@@ -200,6 +207,11 @@ impl Emitter<'_> {
                 format!("{{{bindings}l_{n}{{{}}}}}", fs.join(","))
             }
             Expr::Field(x, n) => {
+                if let Expr::Var(en) = x.as_ref() {
+                    if !env.contains_key(en) && self.p.enums.contains_key(en) {
+                        return Ok(format!("l_{en}::l_{n}"));
+                    }
+                }
                 let xt = self.infer(x, env, None)?;
                 let x = self.expr(x, env, None)?;
                 if matches!(xt, Type::Vector(..)) {
@@ -235,7 +247,7 @@ impl Emitter<'_> {
                     .iter()
                     .map(|(n, (_, t))| (n.clone(), t.clone()))
                     .collect();
-                let at = if check::is_number(&t) {
+                let at = if check::is_numeric_value(&t) {
                     t.clone()
                 } else {
                     self.infer(
@@ -250,6 +262,11 @@ impl Emitter<'_> {
                 let b = self.expr(b, env, Some(&at))?;
                 if ["+", "-", "*"].contains(&op.as_str()) {
                     Self::arithmetic(op, &a, &b, &at)
+                } else if (op == "==" || op == "!=") && at != Type::F32 {
+                    format!(
+                        "{}InkDataEq::ink_data_eq(&({a}),&({b}))",
+                        if op == "!=" { "!" } else { "" }
+                    )
                 } else {
                     format!("(({a}) {op} ({b}))")
                 }
@@ -272,6 +289,51 @@ impl Emitter<'_> {
                 self.expr(&args[1], env, Some(&t))?,
                 self.expr(&args[2], env, Some(&t))?
             ),
+            Expr::Call(n, args) if n == "list" => {
+                let Type::List(inner) = &t else {
+                    return Err("list type".into());
+                };
+                format!(
+                    "vec![{}]",
+                    args.iter()
+                        .map(|e| self.expr(e, env, Some(inner)))
+                        .collect::<LangResult<Vec<_>>>()?
+                        .join(",")
+                )
+            }
+            Expr::Call(n, args) if ink_core::word::primitive(n) => {
+                let ts = ink_core::word::arguments(n, &t);
+                let args = args
+                    .iter()
+                    .zip(ts)
+                    .map(|(a, t)| self.expr(a, env, Some(&t)))
+                    .collect::<LangResult<Vec<_>>>()?;
+                crate::state_native::word_expression(n, &args)
+            }
+            Expr::Call(n, args) if ["Some", "Ok", "Err"].contains(&n.as_str()) => {
+                let inner = match (&t, n.as_str()) {
+                    (Type::Option(t), "Some")
+                    | (Type::Result(t, _), "Ok")
+                    | (Type::Result(_, t), "Err") => t.as_ref(),
+                    _ => return Err("variant type".into()),
+                };
+                format!("{n}({})", self.expr(&args[0], env, Some(inner))?)
+            }
+            Expr::Call(n, args) if n == "Int" => {
+                format!("BigInt::from({})", self.expr(&args[0], env, None)?)
+            }
+            Expr::Call(n, args)
+                if ["checked_add", "checked_sub", "checked_mul"].contains(&n.as_str()) =>
+            {
+                let Type::Result(inner, _) = &t else {
+                    return Err("checked type".into());
+                };
+                format!(
+                    "({}).{n}({}).ok_or(InkArithmeticError::Overflow)",
+                    self.expr(&args[0], env, Some(inner))?,
+                    self.expr(&args[1], env, Some(inner))?
+                )
+            }
             Expr::Call(n, args) if n == "quot_or" || n == "rem_or" => {
                 let a = self.expr(&args[0], env, Some(&t))?;
                 let b = self.expr(&args[1], env, Some(&t))?;
@@ -468,7 +530,7 @@ impl Emitter<'_> {
                 let flag = self.fresh();
                 format!("{{let {list}={xs};let mut {acc}={initial};for {item} in {list}.into_iter() {{let {}={item}.clone();let {}={acc}.clone();let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
             }
-            Expr::Call(n, args) if n == "foldr" => {
+            Expr::Call(n, args) if n == "foldr" || n == "foldl" => {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
                     return Err("fold input".into());
                 };
@@ -478,7 +540,8 @@ impl Emitter<'_> {
                 let (vs, body) = self.lambda(&args[2], env, &[*inner, t.clone()], &t)?;
                 let acc = self.fresh();
                 let list = self.fresh();
-                format!("{{let {list}={iterator};let mut {acc}={initial};for {} in {list}.rev() {{let {}={acc};{acc}={body};}}{acc}}}",vs[0],vs[1])
+                let direction = if n == "foldr" { ".rev()" } else { "" };
+                format!("{{let {list}={iterator};let mut {acc}={initial};for {} in {list}{direction} {{let {}={acc};{acc}={body};}}{acc}}}",vs[0],vs[1])
             }
             Expr::Call(n, args) if n == "sum" || n == "count" => {
                 let context = if n == "sum" {
@@ -493,7 +556,11 @@ impl Emitter<'_> {
                     } else {
                         xs
                     };
-                    format!("({value}).len() as u64")
+                    if t == Type::Int {
+                        format!("BigInt::from(({value}).len())")
+                    } else {
+                        format!("({value}).len() as u64")
+                    }
                 } else {
                     let iterator = Self::read_iterator(&args[0], &xs, env)?;
                     let acc = self.fresh();
@@ -522,6 +589,43 @@ impl Emitter<'_> {
                     argv.push(v)
                 }
                 format!("{{{bindings}self.function_l_{n}({})}}", argv.join(","))
+            }
+            Expr::Method(xs, n, args)
+                if matches!(
+                    self.infer(xs, env, None)?,
+                    Type::Option(_) | Type::Result(..)
+                ) =>
+            {
+                let input = self.infer(xs, env, None)?;
+                let value = self.expr(xs, env, Some(&input))?;
+                if n == "fold" {
+                    let (a, b, tag_a, tag_b) = match &input {
+                        Type::Option(a) => (a.as_ref().clone(), Type::Unit, "Some", "None"),
+                        Type::Result(a, b) => (a.as_ref().clone(), b.as_ref().clone(), "Ok", "Err"),
+                        _ => unreachable!(),
+                    };
+                    let (va, body_a) = self.lambda(&args[0], env, &[a], &t)?;
+                    let (vb, body_b) = self.lambda(&args[1], env, &[b], &t)?;
+                    let right = if tag_b == "None" {
+                        format!("None=>{{let {}=();{body_b}}}", vb[0])
+                    } else {
+                        format!("Err({})=>{{{body_b}}}", vb[0])
+                    };
+                    format!("match {value} {{{tag_a}({})=>{{{body_a}}},{right}}}", va[0])
+                } else if n == "ok_or" {
+                    format!("({value}).ok_or({})", self.expr(&args[0], env, None)?)
+                } else {
+                    let (inner, out) = match (&input, &t, n.as_str()) {
+                        (Type::Option(a), Type::Option(b), "map")
+                        | (Type::Result(a, _), Type::Result(b, _), "map")
+                        | (Type::Result(_, a), Type::Result(_, b), "map_err") => {
+                            (a.as_ref(), b.as_ref())
+                        }
+                        _ => return Err("variant method".into()),
+                    };
+                    let (vars, body) = self.lambda(&args[0], env, &[inner.clone()], out)?;
+                    format!("({value}).{n}(|{}|{{{body}}})", vars[0])
+                }
             }
             Expr::Method(xs, n, args) if n == "concat" => {
                 // Borrow variable operands directly. Computed operands are evaluated
