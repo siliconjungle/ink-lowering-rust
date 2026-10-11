@@ -57,3 +57,5 @@ length and lifetime. No malformed-input diagnostic or rollback is promised.
 Representation conversion/JSON parsing and explicit portable checkpoint integrity
 checks remain. Source/proof checking happens during compilation. Standalone
 representation calls skip whole-state checkpoint validation; query envelopes execute the literal proved physical step. Backend-specific envelope erasure has been removed.
+
+Fixed table operations now include batch upsert/removal, shared keys and forward numerical/predicate scans. `emit_with_table_storage` selects the ordered baseline or indexed row slots while preserving the same source semantics. This operational choice grants no rewrite authority. Ordered storage stays default; source-bound measurements include losses for construction, scalar storage and churn. Direct scans preserve wrapping, exact integers and floating-point key order.

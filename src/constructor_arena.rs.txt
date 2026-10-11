@@ -1,0 +1,41 @@
+// Typed, stable-address temporary storage. Slots are contiguous within chunks;
+// live native outputs are copied into their owning representation before rewind.
+// One chunk per used type is retained between calls; oversized scratch is freed.
+struct NativeArena<T> {
+    chunks: Vec<Box<[std::mem::MaybeUninit<T>]>>,
+    len: usize,
+}
+impl<T> NativeArena<T> {
+    const CHUNK: usize = 256;
+    const fn new() -> Self { Self { chunks: Vec::new(), len: 0 } }
+    fn mark(&self) -> usize { self.len }
+    fn push(&mut self, value: T) -> *const T {
+        let next = self.len.checked_add(1).expect("native arena size overflow");
+        let chunk = self.len / Self::CHUNK;
+        if chunk == self.chunks.len() {
+            self.chunks.push(std::iter::repeat_with(std::mem::MaybeUninit::uninit)
+                .take(Self::CHUNK).collect::<Vec<_>>().into_boxed_slice());
+        }
+        let slot = &mut self.chunks[chunk][self.len % Self::CHUNK];
+        let pointer = slot.write(value) as *const T;
+        self.len = next;
+        pointer
+    }
+    fn rewind(&mut self, mark: usize) {
+        assert!(mark <= self.len, "invalid native arena mark");
+        while self.len > mark {
+            self.len -= 1;
+            // Exactly the initialized prefix is live. Pointers are call-scoped.
+            unsafe { self.chunks[self.len / Self::CHUNK][self.len % Self::CHUNK].assume_init_drop(); }
+        }
+        let live_chunks = self.len.div_ceil(Self::CHUNK);
+        self.chunks.truncate(live_chunks.max(1));
+        // Reclaim the pointer directory after a large temporary spike as well.
+        if self.chunks.capacity() > live_chunks.max(1).saturating_mul(4) {
+            self.chunks.shrink_to_fit();
+        }
+    }
+}
+impl<T> Drop for NativeArena<T> {
+    fn drop(&mut self) { self.rewind(0); }
+}

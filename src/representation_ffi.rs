@@ -13,6 +13,35 @@ fn resolved(s: &Sort, id: &str) -> Sort {
         s.clone()
     }
 }
+
+#[cfg(test)]
+mod arena_tests {
+    include!("constructor_arena.rs.txt");
+    use std::{cell::Cell,rc::Rc};
+    struct Item(Rc<Cell<usize>>,usize);
+    impl Drop for Item {fn drop(&mut self){self.0.set(self.0.get()+1);}}
+    #[test]
+    fn stable_addresses_nested_marks_and_exact_destruction() {
+        let drops=Rc::new(Cell::new(0));let mut arena=NativeArena::new();
+        let first=arena.push(Item(drops.clone(),7));let outer=arena.mark();
+        for i in 0..1024{arena.push(Item(drops.clone(),i));}
+        assert_eq!(unsafe{(*first).1},7);
+        arena.rewind(outer);assert_eq!(drops.get(),1024);
+        assert_eq!(unsafe{(*first).1},7);
+        assert_eq!(arena.chunks.len(),1);
+        arena.rewind(0);assert_eq!(drops.get(),1025);
+        let reused=arena.push(Item(drops.clone(),9));assert_eq!(first,reused);
+        drop(arena);assert_eq!(drops.get(),1026);
+    }
+    #[test]
+    fn a_large_spike_releases_excess_scratch() {
+        let mut arena=NativeArena::new();for i in 0..30000{arena.push(i);}
+        arena.rewind(0);assert_eq!(arena.chunks.len(),1);
+        assert!(arena.chunks.capacity()<=4);
+        let pointer=arena.chunks[0].as_ptr();
+        for _ in 0..10{for i in 0..256{arena.push(i);}arena.rewind(0);assert_eq!(arena.chunks[0].as_ptr(),pointer);}
+    }
+}
 fn input(s: &Sort) -> LangResult<String> {
     Ok(match s {
         Sort::Data(id) => format!("*const D_{id}"),
@@ -33,16 +62,21 @@ pub(crate) fn emit(
     let mut out = String::from(
         "// Borrowed native typed objects: C never owns or packs the physical state.\n",
     );
+    out.push_str(include_str!("constructor_arena.rs.txt"));
     out.push_str("thread_local!{\n");
     for (id, d) in &ds {
         if matches!(d, Declaration::Datatype { .. }) {
-            writeln!(out,"static ARENA_{id}:std::cell::RefCell<Vec<Box<D_{id}>>>=const{{std::cell::RefCell::new(Vec::new())}};").unwrap();
+            writeln!(out,"static ARENA_{id}:std::cell::RefCell<NativeArena<D_{id}>>=const{{std::cell::RefCell::new(NativeArena::new())}};").unwrap();
         }
     }
-    out.push_str("}\nstruct NativeCall;impl Drop for NativeCall{fn drop(&mut self){\n");
+    out.push_str("}\nstruct NativeCall{\n");
+    for (id,d) in &ds {if matches!(d,Declaration::Datatype{..}){writeln!(out,"mark_{id}:usize,").unwrap();}}
+    out.push_str("}\nimpl NativeCall{fn new()->Self{Self{\n");
+    for (id,d) in &ds {if matches!(d,Declaration::Datatype{..}){writeln!(out,"mark_{id}:ARENA_{id}.with(|a|a.borrow().mark()),").unwrap();}}
+    out.push_str("}}}\nimpl Drop for NativeCall{fn drop(&mut self){\n");
     for (id, d) in &ds {
         if matches!(d, Declaration::Datatype { .. }) {
-            writeln!(out, "ARENA_{id}.with(|a|a.borrow_mut().clear());").unwrap();
+            writeln!(out, "ARENA_{id}.with(|a|a.borrow_mut().rewind(self.mark_{id}));").unwrap();
         }
     }
     out.push_str("}}\n");
@@ -84,7 +118,7 @@ pub(crate) fn emit(
                     }
                 })
                 .collect::<Vec<_>>();
-            writeln!(out,"#[no_mangle] unsafe extern \"C\" fn ink_rep_new_{id}_{i}({})->*const D_{id}{{let value=Box::new(D_{id}::C{i}{});let pointer=value.as_ref() as *const _;ARENA_{id}.with(|a|a.borrow_mut().push(value));pointer}}",inputs.join(","),if args.is_empty(){String::new()}else{format!("({})",args.join(","))}).unwrap();
+            writeln!(out,"#[no_mangle] unsafe extern \"C\" fn ink_rep_new_{id}_{i}({})->*const D_{id}{{let value=D_{id}::C{i}{};ARENA_{id}.with(|a|a.borrow_mut().push(value))}}",inputs.join(","),if args.is_empty(){String::new()}else{format!("({})",args.join(","))}).unwrap();
             for (j, s) in ss.iter().enumerate() {
                 let bs = (0..ss.len())
                     .map(|k| if k == j { "value" } else { "_" })
@@ -148,12 +182,8 @@ pub(crate) fn emit(
         } else {
             "value"
         };
-        let wrapper = if id.starts_with("q_") {
-            id.clone()
-        } else {
-            format!("f_{id}")
-        };
-        writeln!(out,"fn {wrapper}({})->{}{{let _call=NativeCall;let value=unsafe{{ink_rep_f_{id}({args})}};unsafe{{{value}}}}}",inputs.join(","),crate::definition_native::ty(result)?).unwrap();
+        let wrapper = format!("f_{id}");
+        writeln!(out,"fn {wrapper}({})->{}{{let _call=NativeCall::new();let value=unsafe{{ink_rep_f_{id}({args})}};unsafe{{{value}}}}}",inputs.join(","),crate::definition_native::ty(result)?).unwrap();
     }
     Ok(out)
 }

@@ -1,0 +1,36 @@
+#[derive(Clone, Copy)]
+struct StorageMeasure { nodes: usize, depth: usize }
+struct CachedMeasure { owner: WeakStorage, measure: StorageMeasure, generation: u32 }
+struct MeasureCache {
+    entries: std::collections::HashMap<(usize, usize), CachedMeasure>,
+    generation: u32,
+    visits: usize,
+    hits: usize,
+}
+impl MeasureCache {
+    const LIMIT: usize = 4096;
+    fn new() -> Self { Self { entries: std::collections::HashMap::new(), generation: 0, visits: 0, hits: 0 } }
+    fn begin(&mut self) {
+        if self.generation == u32::MAX {
+            self.entries.clear();
+            self.generation = 1;
+        } else { self.generation += 1; }
+        self.visits = 0;
+        self.hits = 0;
+    }
+    fn get(&mut self, key: (usize, usize)) -> Option<StorageMeasure> {
+        let cached = self.entries.get_mut(&key)?;
+        if !cached.owner.live() { return None; }
+        cached.generation = self.generation;
+        self.hits += 1;
+        Some(cached.measure)
+    }
+    fn insert(&mut self, key: (usize, usize), owner: WeakStorage, measure: StorageMeasure) {
+        if self.entries.len() >= Self::LIMIT {
+            self.entries.retain(|_, c| c.generation == self.generation && c.owner.live());
+            if self.entries.len() >= Self::LIMIT { self.entries.clear(); }
+        }
+        self.entries.insert(key, CachedMeasure { owner, measure, generation: self.generation });
+    }
+}
+thread_local! { static STORAGE_MEASURES: std::cell::RefCell<MeasureCache> = std::cell::RefCell::new(MeasureCache::new()); }

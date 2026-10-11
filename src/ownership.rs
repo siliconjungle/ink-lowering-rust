@@ -157,7 +157,7 @@ pub fn expr_mutates_state(p: &Program, e: &Expr) -> bool {
         Expr::Var(n) => p.keeps.iter().any(|k| &k.name == n),
         Expr::Method(base, m, args) => {
             let write = matches!(base.as_ref(), Expr::Var(r) if root(r))
-                && !matches!(m.as_str(), "get" | "contains" | "values");
+                && !matches!(m.as_str(), "get" | "contains" | "values" | "keys" | "intersect_keys" | "shared_keys" | "sum_by" | "count_where");
             write || expr_mutates_state(p, base) || args.iter().any(|a| expr_mutates_state(p, a))
         }
         Expr::Call(n, args) => {

@@ -1,5 +1,6 @@
 //! Straightforward lowering of checked first-order definitions, with no
-//! optimisation laws or representation recognisers. Rust/LLVM remain trusted.
+//! optimisation laws. Explicit scalar-spine storage preserves each constructor
+//! through chunks and borrowed views. Rust/LLVM remain trusted.
 use crate::{
     library::{self, Bundle, Object},
     logic::{Constructor, Declaration, Sort, Term},
@@ -34,10 +35,16 @@ struct Expression {
     code: String,
     sort: Sort,
     borrowed: bool,
+    packed_view: bool,
+    // A matched field already owns this immutable value. Reuse that owner when
+    // constructing another field instead of allocating an identical root.
+    shared_owner: Option<String>,
 }
 impl Expression {
     fn owned(&self) -> String {
-        if self.borrowed {
+        if self.packed_view {
+            format!("({}).to_owned()", self.code)
+        } else if self.borrowed {
             format!("({}).clone()", self.code)
         } else {
             self.code.clone()
@@ -58,6 +65,8 @@ struct Lower<'a> {
     nodes: usize,
     shared: bool,
     typed_only: bool,
+    packed_spines: bool,
+    identity_memo: bool,
 }
 pub(crate) fn ty(sort: &Sort) -> LangResult<String> {
     Ok(match sort {
@@ -109,6 +118,65 @@ impl Lower<'_> {
             Declaration::Datatype { constructors } => Ok(constructors.clone()),
             _ => Err("definition is not a datatype".into()),
         }
+    }
+    fn packed_cell(&self, id: &str) -> LangResult<Option<Sort>> {
+        if !self.packed_spines {
+            return Ok(None);
+        }
+        let cs = self.constructors(id)?;
+        Ok(
+            if cs.len() == 2
+                && cs[0].fields.is_empty()
+                && cs[1].fields.len() == 2
+                && cs[1].fields[1] == Sort::SelfType
+                && matches!(cs[1].fields[0], Sort::Bool | Sort::U64 | Sort::Data(_))
+            {
+                Some(cs[1].fields[0].clone())
+            } else {
+                None
+            },
+        )
+    }
+    fn packed_cell_type(&self, sort: &Sort) -> LangResult<String> {
+        let t = ty(sort)?;
+        Ok(if matches!(sort, Sort::Data(_)) {
+            format!("std::sync::Arc<{t}>")
+        } else {
+            t
+        })
+    }
+    fn is_packed(&self, sort: &Sort) -> LangResult<bool> {
+        if let Sort::Data(id) = sort {
+            Ok(self.packed_cell(id)?.is_some())
+        } else {
+            Ok(false)
+        }
+    }
+    fn input_type(&self, sort: &Sort) -> LangResult<String> {
+        if let Sort::Data(id) = sort {
+            if let Some(cell) = self.packed_cell(id)? {
+                return Ok(format!(
+                    "PackedView<'_,PackedTag_{id},{}>",
+                    self.packed_cell_type(&cell)?
+                ));
+            }
+        }
+        Ok(format!(
+            "{}{}",
+            if matches!(sort, Sort::Data(_)) {
+                "&"
+            } else {
+                ""
+            },
+            ty(sort)?
+        ))
+    }
+    fn argument(&self, e: &Expression) -> LangResult<String> {
+        Ok(if self.is_packed(&e.sort)? && !e.packed_view {
+            format!("({}).as_view()", e.argument())
+        } else {
+            e.argument()
+        })
     }
     fn select_sort(&mut self, sort: &Sort) -> LangResult<()> {
         if let Sort::Data(id) = sort {
@@ -295,6 +363,29 @@ impl Lower<'_> {
                 constructor,
                 arguments,
             } => {
+                if *constructor == 1 && self.packed_cell(datatype)?.is_some() {
+                    let head = self.expression(&arguments[0], env, current, depth + 1)?;
+                    let tail = self.expression(&arguments[1], env, current, depth + 1)?;
+                    return Ok(Expression {
+                        code: format!(
+                            "({}).prepend({})",
+                            tail.owned(),
+                            if matches!(head.sort, Sort::Data(_)) {
+                                if let Some(owner) = &head.shared_owner {
+                                    format!("std::sync::Arc::clone({owner})")
+                                } else {
+                                    format!("std::sync::Arc::new({})", head.owned())
+                                }
+                            } else {
+                                head.owned()
+                            }
+                        ),
+                        sort: Sort::Data(datatype.clone()),
+                        borrowed: false,
+                        packed_view: false,
+                        shared_owner: None,
+                    });
+                }
                 let cs = self.constructors(datatype)?;
                 let c = cs.get(*constructor).ok_or("invalid lowered constructor")?;
                 let detachable = self.typed_only && detachable_spine(&cs);
@@ -302,11 +393,8 @@ impl Lower<'_> {
                 for (t, s) in arguments.iter().zip(&c.fields) {
                     let e = self.expression(t, env, current, depth + 1)?;
                     args.push(if matches!(field_sort(s, datatype), Sort::Data(_)) {
-                        let value = format!("{}::new({})", self.storage(), e.owned());
-                        if detachable && *s == Sort::SelfType {
-                            format!("Some({value})")
-                        } else {
-                            value
+                        let value=if let Some(owner)=&e.shared_owner {format!("std::sync::Arc::clone({owner})")}else{format!("{}::new({})",self.storage(),e.owned())};
+                        if detachable && *s == Sort::SelfType {format!("Some({value})")}else{value
                         }
                     } else {
                         e.owned()
@@ -346,58 +434,106 @@ impl Lower<'_> {
                     return Err("invalid lowered match".into());
                 };
                 let cs = self.constructors(id)?;
+                let packed = self.packed_cell(id)?.is_some();
                 let detachable = self.typed_only && detachable_spine(&cs);
                 let mut arms = Vec::new();
                 let mut result = None;
                 for (i, (branch, constructor)) in branches.iter().zip(cs).enumerate() {
                     let mut local = env.clone();
                     let mut fields = Vec::new();
-                    for (name, s) in branch.bindings.iter().zip(constructor.fields) {
+                    for (field_index, (name, s)) in
+                        branch.bindings.iter().zip(constructor.fields).enumerate()
+                    {
                         let binder = self.fresh();
                         let sort = field_sort(&s, id);
                         let data = matches!(sort, Sort::Data(_));
                         local.insert(
                             name.clone(),
                             Expression {
-                                code: if data {
-                                    if detachable && s == Sort::SelfType {
-                                        format!(
-                                            "{binder}.as_deref().expect(\"live recursive edge\")"
-                                        )
-                                    } else {
-                                        format!("{binder}.as_ref()")
-                                    }
+                                code: if packed && data && field_index == 1 {binder.clone()}
+                                else if packed && data {format!("{binder}.as_ref()")}
+                                else if packed {binder.clone()}
+                                else if data {if detachable && s==Sort::SelfType{format!("{binder}.as_deref().expect(\"live recursive edge\")")}else{format!("{binder}.as_ref()")}
                                 } else {
                                     format!("*{binder}")
                                 },
                                 sort,
                                 borrowed: data,
+                                packed_view: packed && data && field_index == 1,
+                                shared_owner: if data
+                                    && self.shared
+                                    && (!packed || field_index == 0)
+                                {
+                                    Some(if packed {format!("&{binder}")} else if detachable && s==Sort::SelfType {format!("{binder}.as_ref().expect(\"live recursive edge\")")}else{binder.clone()})
+                                } else {
+                                    None
+                                },
                             },
                         );
                         fields.push(binder);
                     }
                     let b = self.expression(&branch.body, &local, current, depth + 1)?;
                     result = Some(b.sort.clone());
-                    arms.push(format!(
-                        "D_{id}::C{i}{} => {{ {} }}",
-                        if fields.is_empty() {
-                            String::new()
-                        } else {
-                            format!("({})", fields.join(","))
-                        },
-                        b.owned()
-                    ));
+                    arms.push(if packed {
+                        format!(
+                            "{}=>{{{}}}",
+                            if i == 0 {
+                                "None".into()
+                            } else {
+                                format!("Some(({}))", fields.join(","))
+                            },
+                            b.owned()
+                        )
+                    } else {
+                        format!(
+                            "D_{id}::C{i}{} => {{ {} }}",
+                            if fields.is_empty() {
+                                String::new()
+                            } else {
+                                format!("({})", fields.join(","))
+                            },
+                            b.owned()
+                        )
+                    });
                 }
                 (
-                    format!("match {} {{ {} }}", e.argument(), arms.join(",")),
+                    format!(
+                        "match {} {{ {} }}",
+                        if packed {
+                            format!("({}).view()", self.argument(&e)?)
+                        } else {
+                            e.argument()
+                        },
+                        arms.join(",")
+                    ),
                     result.ok_or("empty lowered match")?,
                 )
             }
+        };
+        fn closed_value(t: &Term) -> bool {
+            match t {
+                Term::Bool(_) | Term::U64(_) => true,
+                Term::Construct { arguments, .. } => arguments.iter().all(closed_value),
+                _ => false,
+            }
+        }
+        let shared_owner = if self.shared
+            && self.typed_only
+            && matches!(sort, Sort::Data(_))
+            && closed_value(t)
+        {
+            let name = self.fresh();
+            let ty = ty(&sort)?;
+            Some(format!("{{static {name}:std::sync::OnceLock<std::sync::Arc<{ty}>>=std::sync::OnceLock::new();{name}.get_or_init(||std::sync::Arc::new({code}))}}"))
+        } else {
+            None
         };
         Ok(Expression {
             code,
             sort,
             borrowed: false,
+            packed_view: false,
+            shared_owner,
         })
     }
     fn call(
@@ -408,19 +544,74 @@ impl Lower<'_> {
         current: &str,
         depth: usize,
     ) -> LangResult<(String, Sort)> {
-        let Declaration::Function { result, .. } = self.declaration(id)?.clone() else {
+        let Declaration::Function {
+            result,
+            body,
+            recursive,
+            ..
+        } = self.declaration(id)?.clone()
+        else {
             return Err("invalid lowered call".into());
         };
-        let args = args
+        let expressions = args
             .iter()
-            .map(|a| {
-                self.expression(a, env, current, depth + 1)
-                    .map(|e| e.argument())
-            })
+            .map(|a| self.expression(a, env, current, depth + 1))
             .collect::<LangResult<Vec<_>>>()?;
-        Ok((format!("d_{id}({})", args.join(",")), result))
+        let values = expressions
+            .iter()
+            .map(|e| self.argument(e))
+            .collect::<LangResult<Vec<_>>>()?;
+        let direct = format!("d_{id}({})", values.join(","));
+        if self.identity_memo
+            && id != current
+            && recursive.is_some()
+            && contains_self_call(&body)
+            && matches!(result, Sort::U64 | Sort::Bool)
+            && expressions.len() <= 5
+        {
+            let data = expressions
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| matches!(e.sort, Sort::Data(_)))
+                .collect::<Vec<_>>();
+            if data.len() == 1 && !data[0].1.packed_view {
+                if let Some(owner) = &data[0].1.shared_owner {
+                    let memo_input=self.fresh();
+                    let mut locals = format!("let {memo_input}={owner};");
+                    let mut call_args = values.clone();
+                    call_args[data[0].0]=format!("{memo_input}.as_ref()");
+                    let mut words = Vec::new();
+                    for (i, e) in expressions.iter().enumerate() {
+                        if matches!(e.sort, Sort::Data(_)) {
+                            continue;
+                        }
+                        let local = self.fresh();
+                        locals.push_str(&format!("let {local}={};", e.code));
+                        call_args[i] = local.clone();
+                        words.push(if e.sort == Sort::Bool {
+                            format!("u64::from({local})")
+                        } else {
+                            local
+                        });
+                    }
+                    words.resize(4, "0u64".into());
+                    let compute = format!("d_{id}({})", call_args.join(","));
+                    return Ok((
+                        format!(
+                            "{{{locals}ink_identity_memo({memo_input},{id:?},[{}],||{compute})}}",
+                            words.join(",")
+                        ),
+                        result,
+                    ));
+                }
+            }
+        }
+        Ok((direct, result))
     }
     fn datatype(&self, id: &str, cs: &[Constructor]) -> LangResult<String> {
+        if let Some(cell) = self.packed_cell(id)? {
+            return Ok(format!("#[derive(Debug)]pub struct PackedTag_{id};\npub type D_{id}=PackedSpine<PackedTag_{id},{}>;\n",self.packed_cell_type(&cell)?));
+        }
         let detachable = self.typed_only && detachable_spine(cs);
         let mut variants = Vec::new();
         let mut decode = Vec::new();
@@ -539,6 +730,29 @@ fn encode(&self)->Value{{let mut cursor=self;let mut rows=Vec::new();loop{{match
         Ok(format!("#[derive(Clone, Debug, PartialEq, Eq)]\npub enum D_{id} {{ {} }}\nimpl D_{id} {{\n fn decode(v: &Value) -> Result<Self, &'static str> {{ match v {{ Value::Data {{ datatype, constructor, arguments }} if datatype == \"{id}\" => match constructor {{ {} _ => Err(\"constructor or field count mismatch\") }}, _ => Err(\"datatype mismatch\") }} }}\n fn encode(&self) -> Value {{ match self {{ {} }} }}\n}}\n", variants.join(","), decode.join("\n"), encode.join("\n")))
     }
 }
+fn contains_self_call(term: &Term) -> bool {
+    match term {
+        Term::SelfCall(_) => true,
+        Term::Call { arguments, .. } | Term::Construct { arguments, .. } => {
+            arguments.iter().any(contains_self_call)
+        }
+        Term::Binary { left, right, .. } => contains_self_call(left) || contains_self_call(right),
+        Term::If {
+            condition,
+            on_true,
+            on_false,
+        } => {
+            contains_self_call(condition)
+                || contains_self_call(on_true)
+                || contains_self_call(on_false)
+        }
+        Term::Match {
+            scrutinee,
+            branches,
+        } => contains_self_call(scrutinee) || branches.iter().any(|b| contains_self_call(&b.body)),
+        _ => false,
+    }
+}
 pub(crate) fn decode_value(sort: &Sort, value: &str) -> String {
     match sort {
         Sort::Bool => format!("decode_bool({value})?"),
@@ -583,6 +797,19 @@ pub(crate) fn lower_typed_shared(
 ) -> LangResult<Emission> {
     lower_with_storage(checked, true, true, true, extras)
 }
+/// Exact chunked scalar spines, selected explicitly by the standalone target.
+pub(crate) fn lower_typed_packed(
+    checked: &ink_core::definition::CheckedDefinition,
+    extras: &BTreeMap<String, Declaration>,
+) -> LangResult<Emission> {
+    lower_with_storage_mode(checked, true, true, true, true, false, extras)
+}
+pub(crate) fn lower_typed_memo(
+    checked: &ink_core::definition::CheckedDefinition,
+    extras: &BTreeMap<String, Declaration>,
+) -> LangResult<Emission> {
+    lower_with_storage_mode(checked, true, true, true, false, true, extras)
+}
 /// Typed immutable storage for literal foreign functions. The generated C ABI
 /// borrows these objects directly; it never serialises physical state.
 pub(crate) fn lower_typed_shared_datatypes(
@@ -598,6 +825,20 @@ fn lower_with_storage(
     functions: bool,
     extras: &BTreeMap<String, Declaration>,
 ) -> LangResult<Emission> {
+    lower_with_storage_mode(checked, shared, typed_only, functions, false, false, extras)
+}
+fn lower_with_storage_mode(
+    checked: &ink_core::definition::CheckedDefinition,
+    shared: bool,
+    typed_only: bool,
+    functions: bool,
+    packed_spines: bool,
+    identity_memo: bool,
+    extras: &BTreeMap<String, Declaration>,
+) -> LangResult<Emission> {
+    if packed_spines && (!shared || !typed_only) {
+        return Err("packed spines require typed immutable storage".into());
+    }
     let bundle = checked.bundle();
     let exports = checked
         .exports()
@@ -636,6 +877,8 @@ fn lower_with_storage(
         nodes: 0,
         shared,
         typed_only,
+        packed_spines,
+        identity_memo,
     };
     for id in &exports {
         if !matches!(lower.declaration(id)?, Declaration::Function { .. }) {
@@ -644,6 +887,12 @@ fn lower_with_storage(
         lower.select(choices.get(id).unwrap_or(id))?;
     }
     let mut source = String::from("// ink-definition-rust-v1: checked bodies; Rust/backend are trusted.\n#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, unused_variables, unused_parens, unused_unsafe, improper_ctypes_definitions)]\n");
+    if packed_spines {
+        source.push_str(include_str!("packed_spine.rs.txt"));
+    }
+    if identity_memo {
+        source.push_str(include_str!("identity_memo.rs.txt"));
+    }
     source.push_str("#[inline(never)] fn ink_def_f32_word(v:f32)->u64{if v.is_nan(){0x7fc00000}else{v.to_bits() as u64}}\n");
     if !typed_only {
         source.push_str(include_str!("definition_value.rs.txt"));
@@ -668,17 +917,16 @@ fn lower_with_storage(
                 for (n, s) in params {
                     let binder = lower.fresh();
                     let data = matches!(s, Sort::Data(_));
-                    inputs.push(format!(
-                        "{binder}: {}{}",
-                        if data { "&" } else { "" },
-                        ty(&s)?
-                    ));
+                    let packed_view = lower.is_packed(&s)?;
+                    inputs.push(format!("{binder}: {}", lower.input_type(&s)?));
                     env.insert(
                         n,
                         Expression {
                             code: binder,
                             sort: s,
                             borrowed: data,
+                            packed_view,
+                            shared_owner: None,
                         },
                     );
                 }
@@ -711,7 +959,11 @@ fn lower_with_storage(
                 if matches!(s, Sort::Data(_)) { "&" } else { "" },
                 ty(s)?
             ));
-            args.push(binder);
+            args.push(if lower.is_packed(s)? {
+                format!("{binder}.as_view()")
+            } else {
+                binder
+            });
         }
         source.push_str(&format!(
             "pub fn f_{id}({}) -> {} {{ d_{target}({}) }}\n",
@@ -759,11 +1011,14 @@ fn lower_with_storage(
         executable_closure: selected,
         selections: exports.iter().map(|id| (id.clone(), choices.get(id).unwrap_or(id).clone())).collect(),
         selection_package_sha256: checked.selection_sha256().map(str::to_owned),
-        scope: "checked first-order definitions with compiler demand projections; trusted Rust lowering, codecs and Rust/LLVM backend; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound".into(),
+        scope: format!("checked first-order definitions with compiler demand projections; trusted Rust lowering, codecs and Rust/LLVM backend; {} storage; {}; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound",if packed_spines{"immutable scalar and shared-data chunks; checked u32 narrowing with exact u64 promotion; Boolean bitsets"}else if shared{"immutable shared Arc"}else{"boxed"},if typed_only{"typed entry points without a ground dispatcher"}else{"ground transport dispatcher"}),
     };
     Ok(Emission { source, receipt })
 }
 
+#[cfg(test)]
+#[path = "definition_sharing_tests.rs"]
+mod sharing_tests;
 /// Export the same sealed definitions through the C/Wasm ground-value word ABI.
 /// Scheduling and transport do not select or reinterpret implementation bodies.
 pub fn lower_portable(
