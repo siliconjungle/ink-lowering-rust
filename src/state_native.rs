@@ -1020,7 +1020,9 @@ fn emit_with_layout(
     storage: Option<&crate::storage::Policy>,
     layout: &crate::snapshot_wire::Layout,
 ) -> LangResult<String> {
-    if narrow && certificate.is_none() {return Err("bounded cache admission requires a source-bound representation entry".into());}
+    if narrow && certificate.is_none() {
+        return Err("bounded cache admission requires a source-bound representation entry".into());
+    }
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
     let execution = action_ir.execution()?;
@@ -1060,7 +1062,9 @@ fn emit_with_layout(
     out.push_str(include_str!("state_native_support.txt"));
     out.push_str("\nmod temporary {\n");
     out.push_str(include_str!("temporary.rs.txt"));
-    out.push_str("\n}\nuse temporary::{OwnedBuffer,OwnedMap};\n");
+    out.push_str(
+        "\n}\nuse temporary::{OwnedBuffer,OwnedMap,ink_parallel_map,ink_parallel_update};\n",
+    );
     out.push_str(r#"
 impl<T:Clone> Wire for OwnedBuffer<T>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
 impl<K:Ord+Clone,V:Clone> Wire for OwnedMap<K,V>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
@@ -1473,7 +1477,7 @@ impl Wire for {id} {{
             .join(",");
         writeln!(
             out,
-            "{}fn function_{}(&mut self,{params})->{}{{{body}}}",
+            "{}fn function_{}(&self,{params})->{}{{{body}}}",
             if ink_core::local_collections::owned(&f.result, p)
                 || f.params
                     .iter()

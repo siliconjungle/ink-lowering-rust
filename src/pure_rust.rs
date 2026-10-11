@@ -221,6 +221,21 @@ impl Emitter<'_> {
                 };
                 format!("({xs}).len() as u32")
             }
+            Expr::Call(n, args) if n == "parallel_map" => {
+                let Type::List(input) = self.infer(&args[0], env, None)? else {
+                    unreachable!()
+                };
+                let Type::List(output) = &t else {
+                    unreachable!()
+                };
+                let xs = self.expr(&args[0], env, None)?;
+                let grain = self.expr(&args[1], env, Some(&Type::U32))?;
+                let (vs, body) = self.lambda(&args[2], env, &[Type::U32, *input], output)?;
+                format!(
+                    "ink_parallel_map({xs},{grain},|{},{}|{{{body}}})",
+                    vs[0], vs[1]
+                )
+            }
             Expr::Call(n, args) if n == "repeat_until" => {
                 let limit = self.expr(&args[0], env, Some(&Type::U32))?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
@@ -279,6 +294,19 @@ impl Emitter<'_> {
                     _ => unreachable!(),
                 };
                 match n.as_str() {
+                    "map_parallel" => {
+                        let grain = self.expr(&args[0], env, Some(&Type::U32))?;
+                        let (vs, body) =
+                            self.lambda(&args[1], env, &[Type::U32, value.clone()], value)?;
+                        format!("OwnedBuffer::new(ink_parallel_update(({xv}).freeze(),{grain},|{},{}|{{{body}}}))",vs[0],vs[1])
+                    }
+                    "split_at" => {
+                        let at = self.expr(&args[0], env, Some(&Type::U32))?;
+                        let (vs, body) =
+                            self.lambda(&args[1], env, &[xt.clone(), xt.clone()], &xt)?;
+                        format!("{{let ({},{})=({xv}).split({at});{body}}}", vs[0], vs[1])
+                    }
+                    "append" => format!("({xv}).append({})", self.expr(&args[0], env, Some(&xt))?),
                     "len" | "pop" | "freeze" | "keys" | "values" => format!("({xv}).{n}()"),
                     "at_or" | "get_or" => {
                         let k = self.expr(&args[0], env, Some(&key))?;
@@ -408,6 +436,17 @@ impl Emitter<'_> {
                         };
                         format!("{{let {list}={xs};let {i}={index};match {list}.get({i} as usize){{Some(v)=>v.clone(),None=>{fallback}}}}}")
                     }
+                    "drop" | "take" => {
+                        let k = self.expr(&args[0], env, Some(&Type::U32))?;
+                        let list = self.fresh();
+                        let count = self.fresh();
+                        let edit = if n == "drop" {
+                            format!("{list}.drain(..{count});")
+                        } else {
+                            format!("{list}.truncate({count});")
+                        };
+                        format!("{{let mut {list}={xs};let {count}=({k} as usize).min({list}.len());{edit}{list}}}")
+                    }
                     "sort" => {
                         let list = self.fresh();
                         format!("{{let mut {list}={xs};{list}.sort();{list}}}")
@@ -464,13 +503,62 @@ impl Emitter<'_> {
         })
     }
 }
+impl Emitter<'_> {
+    fn tail(&mut self, e: &Expr, env: &Env, f: &Function) -> LangResult<String> {
+        Ok(match e {
+            Expr::Let(n, annotation, a, b) => {
+                let t = self.infer(a, env, annotation.as_deref())?;
+                let value = self.expr(a, env, Some(&t))?;
+                let v = self.fresh();
+                let mut local = env.clone();
+                local.insert(n.clone(), (v.clone(), t));
+                format!("let {v}={value};{}", self.tail(b, &local, f)?)
+            }
+            Expr::Call(n, a) if n == "choose" => format!(
+                "if {} {{{}}}else{{{}}}",
+                self.expr(&a[0], env, Some(&Type::Bool))?,
+                self.tail(&a[1], env, f)?,
+                self.tail(&a[2], env, f)?
+            ),
+            Expr::Call(n, a) if n == &f.name => {
+                let mut out = String::new();
+                let mut vs = vec![];
+                for (a, (_, t)) in a.iter().zip(&f.params) {
+                    let value = self.expr(a, env, Some(t))?;
+                    let v = self.fresh();
+                    out.push_str(&format!("let {v}={value};"));
+                    vs.push(v);
+                }
+                for ((n, _), v) in f.params.iter().zip(vs) {
+                    out.push_str(&format!("l_{n}={v};"));
+                }
+                out.push_str("continue;");
+                out
+            }
+            _ => format!("return {};", self.expr(e, env, Some(&f.result))?),
+        })
+    }
+}
+
 pub fn body(p: &Program, f: &Function) -> LangResult<String> {
     let env = f
         .params
         .iter()
         .map(|(n, t)| (n.clone(), (format!("l_{n}"), t.clone())))
         .collect();
-    Emitter { p, next: 0 }.expr(&f.body, &env, Some(&f.result))
+    let mut emitter = Emitter { p, next: 0 };
+    if !ink_core::recursion::recursive(f) {
+        return emitter.expr(&f.body, &env, Some(&f.result));
+    }
+    let binds = f
+        .params
+        .iter()
+        .map(|(n, _)| format!("let mut l_{n}=l_{n};"))
+        .collect::<String>();
+    Ok(format!(
+        "{{{binds}loop{{{}}}}}",
+        emitter.tail(&f.body, &env, f)?
+    ))
 }
 
 #[cfg(test)]
@@ -582,5 +670,53 @@ fn main() {
             String::from_utf8_lossy(&run.stderr)
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    #[test]
+    fn workers_are_bounded_nested_work_is_sequential_and_updates_reuse_allocation() {
+        use std::{fs, process::Command};
+        let root = std::env::temp_dir().join(format!("ink-parallel-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut source = include_str!("temporary.rs.txt").to_owned();
+        source.push_str(r#"
+fn main(){
+ std::env::set_var("INK_THREADS","4");
+ let seen=std::sync::Mutex::new(std::collections::HashSet::new());
+ let mut xs=Vec::with_capacity(512);xs.extend(0..256u32);let pointer=xs.as_ptr();let capacity=xs.capacity();
+ let output=ink_parallel_update(xs,16,|i,x|{
+  seen.lock().unwrap().insert(std::thread::current().id());
+  let nested=ink_parallel_map(vec![x,1],1,|j,y|{assert_eq!(ink_parallel_workers(1000,1),1);y+j});
+  i+nested[0]
+ });
+ assert_eq!(output.as_ptr(),pointer);assert_eq!(output.capacity(),capacity);
+ assert_eq!(output,(0..256u32).map(|x|x*2).collect::<Vec<_>>());
+ assert_eq!(seen.lock().unwrap().len(),4);
+ assert!(ink_parallel_map(Vec::<u32>::new(),0,|i,x|i+x).is_empty());
+ assert_eq!(ink_parallel_map(vec![3],u32::MAX,|i,x|i+x),vec![3]);
+}
+"#);
+        fs::write(root.join("test.rs"), source).unwrap();
+        let out = Command::new("rustc")
+            .args(["--edition=2021", "-O"])
+            .arg(root.join("test.rs"))
+            .arg("-o")
+            .arg(root.join("test"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = Command::new(root.join("test")).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
