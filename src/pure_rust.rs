@@ -426,7 +426,9 @@ impl Emitter<'_> {
                 if n == "count" {
                     let value = if let Expr::Var(n) = &args[0] {
                         env.get(n).ok_or("list binding")?.0.clone()
-                    } else { xs };
+                    } else {
+                        xs
+                    };
                     format!("({value}).len() as u64")
                 } else {
                     let iterator = Self::read_iterator(&args[0], &xs, env)?;
@@ -476,9 +478,6 @@ impl Emitter<'_> {
                 format!("{{let {a}={left};let {b}={right};let mut {out}=Vec::with_capacity({a}.len().checked_add({b}.len()).expect(\"concat allocation size overflow\"));{out}.extend_from_slice({a});{out}.extend_from_slice({b});{out}}}")
             }
             Expr::Method(xs, n, args) => {
-                let reuse = ink_core::collection_facts::reusable_private_receiver(
-                    self.p, e, &env.iter().map(|(n, (_, t))| (n.clone(), t.clone())).collect(), Some(&t)
-                );
                 let Type::List(inner) =
                     self.infer(xs, env, if n == "filter" { Some(&t) } else { None })?
                 else {
@@ -520,12 +519,9 @@ impl Emitter<'_> {
                         format!("{{let mut {list}={xs};{list}.sort();{list}}}")
                     }
                     "scan" => {
-                        let list = self.fresh();
                         let acc = self.fresh();
                         let item = self.fresh();
-                        if reuse {
-                            format!("{{let mut {list}={xs};let mut {acc}={};for {item} in {list}.iter_mut(){{{acc}={};*{item}={acc};}}{list}}}",Self::zero(&inner),Self::arithmetic("+",&acc,&format!("*{item}"),&inner))
-                        } else {
+                        {
                             format!("{{let mut {acc}={};({iterator}).map(|{item}|{{{acc}={};{acc}}}).collect::<Vec<_>>()}}",Self::zero(&inner),Self::arithmetic("+",&acc,&item,&inner))
                         }
                     }
@@ -544,25 +540,12 @@ impl Emitter<'_> {
                             vec![*inner]
                         };
                         let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
-                        if reuse {
-                            let list = self.fresh();
-                            if n == "filter" {
-                                format!("{{let mut {list}={xs};{list}.retain(|ink_ref|{{let {}=ink_ref.clone();{body}}});{list}}}",vs[0])
-                            } else {
-                                let i = self.fresh();
-                                let index = if n == "map_indexed" { format!("let {}={i} as u32;",vs[0]) } else { String::new() };
-                                let item = if n == "map_indexed" { &vs[1] } else { &vs[0] };
-                                format!("{{let mut {list}={xs};for {i} in 0..{list}.len(){{{index}let {item}={list}[{i}].clone();{list}[{i}]={body};}}{list}}}")
-                            }
-                        } else if n == "filter" {
+                        if n == "filter" {
                             format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}}).collect::<Vec<_>>()",vs[0])
                         } else if n == "map_indexed" {
                             format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}}).collect::<Vec<_>>()",vs[1],vs[0])
                         } else {
-                            format!(
-                                "({iterator}).map(|{}|{body}).collect::<Vec<_>>()",
-                                vs[0]
-                            )
+                            format!("({iterator}).map(|{}|{body}).collect::<Vec<_>>()", vs[0])
                         }
                     }
                     "zip" => {

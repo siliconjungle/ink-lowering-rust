@@ -246,7 +246,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     let e = Emit { checked, types };
     let p = checked.module().program();
     let plan = checked.plan();
-    let queries = crate::representation_query::declarations(checked)?;
+    let queries: BTreeMap<String, ink_core::logic::Declaration> = BTreeMap::new();
     let emission = if foreign {
         crate::definition_native::lower_typed_shared_datatypes(checked.definition())?
     } else {

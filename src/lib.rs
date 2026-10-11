@@ -11,7 +11,4 @@ pub mod representation_program;
 
 mod representation_ffi;
 
-/// Compile-time read-only observation projection.
-pub mod representation_query;
-
 mod representation_bounds;

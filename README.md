@@ -56,6 +56,4 @@ or produce incorrect results; raw native pointers also require valid alignment,
 length and lifetime. No malformed-input diagnostic or rollback is promised.
 Representation conversion/JSON parsing and explicit portable checkpoint integrity
 checks remain. Source/proof checking happens during compilation. Standalone
-representation calls skip whole-state checkpoint validation; read-only observation
-envelopes are erased when existing definitional computation establishes unchanged
-logical state/version and no events.
+representation calls skip whole-state checkpoint validation; query envelopes execute the literal proved physical step. Backend-specific envelope erasure has been removed.

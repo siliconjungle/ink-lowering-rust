@@ -993,7 +993,7 @@ impl Wire for {id} {{
 
     out.push_str("Ok(state)}\n");
 
-    // A single typed write primitive per root owns its undo and cache entries.
+    // A single typed write primitive per root owns its undo entries.
     for s in &p.states {
         let field = ident(&s.name);
         let Type::Table(k, v) = &s.ty else {
