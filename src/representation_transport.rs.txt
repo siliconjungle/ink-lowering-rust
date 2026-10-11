@@ -1,0 +1,51 @@
+// Iterative constructor transport. Long inductive spines consume nodes rather
+// than the host stack; malformed and oversized inputs fail before execution.
+pub fn input(t: ink_core::logic::Term, _depth: usize) -> ink_core::LangResult<Value> {
+    enum Work { Read(ink_core::logic::Term, usize), Build(String, usize, usize) }
+    let mut work = vec![Work::Read(t, 0)];
+    let mut values = Vec::new();
+    let mut nodes = 0;
+    while let Some(w) = work.pop() {
+        match w {
+            Work::Read(t, depth) => {
+                nodes += 1;
+                if depth > 8192 || nodes > 100_000 { return Err("native representation transport limit".into()); }
+                match t {
+                    ink_core::logic::Term::Bool(x) => values.push(Value::Bool(x)),
+                    ink_core::logic::Term::U64(x) => values.push(Value::U64(x)),
+                    ink_core::logic::Term::Construct { datatype, constructor, arguments } => {
+                        if datatype.len() != 64 || arguments.len() > 64 { return Err("native constructor limit".into()); }
+                        work.push(Work::Build(datatype, constructor, arguments.len()));
+                        work.extend(arguments.into_iter().rev().map(|x| Work::Read(x, depth + 1)));
+                    }
+                    _ => return Err("native input is not a value".into()),
+                }
+            }
+            Work::Build(datatype, constructor, arity) => {
+                let arguments = values.split_off(values.len() - arity);
+                values.push(Value::Data { datatype, constructor, arguments });
+            }
+        }
+    }
+    values.pop().ok_or("empty native value".into())
+}
+pub fn output(t: Value) -> ink_core::logic::Term {
+    enum Work { Read(Value), Build(String, usize, usize) }
+    let mut work = vec![Work::Read(t)];
+    let mut values = Vec::new();
+    while let Some(w) = work.pop() {
+        match w {
+            Work::Read(Value::Bool(x)) => values.push(ink_core::logic::Term::Bool(x)),
+            Work::Read(Value::U64(x)) => values.push(ink_core::logic::Term::U64(x)),
+            Work::Read(Value::Data { datatype, constructor, arguments }) => {
+                work.push(Work::Build(datatype, constructor, arguments.len()));
+                work.extend(arguments.into_iter().rev().map(Work::Read));
+            }
+            Work::Build(datatype, constructor, arity) => {
+                let arguments = values.split_off(values.len() - arity);
+                values.push(ink_core::logic::Term::Construct { datatype, constructor, arguments });
+            }
+        }
+    }
+    values.pop().expect("native output")
+}

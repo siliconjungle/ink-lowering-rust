@@ -57,6 +57,7 @@ struct Lower<'a> {
     binder: usize,
     nodes: usize,
     shared: bool,
+    typed_only: bool,
 }
 pub(crate) fn ty(sort: &Sort) -> LangResult<String> {
     Ok(match sort {
@@ -219,28 +220,57 @@ impl Lower<'_> {
             Term::Binary { op, left, right } => {
                 let l = self.expression(left, env, current, depth + 1)?;
                 let r = self.expression(right, env, current, depth + 1)?;
-                let (code, sort) = match op.as_str() {
-                    "+" | "-" | "*" => {
-                        let method = match op.as_str() {
-                            "+" => "wrapping_add",
-                            "-" => "wrapping_sub",
-                            _ => "wrapping_mul",
-                        };
-                        (format!("({}).{method}({})", l.code, r.code), Sort::U64)
-                    }
-                    "&&" | "||" => (
-                        format!(
-                            "(({}) {} ({}))",
-                            l.code,
-                            if op == "&&" { "&" } else { "|" },
-                            r.code
+                let (code, sort) = if let Some(operator) = op.strip_prefix("f32:") {
+                    let a = format!("f32::from_bits(({}) as u32)", l.code);
+                    let b = format!("f32::from_bits(({}) as u32)", r.code);
+                    match operator {
+                        "neg" => (
+                            format!("(({} as u32) ^ 0x80000000u32) as u64", l.code),
+                            Sort::U64,
                         ),
-                        Sort::Bool,
-                    ),
-                    "==" | "!=" | "<" | "<=" | ">" | ">=" => {
-                        (format!("(({}) {op} ({}))", l.code, r.code), Sort::Bool)
+                        "+" | "-" | "*" => (
+                            format!("(({a}) {operator} ({b})).to_bits() as u64"),
+                            Sort::U64,
+                        ),
+                        "==" | "!=" | "<" | "<=" | ">" | ">=" => {
+                            (format!("(({a}) {operator} ({b}))"), Sort::Bool)
+                        }
+                        _ => return Err("unsupported binary32 primitive".into()),
                     }
-                    _ => return Err("unsupported lowered primitive".into()),
+                } else {
+                    match op.as_str() {
+                        "+" | "-" | "*" => {
+                            let method = match op.as_str() {
+                                "+" => "wrapping_add",
+                                "-" => "wrapping_sub",
+                                _ => "wrapping_mul",
+                            };
+                            (format!("({}).{method}({})", l.code, r.code), Sort::U64)
+                        }
+                        "quot" | "rem" => (
+                            format!(
+                                "({}).checked_{}({}).unwrap_or(0)",
+                                l.code,
+                                if op == "quot" { "div" } else { "rem" },
+                                r.code
+                            ),
+                            Sort::U64,
+                        ),
+                        "&" => (format!("(({}) & ({}))", l.code, r.code), Sort::U64),
+                        "&&" | "||" => (
+                            format!(
+                                "(({}) {} ({}))",
+                                l.code,
+                                if op == "&&" { "&" } else { "|" },
+                                r.code
+                            ),
+                            Sort::Bool,
+                        ),
+                        "==" | "!=" | "<" | "<=" | ">" | ">=" => {
+                            (format!("(({}) {op} ({}))", l.code, r.code), Sort::Bool)
+                        }
+                        _ => return Err("unsupported lowered primitive".into()),
+                    }
                 };
                 (code, sort)
             }
@@ -415,6 +445,71 @@ impl Lower<'_> {
             ));
             encode.push(format!("Self::C{i}{} => Value::Data {{ datatype: \"{id}\".into(), constructor: {i}, arguments: vec![{}] }},", if bs.is_empty() { String::new() } else { format!("({})", bs.join(",")) }, es.join(",")));
         }
+        // Literal codecs for a linear inductive spine use a loop. This is a
+        // structural ABI lowering, independent of database algorithm identity.
+        if self.typed_only {
+            let mut code = format!(
+                "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum D_{id} {{ {} }}\n",
+                variants.join(",")
+            );
+            // A linear inductive spine must also be released iteratively. In
+            // Wasm, ordinary Arc drop glue otherwise consumes the engine's
+            // call stack even when literal evaluation itself fits its limits.
+            if cs[0].fields.is_empty()
+                && cs
+                    .iter()
+                    .skip(1)
+                    .all(|c| c.fields.iter().filter(|s| **s == Sort::SelfType).count() == 1)
+            {
+                code.push_str(&format!("impl D_{id}{{fn take_tail(&mut self)->Option<std::sync::Arc<Self>>{{match self{{Self::C0=>None,"));
+                for (i, c) in cs.iter().enumerate().skip(1) {
+                    let bs = c
+                        .fields
+                        .iter()
+                        .map(|s| if *s == Sort::SelfType { "tail" } else { "_" })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    code.push_str(&format!("Self::C{i}({bs})=>Some(std::mem::replace(tail,std::sync::Arc::new(Self::C0))),"));
+                }
+                code.push_str("}}}\n");
+                code.push_str(&format!("impl Drop for D_{id}{{fn drop(&mut self){{let mut pending=self.take_tail();while let Some(tail)=pending{{match std::sync::Arc::try_unwrap(tail){{Ok(mut node)=>pending=node.take_tail(),Err(_)=>break,}}}}}}}}\n"));
+            }
+            return Ok(code);
+        }
+        if cs.len() == 2
+            && cs[0].fields.is_empty()
+            && cs[1].fields.last() == Some(&Sort::SelfType)
+            && cs[1].fields[..cs[1].fields.len() - 1]
+                .iter()
+                .all(|s| *s != Sort::SelfType)
+        {
+            let fields = &cs[1].fields[..cs[1].fields.len() - 1];
+            let ds = fields
+                .iter()
+                .enumerate()
+                .map(|(j, s)| {
+                    let d = decode_value(s, &format!("&arguments[{j}]"));
+                    if matches!(s, Sort::Data(_)) {
+                        format!("{}::new({d})", self.storage())
+                    } else {
+                        d
+                    }
+                })
+                .collect::<Vec<_>>();
+            let bs = (0..fields.len())
+                .map(|j| format!("b{j}"))
+                .collect::<Vec<_>>();
+            let es = fields
+                .iter()
+                .zip(&bs)
+                .map(|(s, b)| encode_value(s, b, true))
+                .collect::<Vec<_>>();
+            let n = fields.len();
+            return Ok(format!("#[derive(Clone, Debug, PartialEq, Eq)]\npub enum D_{id} {{ {} }}\nimpl D_{id} {{
+fn decode(v:&Value)->Result<Self,&'static str>{{let mut cursor=v;let mut rows=Vec::new();loop{{match cursor{{Value::Data{{datatype,constructor,arguments}} if datatype==\"{id}\"=>match (*constructor,arguments.len()){{(0,0)=>break,(1,{})=>{{if rows.len()>=4096{{return Err(\"inductive spine limit\");}}rows.push(arguments);cursor=&arguments[{n}];}},_=>return Err(\"constructor or field count mismatch\")}},_=>return Err(\"datatype mismatch\")}}}}let mut tail=Self::C0;for arguments in rows.into_iter().rev(){{tail=Self::C1({}{}::new(tail));}}Ok(tail)}}
+fn encode(&self)->Value{{let mut cursor=self;let mut rows=Vec::new();loop{{match cursor{{Self::C0=>break,Self::C1({}tail)=>{{rows.push(vec![{}]);cursor=tail.as_ref();}}}}}}let mut tail=Value::Data{{datatype:\"{id}\".into(),constructor:0,arguments:vec![]}};for mut arguments in rows.into_iter().rev(){{arguments.push(tail);tail=Value::Data{{datatype:\"{id}\".into(),constructor:1,arguments}};}}tail}}
+}}\n",variants.join(","),n+1, if ds.is_empty(){String::new()}else{format!("{},",ds.join(","))},self.storage(),if bs.is_empty(){String::new()}else{format!("{},",bs.join(","))},es.join(",")));
+        }
         Ok(format!("#[derive(Clone, Debug, PartialEq, Eq)]\npub enum D_{id} {{ {} }}\nimpl D_{id} {{\n fn decode(v: &Value) -> Result<Self, &'static str> {{ match v {{ Value::Data {{ datatype, constructor, arguments }} if datatype == \"{id}\" => match constructor {{ {} _ => Err(\"constructor or field count mismatch\") }}, _ => Err(\"datatype mismatch\") }} }}\n fn encode(&self) -> Value {{ match self {{ {} }} }}\n}}\n", variants.join(","), decode.join("\n"), encode.join("\n")))
     }
 }
@@ -453,18 +548,96 @@ pub fn emit_selected(
 }
 /// Only a core-checked witness may enter this backend.
 pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Emission> {
-    lower_with_storage(checked, false)
+    lower_with_storage(checked, false, false, true)
 }
 /// Pure immutable constructor fields may share storage. Equality and dynamic
 /// transport stay structural; no pointer identity acquires semantic meaning.
 pub(crate) fn lower_shared(
     checked: &ink_core::definition::CheckedDefinition,
 ) -> LangResult<Emission> {
-    lower_with_storage(checked, true)
+    lower_with_storage(checked, true, false, true)
+}
+/// Literal typed functions only: no generic constructor carrier or dispatcher.
+pub(crate) fn lower_typed_shared(
+    checked: &ink_core::definition::CheckedDefinition,
+) -> LangResult<Emission> {
+    lower_with_storage(checked, true, true, true)
+}
+/// Typed immutable storage for literal foreign functions. The generated C ABI
+/// borrows these objects directly; it never serialises physical state.
+pub(crate) fn lower_typed_shared_datatypes(
+    checked: &ink_core::definition::CheckedDefinition,
+) -> LangResult<Emission> {
+    lower_with_storage(checked, true, true, false)
+}
+/// Emit an additional literal function over the sealed declaration types.
+/// The representation compiler checks the residual term using the existing
+/// equality context; this emitter grants no replacement authority.
+pub(crate) fn literal_function(
+    checked: &ink_core::definition::CheckedDefinition,
+    name: &str,
+    declaration: &Declaration,
+) -> LangResult<String> {
+    let objects = checked
+        .bundle()
+        .objects
+        .iter()
+        .map(|(id, raw)| {
+            Ok((
+                id.clone(),
+                serde_json::from_str::<Object>(raw).map_err(|e| e.to_string())?,
+            ))
+        })
+        .collect::<LangResult<BTreeMap<_, _>>>()?;
+    let mut lower = Lower {
+        objects: &objects,
+        selected: BTreeSet::new(),
+        binder: 0,
+        nodes: 0,
+        shared: true,
+        typed_only: true,
+    };
+    let Declaration::Function {
+        params,
+        result,
+        body,
+        ..
+    } = declaration
+    else {
+        return Err("literal function".into());
+    };
+    let mut env = BTreeMap::new();
+    let mut inputs = vec![];
+    for (n, s) in params {
+        let binder = lower.fresh();
+        let data = matches!(s, Sort::Data(_));
+        inputs.push(format!(
+            "{binder}:{}{}",
+            if data { "&" } else { "" },
+            ty(s)?
+        ));
+        env.insert(
+            n.clone(),
+            Expression {
+                code: binder,
+                sort: s.clone(),
+                borrowed: data,
+            },
+        );
+    }
+    let value = lower.expression(body, &env, name, 0)?;
+    Ok(format!(
+        "fn {name}({})->{}{{{}}}\n",
+        inputs.join(","),
+        ty(result)?,
+        value.owned()
+    ))
 }
 fn lower_with_storage(
     checked: &ink_core::definition::CheckedDefinition,
     shared: bool,
+    typed_only: bool,
+    functions: bool,
 ) -> LangResult<Emission> {
     let bundle = checked.bundle();
     let exports = checked.exports();
@@ -486,6 +659,7 @@ fn lower_with_storage(
         binder: 0,
         nodes: 0,
         shared,
+        typed_only,
     };
     for id in exports {
         if !matches!(lower.declaration(id)?, Declaration::Function { .. }) {
@@ -493,8 +667,10 @@ fn lower_with_storage(
         }
         lower.select(choices.get(id).unwrap_or(id))?;
     }
-    let mut source = String::from("// ink-definition-rust-v1: checked bodies; Rust/backend are trusted.\n#![allow(non_camel_case_types, dead_code, unused_variables, unused_parens)]\n");
-    source.push_str(include_str!("definition_value.rs.txt"));
+    let mut source = String::from("// ink-definition-rust-v1: checked bodies; Rust/backend are trusted.\n#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, unused_variables, unused_parens, unused_unsafe, improper_ctypes_definitions)]\n");
+    if !typed_only {
+        source.push_str(include_str!("definition_value.rs.txt"));
+    }
     let selected: Vec<_> = lower.selected.iter().cloned().collect();
     for id in &selected {
         match lower.declaration(id)?.clone() {
@@ -507,6 +683,9 @@ fn lower_with_storage(
                 body,
                 ..
             } => {
+                if !functions {
+                    continue;
+                }
                 let mut env = BTreeMap::new();
                 let mut inputs = Vec::new();
                 for (n, s) in params {
@@ -541,7 +720,7 @@ fn lower_with_storage(
         }
     }
     // Typed exports are wrappers, not mutable definition identities.
-    for id in exports {
+    for id in exports.iter().filter(|_| functions) {
         let Declaration::Function { params, result, .. } = &objects[id].declaration else {
             unreachable!()
         };
@@ -564,33 +743,35 @@ fn lower_with_storage(
             args.join(",")
         ));
     }
-    source.push_str("pub fn invoke(function: &str, args: &[Value]) -> Result<Value, &'static str> { validate_inputs(args)?; match function {\n");
-    for id in exports {
-        let Declaration::Function { params, result, .. } = &objects[id].declaration else {
-            unreachable!()
-        };
-        let mut inputs = Vec::new();
-        source.push_str(&format!(
-            "\"{id}\" if args.len() == {} => {{\n",
-            params.len()
-        ));
-        for (i, (_, s)) in params.iter().enumerate() {
+    if !typed_only {
+        source.push_str("pub fn invoke(function: &str, args: &[Value]) -> Result<Value, &'static str> { validate_inputs(args)?; match function {\n");
+        for id in exports {
+            let Declaration::Function { params, result, .. } = &objects[id].declaration else {
+                unreachable!()
+            };
+            let mut inputs = Vec::new();
             source.push_str(&format!(
-                "let a{i} = {};\n",
-                decode_value(s, &format!("&args[{i}]"))
+                "\"{id}\" if args.len() == {} => {{\n",
+                params.len()
             ));
-            inputs.push(format!(
-                "{}a{i}",
-                if matches!(s, Sort::Data(_)) { "&" } else { "" }
+            for (i, (_, s)) in params.iter().enumerate() {
+                source.push_str(&format!(
+                    "let a{i} = {};\n",
+                    decode_value(s, &format!("&args[{i}]"))
+                ));
+                inputs.push(format!(
+                    "{}a{i}",
+                    if matches!(s, Sort::Data(_)) { "&" } else { "" }
+                ));
+            }
+            source.push_str(&format!(
+                "let result = f_{id}({}); Ok({}) }},\n",
+                inputs.join(","),
+                encode_value(result, "result", false)
             ));
         }
-        source.push_str(&format!(
-            "let result = f_{id}({}); Ok({}) }},\n",
-            inputs.join(","),
-            encode_value(result, "result", false)
-        ));
+        source.push_str("_ => Err(\"unknown export or argument count mismatch\") } }\n");
     }
-    source.push_str("_ => Err(\"unknown export or argument count mismatch\") } }\n");
     if source.len() > 16_000_000 {
         return Err("definition source size limit".into());
     }

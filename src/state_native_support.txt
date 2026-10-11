@@ -1,4 +1,6 @@
 // Shared support for generated native applications. No parser or evaluator.
+// CALLER CONTRACT: correctly typed, canonical arguments; no runtime type validation.
+// Malformed arguments may panic or produce incorrect results. Native raw ABIs may corrupt memory.
 use num_bigint::BigInt;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
@@ -9,46 +11,44 @@ pub trait Wire: Sized {
 macro_rules! unsigned_wire {
     ($t:ty) => { impl Wire for $t {
         fn to_json(&self) -> Json { json!(self) }
-        fn from_json(v:&Json)->Result<Self,String> { v.as_u64().and_then(|n| n.try_into().ok()).ok_or("invalid unsigned integer".into()) }
+        fn from_json(v:&Json)->Result<Self,String> { Ok(v.as_u64().unwrap() as $t) }
     } };
 }
 unsigned_wire!(u32); unsigned_wire!(u64);
 impl Wire for () {
     fn to_json(&self)->Json { Json::Null }
-    fn from_json(v:&Json)->Result<Self,String>{ if v.is_null(){Ok(())}else{Err("expected Unit".into())} }
+    fn from_json(v:&Json)->Result<Self,String>{ let _=v;Ok(()) }
 }
 impl Wire for bool {
     fn to_json(&self)->Json{json!(self)}
-    fn from_json(v:&Json)->Result<Self,String>{v.as_bool().ok_or("expected Bool".into())}
+    fn from_json(v:&Json)->Result<Self,String>{Ok(v.as_bool().unwrap())}
 }
 impl Wire for String {
     fn to_json(&self)->Json{json!(self)}
-    fn from_json(v:&Json)->Result<Self,String>{v.as_str().map(str::to_owned).ok_or("expected String".into())}
+    fn from_json(v:&Json)->Result<Self,String>{Ok(v.as_str().unwrap().to_owned())}
 }
 impl Wire for BigInt {
     fn to_json(&self)->Json{json!({"Int":self.to_string()})}
-    fn from_json(v:&Json)->Result<Self,String>{v.get("Int").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string()).parse().map_err(|_|"expected Int".into())}
+    fn from_json(v:&Json)->Result<Self,String>{v.get("Int").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string()).parse().map_or_else(|_|panic!("caller Int precondition"),Ok)}
 }
 impl<T:Wire> Wire for Vec<T> {
     fn to_json(&self)->Json{self.iter().map(Wire::to_json).collect()}
-    fn from_json(v:&Json)->Result<Self,String>{v.as_array().ok_or("expected List")?.iter().map(T::from_json).collect()}
+    fn from_json(v:&Json)->Result<Self,String>{v.as_array().unwrap().iter().map(T::from_json).collect()}
 }
 impl<T:Wire> Wire for Option<T> {
     fn to_json(&self)->Json{match self{Some(v)=>json!({"Some":v.to_json()}),None=>json!({"None":null})}}
     fn from_json(v:&Json)->Result<Self,String>{
-        let obj=v.as_object().ok_or("expected Option")?;
-        if obj.len()!=1 {return Err("expected one tag".into())}
+        let obj=v.as_object().unwrap();
         if let Some(x)=obj.get("Some"){Ok(Some(T::from_json(x)?))}
-        else if obj.get("None")==Some(&Json::Null){Ok(None)}else{Err("invalid Option".into())}
+        else {Ok(None)}
     }
 }
 impl<T:Wire,E:Wire> Wire for Result<T,E> {
     fn to_json(&self)->Json{match self{Ok(v)=>json!({"Ok":v.to_json()}),Err(e)=>json!({"Err":e.to_json()})}}
     fn from_json(v:&Json)->Result<Self,String>{
-        let obj=v.as_object().ok_or("expected Result")?;
-        if obj.len()!=1 {return Err("expected one tag".into())}
+        let obj=v.as_object().unwrap();
         if let Some(x)=obj.get("Ok"){Ok(Ok(T::from_json(x)?))}
-        else if let Some(x)=obj.get("Err"){Ok(Err(E::from_json(x)?))}else{Err("invalid Result".into())}
+        else {Ok(Err(E::from_json(obj.get("Err").unwrap())?))}
     }
 }
 #[derive(Clone, Debug)]
@@ -74,25 +74,23 @@ impl<T:Wire> OutcomeView<'_,T> {
 
 impl Wire for i32 {
  fn to_json(&self)->Json{json!(self)}
- fn from_json(v:&Json)->Result<Self,String>{v.as_i64().and_then(|n|n.try_into().ok()).ok_or("invalid i32".into())}
+ fn from_json(v:&Json)->Result<Self,String>{Ok(v.as_i64().unwrap() as i32)}
 }
 impl Wire for f32 {
  fn to_json(&self)->Json{if self.is_finite(){json!(self)}else{json!({"F32Bits":self.to_bits()})}}
  fn from_json(v:&Json)->Result<Self,String>{
-  if let Some(n)=v.as_f64(){let f=n as f32;if f.is_finite(){return Ok(f)}return Err("f32 overflow".into())}
-  if let Some(o)=v.as_object(){if o.len()==1{if let Some(b)=o.get("F32Bits").and_then(Json::as_u64).and_then(|n|u32::try_from(n).ok()){return Ok(Self::from_bits(b))}}}
-  Err("expected finite f32 or F32Bits".into())
+  Ok(if let Some(n)=v.as_f64(){n as f32}else{Self::from_bits(v["F32Bits"].as_u64().unwrap() as u32)})
  }
 }
 impl<T:Wire,const N:usize> Wire for [T;N] {
  fn to_json(&self)->Json{self.iter().map(Wire::to_json).collect()}
- fn from_json(v:&Json)->Result<Self,String>{let a=v.as_array().ok_or("expected vector")?;if a.len()!=N{return Err("vector dimension mismatch".into())}a.iter().map(T::from_json).collect::<Result<Vec<_>,_>>()?.try_into().map_err(|_|"vector dimension mismatch".into())}
+ fn from_json(v:&Json)->Result<Self,String>{let a=v.as_array().unwrap();Ok(std::array::from_fn(|i|T::from_json(&a[i]).unwrap()))}
 }
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)] pub enum InkArithmeticError {Overflow}
 impl Wire for InkArithmeticError {
  fn to_json(&self)->Json{json!("ArithmeticError.Overflow")}
- fn from_json(v:&Json)->Result<Self,String>{if v.as_str()==Some("ArithmeticError.Overflow"){Ok(Self::Overflow)}else{Err("invalid arithmetic error".into())}}
+ fn from_json(v:&Json)->Result<Self,String>{let _=v;Ok(Self::Overflow)}
 }
 
 impl<T:Wire> Wire for Box<T> { fn to_json(&self)->Json { (**self).to_json() } fn from_json(v:&Json)->Result<Self,String> { Ok(Box::new(T::from_json(v)?)) } }

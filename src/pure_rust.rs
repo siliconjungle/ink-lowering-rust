@@ -61,6 +61,15 @@ impl Emitter<'_> {
             _ => "0u64".into(),
         }
     }
+    // Read-only traversals borrow a lexical list instead of cloning the entire
+    // vector. Computed receivers still finish eagerly and are consumed once.
+    fn read_iterator(e: &Expr, value: &str, env: &Env) -> LangResult<String> {
+        Ok(if let Expr::Var(n) = e {
+            format!("({}).iter().cloned()", env.get(n).ok_or("list binding")?.0)
+        } else {
+            format!("({value}).into_iter()")
+        })
+    }
     fn lambda(
         &mut self,
         e: &Expr,
@@ -426,11 +435,12 @@ impl Emitter<'_> {
                     return Err("fold input".into());
                 };
                 let xs = self.expr(&args[0], env, None)?;
+                let iterator = Self::read_iterator(&args[0], &xs, env)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 let (vs, body) = self.lambda(&args[2], env, &[*inner, t.clone()], &t)?;
-                let list = self.fresh();
                 let acc = self.fresh();
-                format!("{{let {list}={xs};let mut {acc}={initial};for {} in {list}.into_iter().rev() {{let {}={acc};{acc}={body};}}{acc}}}",vs[0],vs[1])
+                let list = self.fresh();
+                format!("{{let {list}={iterator};let mut {acc}={initial};for {} in {list}.rev() {{let {}={acc};{acc}={body};}}{acc}}}",vs[0],vs[1])
             }
             Expr::Call(n, args) if n == "sum" || n == "count" => {
                 let context = if n == "sum" {
@@ -440,12 +450,16 @@ impl Emitter<'_> {
                 };
                 let xs = self.expr(&args[0], env, context.as_ref())?;
                 if n == "count" {
-                    format!("({xs}).len() as u64")
+                    let value = if let Expr::Var(n) = &args[0] {
+                        env.get(n).ok_or("list binding")?.0.clone()
+                    } else { xs };
+                    format!("({value}).len() as u64")
                 } else {
+                    let iterator = Self::read_iterator(&args[0], &xs, env)?;
                     let acc = self.fresh();
                     let item = self.fresh();
                     format!(
-                        "({xs}).into_iter().fold({},|{acc},{item}|{})",
+                        "({iterator}).fold({},|{acc},{item}|{})",
                         Self::zero(&t),
                         Self::arithmetic("+", &acc, &item, &t)
                     )
@@ -473,12 +487,12 @@ impl Emitter<'_> {
                 // Borrow variable operands directly. Computed operands are evaluated
                 // once and their temporaries live through the two result copies.
                 let left = if let Expr::Var(n) = xs.as_ref() {
-                    format!("&l_{n}")
+                    format!("&{}", env.get(n).ok_or("list binding")?.0)
                 } else {
                     format!("&({})", self.expr(xs, env, Some(&t))?)
                 };
                 let right = if let Expr::Var(n) = &args[0] {
-                    format!("&l_{n}")
+                    format!("&{}", env.get(n).ok_or("list binding")?.0)
                 } else {
                     format!("&({})", self.expr(&args[0], env, Some(&t))?)
                 };
@@ -488,12 +502,17 @@ impl Emitter<'_> {
                 format!("{{let {a}={left};let {b}={right};let mut {out}=Vec::with_capacity({a}.len().checked_add({b}.len()).expect(\"concat allocation size overflow\"));{out}.extend_from_slice({a});{out}.extend_from_slice({b});{out}}}")
             }
             Expr::Method(xs, n, args) => {
+                let reuse = ink_core::collection_facts::reusable_private_receiver(
+                    self.p, e, &env.iter().map(|(n, (_, t))| (n.clone(), t.clone())).collect(), Some(&t)
+                );
                 let Type::List(inner) =
                     self.infer(xs, env, if n == "filter" { Some(&t) } else { None })?
                 else {
                     return Err("list receiver".into());
                 };
-                let xs = self.expr(xs, env, None)?;
+                let receiver = xs.as_ref();
+                let xs = self.expr(receiver, env, None)?;
+                let iterator = Self::read_iterator(receiver, &xs, env)?;
                 match n.as_str() {
                     "at_or" => {
                         let index = self.expr(&args[0], env, Some(&Type::U32))?;
@@ -530,7 +549,11 @@ impl Emitter<'_> {
                         let list = self.fresh();
                         let acc = self.fresh();
                         let item = self.fresh();
-                        format!("{{let {list}={xs};let mut {acc}={};{list}.into_iter().map(|{item}|{{{acc}={};{acc}}}).collect::<Vec<_>>()}}",Self::zero(&inner),Self::arithmetic("+",&acc,&item,&inner))
+                        if reuse {
+                            format!("{{let mut {list}={xs};let mut {acc}={};for {item} in {list}.iter_mut(){{{acc}={};*{item}={acc};}}{list}}}",Self::zero(&inner),Self::arithmetic("+",&acc,&format!("*{item}"),&inner))
+                        } else {
+                            format!("{{let mut {acc}={};({iterator}).map(|{item}|{{{acc}={};{acc}}}).collect::<Vec<_>>()}}",Self::zero(&inner),Self::arithmetic("+",&acc,&item,&inner))
+                        }
                     }
                     "map" | "filter" | "map_indexed" => {
                         let output = if n == "filter" {
@@ -547,13 +570,23 @@ impl Emitter<'_> {
                             vec![*inner]
                         };
                         let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
-                        if n == "filter" {
-                            format!("({xs}).into_iter().filter(|ink_ref|{{let {}=ink_ref.clone();{body}}}).collect::<Vec<_>>()",vs[0])
+                        if reuse {
+                            let list = self.fresh();
+                            if n == "filter" {
+                                format!("{{let mut {list}={xs};{list}.retain(|ink_ref|{{let {}=ink_ref.clone();{body}}});{list}}}",vs[0])
+                            } else {
+                                let i = self.fresh();
+                                let index = if n == "map_indexed" { format!("let {}={i} as u32;",vs[0]) } else { String::new() };
+                                let item = if n == "map_indexed" { &vs[1] } else { &vs[0] };
+                                format!("{{let mut {list}={xs};for {i} in 0..{list}.len(){{{index}let {item}={list}[{i}].clone();{list}[{i}]={body};}}{list}}}")
+                            }
+                        } else if n == "filter" {
+                            format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}}).collect::<Vec<_>>()",vs[0])
                         } else if n == "map_indexed" {
-                            format!("({xs}).into_iter().enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}}).collect::<Vec<_>>()",vs[1],vs[0])
+                            format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}}).collect::<Vec<_>>()",vs[1],vs[0])
                         } else {
                             format!(
-                                "({xs}).into_iter().map(|{}|{body}).collect::<Vec<_>>()",
+                                "({iterator}).map(|{}|{body}).collect::<Vec<_>>()",
                                 vs[0]
                             )
                         }
@@ -566,10 +599,11 @@ impl Emitter<'_> {
                             return Err("zip output".into());
                         };
                         let ys = self.expr(&args[0], env, None)?;
+                        let right_iterator = Self::read_iterator(&args[0], &ys, env)?;
                         let (vs, body) = self.lambda(&args[1], env, &[*inner, *other], out)?;
                         let a = self.fresh();
                         let b = self.fresh();
-                        format!("{{let {a}={xs};let {b}={ys};{a}.into_iter().zip({b}).map(|({},{})|{body}).collect::<Vec<_>>()}}",vs[0],vs[1])
+                        format!("{{let {a}={iterator};let {b}={right_iterator};{a}.zip({b}).map(|({},{})|{body}).collect::<Vec<_>>()}}",vs[0],vs[1])
                     }
                     _ => return Err(format!("unsupported pure method {n}")),
                 }
