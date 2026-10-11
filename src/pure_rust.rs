@@ -3,18 +3,9 @@ use crate::{check, syntax::*, LangResult};
 use std::collections::BTreeMap;
 type Env = BTreeMap<String, (String, Type)>;
 fn references(e: &Expr, name: &str) -> bool {
-    match e {
-        Expr::Var(n) => n == name,
-        Expr::Let(n, _, a, b) => references(a, name) || (n != name && references(b, name)),
-        Expr::Lambda(n, b) => n != name && references(b, name),
-        Expr::Neg(a) | Expr::Field(a, _) | Expr::Try(a) => references(a, name),
-        Expr::Binary(_, a, b) => references(a, name) || references(b, name),
-        Expr::Call(_, a) => a.iter().any(|a| references(a, name)),
-        Expr::Method(a, _, b) => references(a, name) || b.iter().any(|b| references(b, name)),
-        Expr::Record(_, fs) => fs.iter().any(|(_, e)| references(e, name)),
-        Expr::Num(_) | Expr::Float(_) | Expr::Bool(_) | Expr::String(_) | Expr::Unit => false,
-    }
+    ink_core::analysis::references_free(e, name)
 }
+
 struct Emitter<'a> {
     p: &'a Program,
     next: usize,
@@ -433,6 +424,34 @@ impl Emitter<'_> {
                     _ => unreachable!(),
                 };
                 match n.as_str() {
+                    "map" | "map_indexed" => {
+                        let params = if n == "map" {
+                            vec![value.clone()]
+                        } else {
+                            vec![Type::U32, value.clone()]
+                        };
+                        let (vs, body) = self.lambda(&args[0], env, &params, value)?;
+                        if n == "map" {
+                            format!("({xv}).map_inplace(|{}|{{{body}}})", vs[0])
+                        } else {
+                            format!(
+                                "({xv}).map_indexed_inplace(|{},{}|{{{body}}})",
+                                vs[0], vs[1]
+                            )
+                        }
+                    }
+                    "filter" => {
+                        let (vs, body) =
+                            self.lambda(&args[0], env, &[value.clone()], &Type::Bool)?;
+                        format!("({xv}).filter_inplace(|{}|{{{body}}})", vs[0])
+                    }
+                    "scan" => {
+                        let add = Self::arithmetic("+", "acc", "item", value);
+                        format!(
+                            "({xv}).scan_inplace({},|acc,item|{{{add}}})",
+                            Self::zero(value)
+                        )
+                    }
                     "map_parallel" => {
                         let grain = self.expr(&args[0], env, Some(&Type::U32))?;
                         let mapped = self.parallel(
@@ -491,6 +510,25 @@ impl Emitter<'_> {
                 let (vs, body) = self.lambda(&args[2], env, &[Type::U32, t.clone()], &t)?;
                 let acc = self.fresh();
                 format!("{{let mut {acc}={initial};for {} in 0..{bound}u32 {{let {}={acc};{acc}={body};}}{acc}}}",vs[0],vs[1])
+            }
+            Expr::Call(n, args) if n == "fold_until" => {
+                let Type::List(inner) = self.infer(&args[0], env, None)? else {
+                    return Err("fold input".into());
+                };
+                let xs = self.expr(&args[0], env, None)?;
+                let initial = self.expr(&args[1], env, Some(&t))?;
+                let (stopvars, stop) = self.lambda(
+                    &args[2],
+                    env,
+                    &[inner.as_ref().clone(), t.clone()],
+                    &Type::Bool,
+                )?;
+                let (vs, body) = self.lambda(&args[3], env, &[*inner, t.clone()], &t)?;
+                let list = self.fresh();
+                let acc = self.fresh();
+                let item = self.fresh();
+                let flag = self.fresh();
+                format!("{{let {list}={xs};let mut {acc}={initial};for {item} in {list}.into_iter() {{let {}={item}.clone();let {}={acc}.clone();let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
             }
             Expr::Call(n, args) if n == "foldr" || n == "foldl" => {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
@@ -608,14 +646,6 @@ impl Emitter<'_> {
                 format!("{{let {a}={left};let {b}={right};let mut {out}=Vec::with_capacity({a}.len().checked_add({b}.len()).expect(\"concat allocation size overflow\"));{out}.extend_from_slice({a});{out}.extend_from_slice({b});{out}}}")
             }
             Expr::Method(xs, n, args) => {
-                let reuse = ink_core::collection_facts::reusable_private_receiver(
-                    self.p,
-                    e,
-                    &env.iter()
-                        .map(|(n, (_, t))| (n.clone(), t.clone()))
-                        .collect(),
-                    Some(&t),
-                );
                 let Type::List(inner) =
                     self.infer(xs, env, if n == "filter" { Some(&t) } else { None })?
                 else {
@@ -657,12 +687,9 @@ impl Emitter<'_> {
                         format!("{{let mut {list}={xs};{list}.sort();{list}}}")
                     }
                     "scan" => {
-                        let list = self.fresh();
                         let acc = self.fresh();
                         let item = self.fresh();
-                        if reuse {
-                            format!("{{let mut {list}={xs};let mut {acc}={};for {item} in {list}.iter_mut(){{{acc}={};*{item}={acc};}}{list}}}",Self::zero(&inner),Self::arithmetic("+",&acc,&format!("*{item}"),&inner))
-                        } else {
+                        {
                             format!("{{let mut {acc}={};({iterator}).map(|{item}|{{{acc}={};{acc}}}).collect::<Vec<_>>()}}",Self::zero(&inner),Self::arithmetic("+",&acc,&item,&inner))
                         }
                     }
@@ -681,21 +708,7 @@ impl Emitter<'_> {
                             vec![*inner]
                         };
                         let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
-                        if reuse {
-                            let list = self.fresh();
-                            if n == "filter" {
-                                format!("{{let mut {list}={xs};{list}.retain(|ink_ref|{{let {}=ink_ref.clone();{body}}});{list}}}",vs[0])
-                            } else {
-                                let i = self.fresh();
-                                let index = if n == "map_indexed" {
-                                    format!("let {}={i} as u32;", vs[0])
-                                } else {
-                                    String::new()
-                                };
-                                let item = if n == "map_indexed" { &vs[1] } else { &vs[0] };
-                                format!("{{let mut {list}={xs};for {i} in 0..{list}.len(){{{index}let {item}={list}[{i}].clone();{list}[{i}]={body};}}{list}}}")
-                            }
-                        } else if n == "filter" {
+                        if n == "filter" {
                             format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}}).collect::<Vec<_>>()",vs[0])
                         } else if n == "map_indexed" {
                             format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}}).collect::<Vec<_>>()",vs[1],vs[0])
@@ -909,7 +922,7 @@ mod parallel_tests {
         use std::{fs, process::Command};
         let root = std::env::temp_dir().join(format!("ink-parallel-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        let mut source = include_str!("temporary.rs.txt").to_owned();
+        let mut source = ink_native_support::OWNED_VALUES_RUST_SOURCE.to_owned();
         source.push_str(r#"
 fn main(){
  std::env::set_var("INK_THREADS","4");

@@ -80,7 +80,7 @@ impl Emit<'_> {
                 Type::Int => {
                     let id=data(sort)?;
                     let natural=self.checked.projection().objects[id].payload["declaration"]["Datatype"]["constructors"][1]["fields"][0]["Data"].as_str().ok_or("binary magnitude datatype")?;
-                    format!("{{let text=v.get(\"Int\").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string());let n=text.parse::<num_bigint::BigInt>().unwrap();let bits=n.bits() as usize;let(_,bytes)=n.to_bytes_le();let mut tail=D_{natural}::C0;for bit in (0..bits).rev(){{tail=if bytes[bit/8]&(1<<(bit%8))==0{{D_{natural}::C1(std::sync::Arc::new(tail))}}else{{D_{natural}::C2(std::sync::Arc::new(tail))}};}}if bits==0{{D_{id}::C0}}else if n.sign()==num_bigint::Sign::Minus{{D_{id}::C2(std::sync::Arc::new(tail))}}else{{D_{id}::C1(std::sync::Arc::new(tail))}}}}")
+                    format!("{{let text=v.get(\"Int\").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string());let n=text.parse::<num_bigint::BigInt>().unwrap();let bits=n.bits() as usize;let(_,bytes)=n.to_bytes_le();let mut tail=D_{natural}::C0;for bit in (0..bits).rev(){{tail=if bytes[bit/8]&(1<<(bit%8))==0{{D_{natural}::C1(Some(std::sync::Arc::new(tail)))}}else{{D_{natural}::C2(Some(std::sync::Arc::new(tail)))}};}}if bits==0{{D_{id}::C0}}else if n.sign()==num_bigint::Sign::Minus{{D_{id}::C2(std::sync::Arc::new(tail))}}else{{D_{id}::C1(std::sync::Arc::new(tail))}}}}")
                 }
                 Type::Bool => "v.as_bool().unwrap()".into(),
                 Type::Unit => format!("{{D_{}::C0}}", data(sort)?),
@@ -112,7 +112,7 @@ impl Emit<'_> {
                 Type::List(a) => {
                     let id=data(sort)?;
                     let read=stored(self.sort(a)?,&self.codec(a,"read","x","d+1")?);
-                    format!("{{let xs=v.as_array().unwrap();let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail=D_{id}::C1({read},std::sync::Arc::new(tail));}}tail}}")
+                    format!("{{let xs=v.as_array().unwrap();let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail=D_{id}::C1({read},Some(std::sync::Arc::new(tail)));}}tail}}")
                 }
                 _ => return Err("unsupported standalone source codec".into()),
             };
@@ -129,7 +129,7 @@ impl Emit<'_> {
                 Type::Int => {
                     let id=data(sort)?;
                     let natural=self.checked.projection().objects[id].payload["declaration"]["Datatype"]["constructors"][1]["fields"][0]["Data"].as_str().ok_or("binary magnitude datatype")?;
-                    format!("{{match v{{D_{id}::C0=>json!({{\"Int\":\"0\"}}),D_{id}::C1(tail)|D_{id}::C2(tail)=>{{let mut cursor=tail.as_ref();let mut magnitude=num_bigint::BigUint::from(0u8);let mut bits=0;loop{{match cursor{{D_{natural}::C0=>break,D_{natural}::C1(tail)|D_{natural}::C2(tail)=>{{if matches!(cursor,D_{natural}::C2(_)){{magnitude|=num_bigint::BigUint::from(1u8)<<bits;}}bits+=1;cursor=tail.as_ref();}}}}}}let sign=if matches!(v,D_{id}::C2(_)){{num_bigint::Sign::Minus}}else{{num_bigint::Sign::Plus}};json!({{\"Int\":num_bigint::BigInt::from_biguint(sign,magnitude).to_string()}})}}}}}}")
+                    format!("{{match v{{D_{id}::C0=>json!({{\"Int\":\"0\"}}),D_{id}::C1(tail)|D_{id}::C2(tail)=>{{let mut cursor=tail.as_ref();let mut magnitude=num_bigint::BigUint::from(0u8);let mut bits=0;loop{{match cursor{{D_{natural}::C0=>break,D_{natural}::C1(tail)|D_{natural}::C2(tail)=>{{if matches!(cursor,D_{natural}::C2(_)){{magnitude|=num_bigint::BigUint::from(1u8)<<bits;}}bits+=1;cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}let sign=if matches!(v,D_{id}::C2(_)){{num_bigint::Sign::Minus}}else{{num_bigint::Sign::Plus}};json!({{\"Int\":num_bigint::BigInt::from_biguint(sign,magnitude).to_string()}})}}}}}}")
                 }
                 Type::Unit => "Json::Null".into(),
                 Type::Named(n) if p.enums.contains_key(n) => {
@@ -146,7 +146,7 @@ impl Emit<'_> {
                 Type::Option(a) => format!("match v{{D_{}::C0=>json!({{\"None\":null}}),D_{}::C1(x)=>json!({{\"Some\":{}}})}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
                 Type::Result(a,b) => format!("match v{{D_{}::C0(x)=>json!({{\"Ok\":{}}}),D_{}::C1(x)=>json!({{\"Err\":{}}})}}",data(sort)?,self.codec(a,"write","x","d+1")?,data(sort)?,self.codec(b,"write","x","d+1")?),
                 Type::Vector(a,n)=>{let bs=(0..*n).map(|i|format!("b{i}")).collect::<Vec<_>>();let xs=(0..*n).map(|i|self.codec(a,"write",&format!("&b{i}"),"d+1")).collect::<LangResult<Vec<_>>>()?;format!("{{let D_{}::C0{}=v;Json::Array(vec![{}])}}",data(sort)?,fields(&bs),xs.join(","))},
-                Type::List(a) => format!("{{let mut cursor=v;let mut xs=vec![];loop{{match cursor{{D_{}::C0=>break,D_{}::C1(x,tail)=>{{xs.push({});cursor=tail.as_ref();}}}}}}Json::Array(xs)}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
+                Type::List(a) => format!("{{let mut cursor=v;let mut xs=vec![];loop{{match cursor{{D_{}::C0=>break,D_{}::C1(x,tail)=>{{xs.push({});cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}Json::Array(xs)}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
                 _ => unreachable!(),
             };
             writeln!(out, "{json})}}").unwrap();
@@ -166,14 +166,14 @@ impl Emit<'_> {
             let id = &model.datatype;
             let t = &model.value_type;
             let read = stored(self.sort(t)?, &self.codec(t, "read", "row", "0")?);
-            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}=D_{id}::C1(key.as_u64().unwrap(),{read},std::sync::Arc::new(root{i}));}}").unwrap();
+            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}=D_{id}::C1(key.as_u64().unwrap(),{read},Some(std::sync::Arc::new(root{i})));}}").unwrap();
             roots.push(format!("std::sync::Arc::new(root{i})"));
         }
         writeln!(out,"Ok(D_{}::C0{})}}\nfn logical_tables(state:&D_{})->Result<Vec<Vec<(Json,Json)>>,String>{{let D_{}::C0{}=state;",projection.state,fields(&roots),projection.state,projection.state,fields(&(0..roots.len()).map(|i|format!("r{i}")).collect::<Vec<_>>())).unwrap();
         for (i, model) in projection.tables.iter().enumerate() {
             let id = &model.datatype;
             let write = self.codec(&model.value_type, "write", "value", "0")?;
-            writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push((json!(key),{write}));cursor=tail.as_ref();}}}}}}").unwrap();
+            writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push((json!(key),{write}));cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}").unwrap();
         }
         let ordered = order
             .iter()
@@ -209,7 +209,7 @@ impl Emit<'_> {
             )
             .unwrap();
         }
-        out.push_str("};out.push(value);cursor=tail.as_ref();}}}Ok(out)}\n");
+        out.push_str("};out.push(value);cursor=tail.as_deref().expect(\"live recursive edge\");}}}Ok(out)}\n");
         Ok(out)
     }
 }
@@ -235,7 +235,10 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
         // Source projection also records internal-only carrier types. Emitting
         // codecs for unreachable ones references datatypes the literal emitter
         // correctly omitted (for example an unused Table<_,Bool> remove result).
-        .filter(|(_,sort)| match sort { Sort::Data(id)=>executable.contains_key(id), _=>true })
+        .filter(|(_, sort)| match sort {
+            Sort::Data(id) => executable.contains_key(id),
+            _ => true,
+        })
         .enumerate()
         .map(|(i, (key, sort))| {
             Ok((
@@ -251,7 +254,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     let e = Emit { checked, types };
     let p = checked.module().program();
     let plan = checked.plan();
-    let queries = crate::representation_query::declarations(checked)?;
+    let queries: BTreeMap<String, ink_core::logic::Declaration> = BTreeMap::new();
     let emission = if foreign {
         crate::definition_native::lower_typed_shared_datatypes(checked.definition())?
     } else {
@@ -264,15 +267,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
             &queries,
         )?);
     }
-    if !foreign {
-        for (name, d) in &queries {
-            out.push_str(&crate::definition_native::literal_function(
-                checked.definition(),
-                name,
-                d,
-            )?);
-        }
-    }
+
     out.push_str("\nuse serde_json::{Value as Json,json};\nmod portable{\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
@@ -313,39 +308,6 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     writeln!(out,"pub fn restore(bytes:&[u8])->Result<Self,String>{{let layout=snapshot_layout();let saved=portable::decode(&layout,bytes,SnapshotLimits::default())?;let logical=logical_from_tables(&saved.tables)?;Ok(Self{{physical:f_{}(&logical),version:saved.version,outbox:saved.outbox,layout}})}}",plan.encode).unwrap();
     writeln!(out,"pub fn checkpoint(&self)->Result<Vec<u8>,String>{{let logical=f_{}({});portable::encode(&self.layout,&portable::Logical{{version:self.version,tables:logical_tables(&logical)?,outbox:self.outbox.clone()}},SnapshotLimits::default())}}",plan.decode,borrowed(&plan.physical_state,"self.physical")).unwrap();
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox_json(&self)->Json{Json::Array(self.outbox.iter().map(|e|json!({\"commit\":e.commit,\"position\":e.position,\"channel\":self.layout.events[e.channel].0,\"value\":e.value})).collect())}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){self.outbox.retain(|e|(e.commit,e.position)>(commit,position));}\n");
-    // Typed query entry points bypass JSON and the complete transaction envelope.
-    for source in &p.actions {
-        let a = &plan.actions[&source.name];
-        let name = format!("q_{}", a.execute);
-        let Some(Declaration::Function { params, result, .. }) = queries.get(&name) else {
-            continue;
-        };
-        let inputs = params[2..]
-            .iter()
-            .enumerate()
-            .map(|(i, (_, s))| {
-                Ok(format!(
-                    "a{i}:{}{}",
-                    if matches!(s, Sort::Data(_)) { "&" } else { "" },
-                    crate::definition_native::ty(s)?
-                ))
-            })
-            .collect::<LangResult<Vec<_>>>()?;
-        let mut args = vec![
-            borrowed(&plan.physical_state, "self.physical"),
-            "self.version".into(),
-        ];
-        args.extend((0..inputs.len()).map(|i| format!("a{i}")));
-        writeln!(
-            out,
-            "pub fn query_{}(&self,{})->{}{{{name}({})}}",
-            source.name,
-            inputs.join(","),
-            crate::definition_native::ty(result)?,
-            args.join(",")
-        )
-        .unwrap();
-    }
     out.push_str(
         "pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{match name{\n",
     );
@@ -366,11 +328,6 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
             )
             .unwrap();
             args.push(borrowed(sort, &format!("a{i}")));
-        }
-        let query = format!("q_{}", a.execute);
-        if queries.contains_key(&query) {
-            writeln!(out,"let reply={query}({});let result={};Ok(json!({{\"result\":result,\"committed\":false,\"version\":self.version,\"events\":[]}}))}},",args.join(","),e.codec(&source.result,"write","&reply","0")?).unwrap();
-            continue;
         }
         writeln!(out, "let executed=f_{}({});", a.execute, args.join(",")).unwrap();
         let executed = borrowed(&a.result, "executed");
