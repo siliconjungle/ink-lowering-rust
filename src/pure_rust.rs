@@ -84,6 +84,7 @@ impl Emitter<'_> {
                 _ => format!("{n}u64"),
             },
             Expr::Float(b) => format!("f32::from_bits({b}u32)"),
+            Expr::String(text) => format!("{text:?}.to_owned()"),
             Expr::Bool(b) => b.to_string(),
             Expr::Var(n) => {
                 let v = &env.get(n).ok_or("missing binding")?.0;

@@ -11,6 +11,7 @@ use std::{collections::BTreeMap, fmt::Write};
 struct Emit<'a> {
     checked: &'a CheckedRepresentation,
     types: BTreeMap<String, (usize, Type, Sort)>,
+    packed_ids: std::collections::BTreeSet<String>,
 }
 fn data(sort: &Sort) -> LangResult<&str> {
     if let Sort::Data(id) = sort {
@@ -66,6 +67,9 @@ impl Emit<'_> {
         let p = self.checked.module().program();
         let mut out = String::new();
         for (_, (index, t, sort)) in &self.types {
+            if ink_core::local_collections::owned(t, p) {
+                continue;
+            }
             let ty = crate::definition_native::ty(sort)?;
             writeln!(
                 out,
@@ -82,6 +86,8 @@ impl Emit<'_> {
                     let natural=self.checked.projection().objects[id].payload["declaration"]["Datatype"]["constructors"][1]["fields"][0]["Data"].as_str().ok_or("binary magnitude datatype")?;
                     format!("{{let text=v.get(\"Int\").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string());let n=text.parse::<num_bigint::BigInt>().unwrap();let bits=n.bits() as usize;let(_,bytes)=n.to_bytes_le();let mut tail=D_{natural}::C0;for bit in (0..bits).rev(){{tail=if bytes[bit/8]&(1<<(bit%8))==0{{D_{natural}::C1(std::sync::Arc::new(tail))}}else{{D_{natural}::C2(std::sync::Arc::new(tail))}};}}if bits==0{{D_{id}::C0}}else if n.sign()==num_bigint::Sign::Minus{{D_{id}::C2(std::sync::Arc::new(tail))}}else{{D_{id}::C1(std::sync::Arc::new(tail))}}}}")
                 }
+                Type::String => {let id=data(sort)?;let step=if self.packed_ids.contains(id){"tail.prepend(byte as u64)".into()}else{format!("D_{id}::C1(byte as u64,std::sync::Arc::new(tail))")};format!("{{let mut tail=D_{id}::C0;for byte in v.as_str().unwrap().bytes().rev(){{tail={step};}}tail}}")},
+                Type::Named(n) if p.ids.contains(n) => {let id=data(sort)?;format!("{{let x=u128::from_str_radix(v.as_str().unwrap(),16).unwrap();D_{id}::C0((x>>64)as u64,x as u64)}}")},
                 Type::Bool => "v.as_bool().unwrap()".into(),
                 Type::Unit => format!("{{D_{}::C0}}", data(sort)?),
                 Type::Named(n) if p.enums.contains_key(n) => {
@@ -112,7 +118,8 @@ impl Emit<'_> {
                 Type::List(a) => {
                     let id=data(sort)?;
                     let read=stored(self.sort(a)?,&self.codec(a,"read","x","d+1")?);
-                    format!("{{let xs=v.as_array().unwrap();let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail=D_{id}::C1({read},std::sync::Arc::new(tail));}}tail}}")
+                    let step=if self.packed_ids.contains(id){format!("tail.prepend({read})")}else{format!("D_{id}::C1({read},std::sync::Arc::new(tail))")};
+                    format!("{{let xs=v.as_array().unwrap();let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail={step};}}tail}}")
                 }
                 _ => return Err("unsupported standalone source codec".into()),
             };
@@ -131,6 +138,8 @@ impl Emit<'_> {
                     let natural=self.checked.projection().objects[id].payload["declaration"]["Datatype"]["constructors"][1]["fields"][0]["Data"].as_str().ok_or("binary magnitude datatype")?;
                     format!("{{match v{{D_{id}::C0=>json!({{\"Int\":\"0\"}}),D_{id}::C1(tail)|D_{id}::C2(tail)=>{{let mut cursor=tail.as_ref();let mut magnitude=num_bigint::BigUint::from(0u8);let mut bits=0;loop{{match cursor{{D_{natural}::C0=>break,D_{natural}::C1(tail)|D_{natural}::C2(tail)=>{{if matches!(cursor,D_{natural}::C2(_)){{magnitude|=num_bigint::BigUint::from(1u8)<<bits;}}bits+=1;cursor=tail.as_ref();}}}}}}let sign=if matches!(v,D_{id}::C2(_)){{num_bigint::Sign::Minus}}else{{num_bigint::Sign::Plus}};json!({{\"Int\":num_bigint::BigInt::from_biguint(sign,magnitude).to_string()}})}}}}}}")
                 }
+                Type::String => {let id=data(sort)?;if self.packed_ids.contains(id){"{json!(String::from_utf8(v.cells().map(|byte|byte as u8).collect()).unwrap())}".into()}else{format!("{{let mut cursor=v;let mut bytes=vec![];loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(byte,tail)=>{{bytes.push(*byte as u8);cursor=tail.as_ref();}}}}}}json!(String::from_utf8(bytes).unwrap())}}")}},
+                Type::Named(n) if p.ids.contains(n) => {let id=data(sort)?;format!("{{let D_{id}::C0(high,low)=v;json!(format!(\"{{:032x}}\",((*high as u128)<<64)|*low as u128))}}")},
                 Type::Unit => "Json::Null".into(),
                 Type::Named(n) if p.enums.contains_key(n) => {
                     let id=data(sort)?;
@@ -146,7 +155,7 @@ impl Emit<'_> {
                 Type::Option(a) => format!("match v{{D_{}::C0=>json!({{\"None\":null}}),D_{}::C1(x)=>json!({{\"Some\":{}}})}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
                 Type::Result(a,b) => format!("match v{{D_{}::C0(x)=>json!({{\"Ok\":{}}}),D_{}::C1(x)=>json!({{\"Err\":{}}})}}",data(sort)?,self.codec(a,"write","x","d+1")?,data(sort)?,self.codec(b,"write","x","d+1")?),
                 Type::Vector(a,n)=>{let bs=(0..*n).map(|i|format!("b{i}")).collect::<Vec<_>>();let xs=(0..*n).map(|i|self.codec(a,"write",&format!("&b{i}"),"d+1")).collect::<LangResult<Vec<_>>>()?;format!("{{let D_{}::C0{}=v;Json::Array(vec![{}])}}",data(sort)?,fields(&bs),xs.join(","))},
-                Type::List(a) => format!("{{let mut cursor=v;let mut xs=vec![];loop{{match cursor{{D_{}::C0=>break,D_{}::C1(x,tail)=>{{xs.push({});cursor=tail.as_ref();}}}}}}Json::Array(xs)}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
+                Type::List(a) => if self.packed_ids.contains(data(sort)?){format!("{{let mut xs=vec![];for x in v.cells(){{xs.push({});}}Json::Array(xs)}}",self.codec(a,"write","&x","d+1")?)}else{format!("{{let mut cursor=v;let mut xs=vec![];loop{{match cursor{{D_{}::C0=>break,D_{}::C1(x,tail)=>{{xs.push({});cursor=tail.as_ref();}}}}}}Json::Array(xs)}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?)},
                 _ => unreachable!(),
             };
             writeln!(out, "{json})}}").unwrap();
@@ -166,14 +175,19 @@ impl Emit<'_> {
             let id = &model.datatype;
             let t = &model.value_type;
             let read = stored(self.sort(t)?, &self.codec(t, "read", "row", "0")?);
-            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}=D_{id}::C1(key.as_u64().unwrap(),{read},std::sync::Arc::new(root{i}));}}").unwrap();
+            let key_read = stored(
+                self.sort(&model.key_type)?,
+                &self.codec(&model.key_type, "read", "key", "0")?,
+            );
+            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}=D_{id}::C1({key_read},{read},std::sync::Arc::new(root{i}));}}").unwrap();
             roots.push(format!("std::sync::Arc::new(root{i})"));
         }
         writeln!(out,"Ok(D_{}::C0{})}}\nfn logical_tables(state:&D_{})->Result<Vec<Vec<(Json,Json)>>,String>{{let D_{}::C0{}=state;",projection.state,fields(&roots),projection.state,projection.state,fields(&(0..roots.len()).map(|i|format!("r{i}")).collect::<Vec<_>>())).unwrap();
         for (i, model) in projection.tables.iter().enumerate() {
             let id = &model.datatype;
             let write = self.codec(&model.value_type, "write", "value", "0")?;
-            writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push((json!(key),{write}));cursor=tail.as_ref();}}}}}}").unwrap();
+            let key_write = self.codec(&model.key_type, "write", "key", "0")?;
+            writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push(({key_write},{write}));cursor=tail.as_ref();}}}}}}").unwrap();
         }
         let ordered = order
             .iter()
@@ -193,7 +207,11 @@ impl Emit<'_> {
             return Err("event list datatype".into());
         };
         let event = data(&constructors[1].fields[0])?;
-        writeln!(out,"fn logical_events(events:&D_{list})->Result<Vec<(usize,Json)>,String>{{let mut cursor=events;let mut out=vec![];loop{{match cursor{{D_{list}::C0=>break,D_{list}::C1(event,tail)=>{{let value=match event.as_ref(){{").unwrap();
+        if self.packed_ids.contains(list) {
+            writeln!(out,"fn logical_events(events:&D_{list})->Result<Vec<(usize,Json)>,String>{{let mut out=vec![];for event in events.cells(){{let value=match event.as_ref(){{").unwrap();
+        } else {
+            writeln!(out,"fn logical_events(events:&D_{list})->Result<Vec<(usize,Json)>,String>{{let mut cursor=events;let mut out=vec![];loop{{match cursor{{D_{list}::C0=>break,D_{list}::C1(event,tail)=>{{let value=match event.as_ref(){{").unwrap();
+        }
         if p.events.is_empty() {
             writeln!(
                 out,
@@ -209,7 +227,11 @@ impl Emit<'_> {
             )
             .unwrap();
         }
-        out.push_str("};out.push(value);cursor=tail.as_ref();}}}Ok(out)}\n");
+        if self.packed_ids.contains(list) {
+            out.push_str("};out.push(value);}Ok(out)}\n");
+        } else {
+            out.push_str("};out.push(value);cursor=tail.as_ref();}}}Ok(out)}\n");
+        }
         Ok(out)
     }
 }
@@ -217,21 +239,38 @@ impl Emit<'_> {
 /// Emit one already selected representation as an ordinary compiled program.
 /// The private checker witness is consumed only by this compile-time function.
 pub fn lower(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, false)
+    lower_native(checked, false, false, false)
+}
+/// Explicit exact packed storage for scalar columns, lists and local owners.
+pub fn lower_packed(checked: &CheckedRepresentation) -> LangResult<String> {
+    lower_native(checked, false, true, false)
 }
 
 /// Standalone native host for the C lowering's type-specific borrowed ABI.
 /// C bodies are linked separately. This emits no interpreter or Ink dependency.
 pub fn lower_c_host(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, true)
+    lower_native(checked, true, false, false)
 }
 
-fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<String> {
+pub fn lower_memo(checked: &CheckedRepresentation) -> LangResult<String> {
+    lower_native(checked, false, false, true)
+}
+fn lower_native(
+    checked: &CheckedRepresentation,
+    foreign: bool,
+    packed: bool,
+    memo: bool,
+) -> LangResult<String> {
+    let reachable = checked.definition().reachable_executable_declarations()?;
     let types = checked
         .projection()
         .types
         .iter()
         .enumerate()
+        .filter(|(_, (_, sort))| match sort {
+            Sort::Data(id) => reachable.contains_key(id),
+            _ => true,
+        })
         .map(|(i, (key, sort))| {
             Ok((
                 key.clone(),
@@ -243,29 +282,77 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
             ))
         })
         .collect::<LangResult<BTreeMap<_, _>>>()?;
-    let e = Emit { checked, types };
+    let packed_ids = if packed {
+        checked
+            .definition()
+            .reachable_executable_declarations()?
+            .into_iter()
+            .filter_map(|(id, d)| match d {
+                Declaration::Datatype { constructors: c }
+                    if c.len() == 2
+                        && c[0].fields.is_empty()
+                        && c[1].fields.len() == 2
+                        && c[1].fields[1] == Sort::SelfType
+                        && matches!(c[1].fields[0], Sort::Bool | Sort::U64 | Sort::Data(_)) =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
+    let e = Emit {
+        checked,
+        types,
+        packed_ids,
+    };
     let p = checked.module().program();
     let plan = checked.plan();
     let queries = crate::representation_query::declarations(checked)?;
+    let transitions = crate::representation_transition::declarations(checked)?;
     let emission = if foreign {
         crate::definition_native::lower_typed_shared_datatypes(checked.definition())?
+    } else if memo {
+        crate::definition_native::lower_typed_memo(checked.definition())?
+    } else if packed {
+        crate::definition_native::lower_typed_packed(checked.definition())?
     } else {
         crate::definition_native::lower_typed_shared(checked.definition())?
     };
     let mut out = emission.source;
     if foreign {
+        let residuals = queries
+            .iter()
+            .chain(transitions.iter())
+            .map(|(n, d)| (n.clone(), d.clone()))
+            .collect();
         out.push_str(&crate::representation_ffi::emit(
             checked.definition(),
-            &queries,
+            &residuals,
         )?);
     }
     if !foreign {
-        for (name, d) in &queries {
-            out.push_str(&crate::definition_native::literal_function(
-                checked.definition(),
-                name,
-                d,
-            )?);
+        for (name, d) in queries.iter().chain(transitions.iter()) {
+            out.push_str(&if memo {
+                crate::definition_native::literal_function_options(
+                    checked.definition(),
+                    name,
+                    d,
+                    false,
+                    true,
+                )?
+            } else if packed {
+                crate::definition_native::literal_function_mode(
+                    checked.definition(),
+                    name,
+                    d,
+                    true,
+                )?
+            } else {
+                crate::definition_native::literal_function(checked.definition(), name, d)?
+            });
         }
     }
     out.push_str("\nuse serde_json::{Value as Json,json};\nmod portable{\n");
@@ -296,6 +383,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     out.push_str(&e.wire()?);
     out.push_str(&e.tables()?);
     let physical = crate::definition_native::ty(&plan.physical_state)?;
+    out.push_str("pub use portable::Event;\npub struct Outcome<T>{pub result:T,pub committed:bool,pub version:u64,pub events:Vec<Event>}\npub struct OutcomeView<'a,T>{pub result:T,pub committed:bool,pub version:u64,pub events:&'a[Event]}\nimpl<T> OutcomeView<'_,T>{pub fn into_owned(self)->Outcome<T>{Outcome{result:self.result,committed:self.committed,version:self.version,events:self.events.to_vec()}}}\n");
     writeln!(out,"pub struct State{{physical:{physical},version:u64,outbox:Vec<portable::Event>,layout:portable::Layout}}\nimpl State{{").unwrap();
     let empty = checked
         .projection()
@@ -341,6 +429,69 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
         )
         .unwrap();
     }
+    // The direct native bridge accepts the sealed definition's typed carriers.
+    // Replies own their values; committed events borrow the existing outbox.
+    for source in &p.actions {
+        let a = &plan.actions[&source.name];
+        let reply_sort = e.sort(&source.result)?;
+        let reply_ty = crate::definition_native::ty(reply_sort)?;
+        let inputs = source
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, (_, t))| {
+                let sort = e.sort(t)?;
+                Ok(format!(
+                    "a{i}:{}{}",
+                    if matches!(sort, Sort::Data(_)) {
+                        "&"
+                    } else {
+                        ""
+                    },
+                    crate::definition_native::ty(sort)?
+                ))
+            })
+            .collect::<LangResult<Vec<_>>>()?;
+        let mut args = vec![
+            borrowed(&plan.physical_state, "self.physical"),
+            "self.version".into(),
+        ];
+        args.extend((0..inputs.len()).map(|i| format!("a{i}")));
+        writeln!(
+            out,
+            "pub fn invoke_view_{}(&mut self,{})->Result<OutcomeView<'_,{reply_ty}>,String>{{",
+            source.name,
+            inputs.join(",")
+        )
+        .unwrap();
+        let query = format!("q_{}", a.execute);
+        if queries.contains_key(&query) {
+            writeln!(out,"let result={query}({});Ok(OutcomeView{{result,committed:false,version:self.version,events:&self.outbox[self.outbox.len()..]}})}}",args.join(",")).unwrap();
+            continue;
+        }
+        let observation = data(&checked.projection().actions[&source.name].result)?;
+        writeln!(
+            out,
+            "let executed={}({});let observed=f_{}({});let next=f_{}({});",
+            if transitions.contains_key(&format!("t_{}", a.execute)) {
+                format!("t_{}", a.execute)
+            } else {
+                format!("f_{}", a.execute)
+            },
+            args.join(","),
+            a.observe,
+            borrowed(&a.result, "executed"),
+            a.next,
+            borrowed(&a.result, "executed")
+        )
+        .unwrap();
+        let owned_reply = if matches!(reply_sort, Sort::Data(_)) {
+            "reply.as_ref().clone()"
+        } else {
+            "*reply"
+        };
+        writeln!(out,"let(result,committed,version,events)=match &observed{{D_{observation}::C0(reply,committed,version,_,events)=>({owned_reply},*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let start=self.outbox.len();let staged=logical_events(events)?;if committed{{self.outbox.try_reserve(staged.len()).map_err(|_|\"outbox allocation failure\")?;for(position,(channel,value))in staged.into_iter().enumerate(){{self.outbox.push(Event{{commit:version,position:position as u64,channel,value}});}}}}self.physical=next;self.version=version;Ok(OutcomeView{{result,committed,version,events:&self.outbox[start..]}})}}").unwrap();
+    }
     out.push_str(
         "pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{match name{\n",
     );
@@ -367,7 +518,17 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
             writeln!(out,"let reply={query}({});let result={};Ok(json!({{\"result\":result,\"committed\":false,\"version\":self.version,\"events\":[]}}))}},",args.join(","),e.codec(&source.result,"write","&reply","0")?).unwrap();
             continue;
         }
-        writeln!(out, "let executed=f_{}({});", a.execute, args.join(",")).unwrap();
+        writeln!(
+            out,
+            "let executed={}({});",
+            if transitions.contains_key(&format!("t_{}", a.execute)) {
+                format!("t_{}", a.execute)
+            } else {
+                format!("f_{}", a.execute)
+            },
+            args.join(",")
+        )
+        .unwrap();
         let executed = borrowed(&a.result, "executed");
         writeln!(out,"let observed=f_{}({executed});let next=f_{}({executed});let(reply,committed,version,events)=match &observed{{D_{observation}::C0(reply,committed,version,_,events)=>(reply,*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let result={};let staged=logical_events(events)?;let mut published=vec![];",a.observe,a.next,e.codec(&source.result,"write","reply","0")?).unwrap();
         let names = p

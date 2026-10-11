@@ -49,36 +49,94 @@ impl<T: Clone> OwnedBuffer<T> {
         self.0
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct OwnedMap<K: Ord, V>(std::collections::BTreeMap<K, V>);
-impl<K: Ord + Clone, V: Clone> OwnedMap<K, V> {
-    pub fn new() -> Self {
-        Self(std::collections::BTreeMap::new())
-    }
-    pub fn len(&self) -> u32 {
-        self.0.len().try_into().expect("map exceeds u32")
-    }
-    pub fn get(&self, k: &K) -> Option<V> {
-        self.0.get(k).cloned()
-    }
-    pub fn contains(&self, k: &K) -> bool {
-        self.0.contains_key(k)
-    }
-    pub fn set(mut self, k: K, v: V) -> Self {
-        self.0.insert(k, v);
-        self
-    }
-    pub fn remove(mut self, k: &K) -> Self {
-        self.0.remove(k);
-        self
-    }
-    pub fn keys(&self) -> Vec<K> {
-        self.0.keys().cloned().collect()
-    }
-    pub fn values(&self) -> Vec<V> {
-        self.0.values().cloned().collect()
+// Exact dense scalar scratch with bounded per-thread allocation reuse. Keys
+// outside the dense domain migrate all live entries into the ordered fallback.
+const INK_DENSE_LIMIT: usize = 4096;
+const INK_SCRATCH_RETAIN: usize = 2048;
+const INK_SCRATCH_POOL_LIMIT: usize = 8;
+std::thread_local! {static INK_MAP_POOL:std::cell::RefCell<Vec<Box<dyn std::any::Any>>>=const{std::cell::RefCell::new(Vec::new())};}
+#[derive(Clone, Debug)]
+struct InkSlot<K,V> { epoch:u64, value:Option<(K,V)> }
+#[derive(Clone, Debug)]
+struct InkDense<K,V> { epoch:u64, length:usize, slots:Vec<InkSlot<K,V>> }
+impl<K:'static,V:'static> InkDense<K,V> {
+    fn fresh()->Self {
+        let old=INK_MAP_POOL.with(|pool| {let mut pool=pool.borrow_mut();let at=pool.iter().position(|p|p.as_ref().is::<Self>());at.map(|i|*pool.swap_remove(i).downcast::<Self>().unwrap())});
+        let mut scratch=old.unwrap_or(Self{epoch:0,length:0,slots:vec![]});
+        if scratch.epoch==u64::MAX {for slot in &mut scratch.slots {slot.epoch=0;slot.value=None;}scratch.epoch=1;}
+        else {scratch.epoch+=1;}
+        scratch.length=0;scratch
     }
 }
+fn ink_dense_index<K:'static>(key:&K)->Option<usize> {
+    let any=key as &dyn std::any::Any;
+    let index=if let Some(&x)=any.downcast_ref::<u32>() {x as u64}
+        else if let Some(&x)=any.downcast_ref::<u64>() {x}
+        else if let Some(&x)=any.downcast_ref::<i32>() {u64::try_from(x).ok()?}
+        else if let Some(&x)=any.downcast_ref::<bool>() {u64::from(x)} else {return None};
+    if index<INK_DENSE_LIMIT as u64 {Some(index as usize)}else{None}
+}
+fn ink_scalar<T:'static>()->bool {
+    let id=std::any::TypeId::of::<T>();[std::any::TypeId::of::<u32>(),std::any::TypeId::of::<u64>(),std::any::TypeId::of::<i32>(),std::any::TypeId::of::<bool>()].contains(&id)
+}
+#[derive(Clone, Debug)]
+enum InkMapStorage<K:Ord,V> { Sparse(std::collections::BTreeMap<K,V>), Dense(InkDense<K,V>) }
+#[derive(Clone, Debug)]
+pub struct OwnedMap<K:Ord+'static,V:'static>(InkMapStorage<K,V>);
+impl<K:Ord+Clone+'static,V:Clone+'static> OwnedMap<K,V> {
+    pub fn new()->Self {
+        if ink_scalar::<K>()&&ink_scalar::<V>() {Self(InkMapStorage::Dense(InkDense::fresh()))}
+        else {Self::new_sparse()}
+    }
+    pub fn new_sparse()->Self {Self(InkMapStorage::Sparse(std::collections::BTreeMap::new()))}
+    fn entries(&self)->Box<dyn Iterator<Item=(&K,&V)>+'_> {
+        match &self.0 {
+            InkMapStorage::Sparse(map)=>Box::new(map.iter()),
+            InkMapStorage::Dense(s)=>Box::new(s.slots.iter().filter(move|x|x.epoch==s.epoch).filter_map(|x|x.value.as_ref().map(|(k,v)|(k,v)))),
+        }
+    }
+    pub fn len(&self)->u32 {match &self.0 {InkMapStorage::Sparse(map)=>map.len(),InkMapStorage::Dense(s)=>s.length}.try_into().expect("map exceeds u32")}
+    pub fn get(&self,key:&K)->Option<V> {
+        match &self.0 {
+            InkMapStorage::Sparse(map)=>map.get(key).cloned(),
+            InkMapStorage::Dense(s)=>ink_dense_index(key).and_then(|i|s.slots.get(i)).filter(|x|x.epoch==s.epoch).and_then(|x|x.value.as_ref().map(|(_,v)|v.clone())),
+        }
+    }
+    pub fn contains(&self,key:&K)->bool {self.get(key).is_some()}
+    pub fn set(mut self,key:K,value:V)->Self {
+        if let InkMapStorage::Dense(s)=&mut self.0 {
+            if let Some(index)=ink_dense_index(&key).filter(|&i|i<=s.slots.len().saturating_mul(8)+64) {
+                s.slots.resize_with(s.slots.len().max(index+1),||InkSlot{epoch:0,value:None});
+                let slot=&mut s.slots[index];if slot.epoch!=s.epoch||slot.value.is_none(){s.length+=1;}
+                slot.value=Some((key,value));slot.epoch=s.epoch;return self;
+            }
+            let mut ordered=std::collections::BTreeMap::new();
+            for slot in &mut s.slots {if slot.epoch==s.epoch {if let Some((k,v))=slot.value.take(){ordered.insert(k,v);}}}
+            ordered.insert(key,value);
+            let old=std::mem::replace(&mut self.0,InkMapStorage::Sparse(ordered));
+            if let InkMapStorage::Dense(s)=old {ink_recycle(s);}
+        } else if let InkMapStorage::Sparse(map)=&mut self.0 {map.insert(key,value);}
+        self
+    }
+    pub fn remove(mut self,key:&K)->Self {
+        match &mut self.0 {
+            InkMapStorage::Sparse(map)=>{map.remove(key);},
+            InkMapStorage::Dense(s)=>{if let Some(slot)=ink_dense_index(key).and_then(|i|s.slots.get_mut(i)){if slot.epoch==s.epoch&&slot.value.take().is_some(){s.length-=1;slot.epoch=0;}}},
+        }self
+    }
+    pub fn keys(&self)->Vec<K>{self.entries().map(|(k,_)|k.clone()).collect()}
+    pub fn values(&self)->Vec<V>{self.entries().map(|(_,v)|v.clone()).collect()}
+}
+fn ink_recycle<K:'static,V:'static>(scratch:InkDense<K,V>) {
+    if scratch.slots.capacity()<=INK_SCRATCH_RETAIN {INK_MAP_POOL.with(|pool|{let mut pool=pool.borrow_mut();if pool.len()<INK_SCRATCH_POOL_LIMIT {pool.push(Box::new(scratch));}});}
+}
+impl<K:Ord+'static,V:'static> Drop for OwnedMap<K,V> {
+    fn drop(&mut self) {if matches!(self.0,InkMapStorage::Dense(_)){if let InkMapStorage::Dense(s)=std::mem::replace(&mut self.0,InkMapStorage::Sparse(std::collections::BTreeMap::new())){ink_recycle(s);}}}
+}
+impl<K:Ord+Clone+'static,V:Clone+PartialEq+'static> PartialEq for OwnedMap<K,V>{fn eq(&self,other:&Self)->bool{self.entries().eq(other.entries())}}
+impl<K:Ord+Clone+'static,V:Clone+Eq+'static> Eq for OwnedMap<K,V>{}
+impl<K:Ord+Clone+'static,V:Clone+Ord+'static> Ord for OwnedMap<K,V>{fn cmp(&self,other:&Self)->std::cmp::Ordering{self.entries().cmp(other.entries())}}
+impl<K:Ord+Clone+'static,V:Clone+PartialOrd+'static> PartialOrd for OwnedMap<K,V>{fn partial_cmp(&self,other:&Self)->Option<std::cmp::Ordering>{self.entries().partial_cmp(other.entries())}}
 
 // Bounded fork/join execution. Each worker owns a disjoint mutable slice;
 // joining retains source order. Nested parallel requests execute sequentially.

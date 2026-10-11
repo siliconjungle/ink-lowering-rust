@@ -8,6 +8,85 @@ use ink_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) fn binders(
+    t: &Term,
+    env: &BTreeMap<String, String>,
+    used: &mut BTreeSet<String>,
+    serial: &mut usize,
+) -> Term {
+    let go = |t: &Term, used: &mut BTreeSet<String>, serial: &mut usize| {
+        binders(t, env, used, serial)
+    };
+    match t {
+        Term::Var(n) => Term::Var(env.get(n).unwrap_or(n).clone()),
+        Term::Construct {
+            datatype,
+            constructor,
+            arguments,
+        } => Term::Construct {
+            datatype: datatype.clone(),
+            constructor: *constructor,
+            arguments: arguments.iter().map(|a| go(a, used, serial)).collect(),
+        },
+        Term::Call {
+            function,
+            arguments,
+        } => Term::Call {
+            function: function.clone(),
+            arguments: arguments.iter().map(|a| go(a, used, serial)).collect(),
+        },
+        Term::SelfCall(arguments) => {
+            Term::SelfCall(arguments.iter().map(|a| go(a, used, serial)).collect())
+        }
+        Term::Binary { op, left, right } => Term::Binary {
+            op: op.clone(),
+            left: Box::new(go(left, used, serial)),
+            right: Box::new(go(right, used, serial)),
+        },
+        Term::If {
+            condition,
+            on_true,
+            on_false,
+        } => Term::If {
+            condition: Box::new(go(condition, used, serial)),
+            on_true: Box::new(go(on_true, used, serial)),
+            on_false: Box::new(go(on_false, used, serial)),
+        },
+        Term::Match {
+            scrutinee,
+            branches,
+        } => Term::Match {
+            scrutinee: Box::new(go(scrutinee, used, serial)),
+            branches: branches
+                .iter()
+                .map(|b| {
+                    let mut local = env.clone();
+                    let bindings = b
+                        .bindings
+                        .iter()
+                        .map(|n| {
+                            let fresh = loop {
+                                let n = format!("inkQueryBinder{}", *serial);
+                                *serial += 1;
+                                if used.insert(n.clone()) {
+                                    break n;
+                                }
+                            };
+                            local.insert(n.clone(), fresh.clone());
+                            fresh
+                        })
+                        .collect();
+                    Branch {
+                        bindings,
+                        body: binders(&b.body, &local, used, serial),
+                    }
+                })
+                .collect(),
+        },
+        _ => t.clone(),
+    }
+}
+
 /// Literal query bodies for which the already checked observation computes to
 /// an unchanged logical state/version and no events. The old physical state
 /// remains related to that logical state; computing a replacement is redundant.
@@ -15,84 +94,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub fn declarations(checked: &CheckedRepresentation) -> LangResult<BTreeMap<String, Declaration>> {
     // Normalisation uses internal '$' binders. Rename them with lexical scope
     // before passing the residual term back through the ordinary type checker.
-    fn binders(
-        t: &Term,
-        env: &BTreeMap<String, String>,
-        used: &mut BTreeSet<String>,
-        serial: &mut usize,
-    ) -> Term {
-        let go = |t: &Term, used: &mut BTreeSet<String>, serial: &mut usize| {
-            binders(t, env, used, serial)
-        };
-        match t {
-            Term::Var(n) => Term::Var(env.get(n).unwrap_or(n).clone()),
-            Term::Construct {
-                datatype,
-                constructor,
-                arguments,
-            } => Term::Construct {
-                datatype: datatype.clone(),
-                constructor: *constructor,
-                arguments: arguments.iter().map(|a| go(a, used, serial)).collect(),
-            },
-            Term::Call {
-                function,
-                arguments,
-            } => Term::Call {
-                function: function.clone(),
-                arguments: arguments.iter().map(|a| go(a, used, serial)).collect(),
-            },
-            Term::SelfCall(arguments) => {
-                Term::SelfCall(arguments.iter().map(|a| go(a, used, serial)).collect())
-            }
-            Term::Binary { op, left, right } => Term::Binary {
-                op: op.clone(),
-                left: Box::new(go(left, used, serial)),
-                right: Box::new(go(right, used, serial)),
-            },
-            Term::If {
-                condition,
-                on_true,
-                on_false,
-            } => Term::If {
-                condition: Box::new(go(condition, used, serial)),
-                on_true: Box::new(go(on_true, used, serial)),
-                on_false: Box::new(go(on_false, used, serial)),
-            },
-            Term::Match {
-                scrutinee,
-                branches,
-            } => Term::Match {
-                scrutinee: Box::new(go(scrutinee, used, serial)),
-                branches: branches
-                    .iter()
-                    .map(|b| {
-                        let mut local = env.clone();
-                        let bindings = b
-                            .bindings
-                            .iter()
-                            .map(|n| {
-                                let fresh = loop {
-                                    let n = format!("inkQueryBinder{}", *serial);
-                                    *serial += 1;
-                                    if used.insert(n.clone()) {
-                                        break n;
-                                    }
-                                };
-                                local.insert(n.clone(), fresh.clone());
-                                fresh
-                            })
-                            .collect();
-                        Branch {
-                            bindings,
-                            body: binders(&b.body, &local, used, serial),
-                        }
-                    })
-                    .collect(),
-            },
-            _ => t.clone(),
-        }
-    }
     fn reply(
         t: &Term,
         logical: &Term,

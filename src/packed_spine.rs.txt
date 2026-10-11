@@ -1,0 +1,236 @@
+// Physical refinement of Nil/Cons spines. All words remain exact.
+pub trait PackedCell: Clone + Eq + std::fmt::Debug {
+    type Block: Clone + std::fmt::Debug;
+    const CAPACITY: usize;
+    fn empty() -> Self::Block;
+    fn at(block: &Self::Block, index: usize) -> Self;
+    fn truncate(block: &mut Self::Block, length: usize);
+    fn push(block: &mut Self::Block, index: usize, value: Self);
+}
+#[derive(Clone, Debug)]
+pub enum WordBlock {
+    Narrow(Vec<u32>),
+    Wide(Vec<u64>),
+}
+impl PackedCell for u64 {
+    type Block = WordBlock;
+    const CAPACITY: usize = 256;
+    fn empty() -> WordBlock {
+        WordBlock::Narrow(Vec::new())
+    }
+    fn at(block: &WordBlock, index: usize) -> Self {
+        match block {
+            WordBlock::Narrow(xs) => xs[index] as u64,
+            WordBlock::Wide(xs) => xs[index],
+        }
+    }
+    fn truncate(block: &mut WordBlock, length: usize) {
+        match block {
+            WordBlock::Narrow(xs) => xs.truncate(length),
+            WordBlock::Wide(xs) => xs.truncate(length),
+        }
+    }
+    fn push(block: &mut WordBlock, _index: usize, value: Self) {
+        match block {
+            WordBlock::Narrow(xs) if value <= u32::MAX as u64 => xs.push(value as u32),
+            WordBlock::Narrow(xs) => {
+                let mut wide = std::mem::take(xs)
+                    .into_iter()
+                    .map(u64::from)
+                    .collect::<Vec<_>>();
+                wide.push(value);
+                *block = WordBlock::Wide(wide);
+            }
+            WordBlock::Wide(xs) => xs.push(value),
+        }
+    }
+}
+impl PackedCell for bool {
+    type Block = u64;
+    const CAPACITY: usize = 64;
+    fn empty() -> u64 {
+        0
+    }
+    fn at(block: &u64, index: usize) -> Self {
+        block & (1u64 << index) != 0
+    }
+    fn truncate(block: &mut u64, length: usize) {
+        if length < 64 {
+            *block &= (1u64 << length) - 1;
+        }
+    }
+    fn push(block: &mut u64, index: usize, value: Self) {
+        if value {
+            *block |= 1u64 << index;
+        }
+    }
+}
+// Generic data cells retain their existing immutable owners. The spine packs
+// those handles contiguously; values are neither flattened nor reinterpreted.
+impl<T: Eq + std::fmt::Debug> PackedCell for std::sync::Arc<T> {
+    type Block = Vec<Self>;
+    const CAPACITY: usize = 128;
+    fn empty() -> Self::Block { Vec::new() }
+    fn at(block: &Self::Block, index: usize) -> Self { block[index].clone() }
+    fn truncate(block: &mut Self::Block, length: usize) { block.truncate(length); }
+    fn push(block: &mut Self::Block, _index: usize, value: Self) { block.push(value); }
+}
+#[derive(Debug)]
+pub struct PackedSpine<Tag, Cell: PackedCell> {
+    chunk: Option<std::sync::Arc<PackedChunk<Tag, Cell>>>,
+    end: usize,
+    length: usize,
+    tag: std::marker::PhantomData<Tag>,
+}
+#[derive(Debug)]
+struct PackedChunk<Tag, Cell: PackedCell> {
+    block: Cell::Block,
+    tail: PackedSpine<Tag, Cell>,
+}
+pub struct PackedView<'a, Tag, Cell: PackedCell> {
+    chunk: Option<&'a std::sync::Arc<PackedChunk<Tag, Cell>>>,
+    end: usize,
+    length: usize,
+}
+impl<Tag, Cell: PackedCell> Copy for PackedView<'_, Tag, Cell> {}
+impl<Tag, Cell: PackedCell> Clone for PackedView<'_, Tag, Cell> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, Tag, Cell: PackedCell> PackedView<'a, Tag, Cell> {
+    pub fn view(self) -> Option<(Cell, Self)> {
+        let chunk = self.chunk?;
+        let head = Cell::at(&chunk.block, self.end - 1);
+        let tail = if self.end == 1 {
+            chunk.tail.as_view()
+        } else {
+            Self {
+                chunk: self.chunk,
+                end: self.end - 1,
+                length: self.length - 1,
+            }
+        };
+        Some((head, tail))
+    }
+    pub fn to_owned(self) -> PackedSpine<Tag, Cell> {
+        PackedSpine {
+            chunk: self.chunk.cloned(),
+            end: self.end,
+            length: self.length,
+            tag: std::marker::PhantomData,
+        }
+    }
+    pub fn cells(self) -> impl Iterator<Item = Cell> + 'a {
+        let mut cursor = self;
+        std::iter::from_fn(move || {
+            let (head, tail) = cursor.view()?;
+            cursor = tail;
+            Some(head)
+        })
+    }
+}
+impl<Tag, Cell: PackedCell> Clone for PackedSpine<Tag, Cell> {
+    fn clone(&self) -> Self {
+        Self {
+            chunk: self.chunk.clone(),
+            end: self.end,
+            length: self.length,
+            tag: std::marker::PhantomData,
+        }
+    }
+}
+impl<Tag, Cell: PackedCell> Clone for PackedChunk<Tag, Cell> {
+    fn clone(&self) -> Self {
+        Self {
+            block: self.block.clone(),
+            tail: self.tail.clone(),
+        }
+    }
+}
+impl<Tag, Cell: PackedCell> PackedSpine<Tag, Cell> {
+    pub const C0: Self = Self {
+        chunk: None,
+        end: 0,
+        length: 0,
+        tag: std::marker::PhantomData,
+    };
+    pub fn C1(value: Cell, tail: std::sync::Arc<Self>) -> Self {
+        std::sync::Arc::try_unwrap(tail)
+            .unwrap_or_else(|tail| tail.as_ref().clone())
+            .prepend(value)
+    }
+    pub fn prepend(mut self, value: Cell) -> Self {
+        let length = self
+            .length
+            .checked_add(1)
+            .expect("packed spine length overflow");
+        if self.end < Cell::CAPACITY && self.chunk.is_some() {
+            let chunk = std::sync::Arc::make_mut(self.chunk.as_mut().unwrap());
+            // A borrowed suffix can hide a later prefix in the same chunk.
+            // Truncate that prefix before appending; never expose stale cells.
+            Cell::truncate(&mut chunk.block, self.end);
+            Cell::push(&mut chunk.block, self.end, value);
+            self.end += 1;
+            self.length = length;
+            self
+        } else {
+            let mut block = Cell::empty();
+            Cell::push(&mut block, 0, value);
+            Self {
+                chunk: Some(std::sync::Arc::new(PackedChunk { block, tail: self })),
+                end: 1,
+                length,
+                tag: std::marker::PhantomData,
+            }
+        }
+    }
+    pub fn view(&self) -> Option<(Cell, Self)> {
+        let chunk = self.chunk.as_ref()?;
+        let value = Cell::at(&chunk.block, self.end - 1);
+        let tail = if self.end == 1 {
+            chunk.tail.clone()
+        } else {
+            Self {
+                chunk: self.chunk.clone(),
+                end: self.end - 1,
+                length: self.length - 1,
+                tag: std::marker::PhantomData,
+            }
+        };
+        Some((value, tail))
+    }
+    pub fn len(&self) -> usize {
+        self.length
+    }
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+    pub fn as_view(&self) -> PackedView<'_, Tag, Cell> {
+        PackedView {
+            chunk: self.chunk.as_ref(),
+            end: self.end,
+            length: self.length,
+        }
+    }
+    pub fn cells(&self) -> impl Iterator<Item = Cell> + '_ {
+        self.as_view().cells()
+    }
+}
+impl<Tag, Cell: PackedCell> PartialEq for PackedSpine<Tag, Cell> {
+    fn eq(&self, other: &Self) -> bool {
+        self.length == other.length && self.cells().eq(other.cells())
+    }
+}
+impl<Tag, Cell: PackedCell> Eq for PackedSpine<Tag, Cell> {}
+impl<Tag, Cell: PackedCell> Drop for PackedSpine<Tag, Cell> {
+    fn drop(&mut self) {
+        let mut pending = self.chunk.take();
+        while let Some(chunk) = pending {
+            match std::sync::Arc::try_unwrap(chunk) {
+                Ok(mut chunk) => pending = chunk.tail.chunk.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}

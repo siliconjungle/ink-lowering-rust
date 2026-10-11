@@ -1,0 +1,47 @@
+// Bounded memoisation of pure scalar functions over immutable shared inputs.
+// Weak owners and pointer equality authenticate identity; addresses alone never
+// qualify a hit. No data result is retained and calls with owned inputs bypass.
+#[derive(Clone, Copy)]
+enum InkMemoScalar { Word(u64), Flag(bool) }
+trait InkMemoResult: Copy {
+    fn store(self) -> InkMemoScalar;
+    fn load(value: InkMemoScalar) -> Option<Self>;
+}
+impl InkMemoResult for u64 {
+    fn store(self) -> InkMemoScalar { InkMemoScalar::Word(self) }
+    fn load(v: InkMemoScalar) -> Option<Self> { match v { InkMemoScalar::Word(x)=>Some(x),_=>None } }
+}
+impl InkMemoResult for bool {
+    fn store(self) -> InkMemoScalar { InkMemoScalar::Flag(self) }
+    fn load(v: InkMemoScalar) -> Option<Self> { match v { InkMemoScalar::Flag(x)=>Some(x),_=>None } }
+}
+struct InkMemoEntry {
+    input: std::sync::Weak<dyn std::any::Any>,
+    function: &'static str,
+    arguments: [u64; 4],
+    value: InkMemoScalar,
+}
+std::thread_local! {static INK_IDENTITY_MEMO:std::cell::RefCell<Vec<InkMemoEntry>>=const{std::cell::RefCell::new(Vec::new())};}
+fn ink_identity_memo<T:'static,V:InkMemoResult>(input:&std::sync::Arc<T>,function:&'static str,arguments:[u64;4],compute:impl FnOnce()->V)->V {
+    let found=INK_IDENTITY_MEMO.with(|cache| {
+        let mut cache=cache.borrow_mut();
+        cache.retain(|entry|entry.input.strong_count()>0);
+        cache.iter().rev().find_map(|entry| {
+            if entry.function!=function||entry.arguments!=arguments{return None;}
+            let owner=entry.input.upgrade()?;
+            if !std::ptr::eq(owner.downcast_ref::<T>()?,input.as_ref()){return None;}
+            V::load(entry.value)
+        })
+    });
+    if let Some(value)=found{return value;}
+    // Computing can recursively enter the cache; hold no RefCell borrow here.
+    let value=compute();
+    let owner:std::sync::Arc<dyn std::any::Any>=input.clone();
+    let weak=std::sync::Arc::downgrade(&owner);
+    INK_IDENTITY_MEMO.with(|cache| {
+        let mut cache=cache.borrow_mut();
+        if cache.len()==64 {cache.remove(0);}
+        cache.push(InkMemoEntry{input:weak,function,arguments,value:value.store()});
+    });
+    value
+}

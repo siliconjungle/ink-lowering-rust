@@ -77,10 +77,13 @@ pub fn lower(
             let physical_sort = &checked.plan().physical_state;
             let physical_type = crate::definition_native::ty(physical_sort)?;
             let bounds = if let ink_core::logic::Sort::Data(id) = physical_sort {
-                output.push_str(&crate::representation_bounds::emit(d,id)?);
+                output.push_str(&crate::representation_bounds::emit(d,Some(id))?);
                 format!("if !same_storage(state,&next){{bounded_storage(Storage::D_{id}(&next))?;}}")
-            } else { String::new() };
-            output.push_str(&format!("pub fn prepared_transition(action:&str,state:&{physical_type},args:&[Value],compact:bool)->Result<(Value,{physical_type}), &'static str>{{validate_inputs(args)?;match action{{\n"));
+            } else {
+                output.push_str(&crate::representation_bounds::emit(d,None)?);
+                String::new()
+            };
+            output.push_str(&format!("pub fn prepared_transition(action:&str,state:&{physical_type},args:&[Value],_compact:bool)->Result<(Value,{physical_type}), &'static str>{{validate_inputs(args)?;match action{{\n"));
             for (name, action) in &checked.plan().actions {
                 let object: ink_core::library::Object =
                     serde_json::from_str(&d.bundle().objects[&action.execute])
@@ -112,14 +115,14 @@ pub fn lower(
                     "executed"
                 };
                 let observed_sort = &checked.projection().actions[name].result;
-                let ordinary=crate::definition_native::encode_value(observed_sort,"observed",false);
-                let projected=if checked.module().program().actions.iter().any(|a|a.name==*name&&matches!(a.kind,ink_core::syntax::ActionKind::Query)) {
+                let projected={
                     let ink_core::logic::Sort::Data(obs_id)=observed_sort else{return Err("query observation datatype".into());};
                     let ink_core::logic::Declaration::Datatype{constructors}= &checked.definition().executable_declarations()?[obs_id] else{return Err("query observation declaration".into());};
                     let fields=&constructors[0].fields;
-                    format!("if compact{{match &observed{{D_{obs_id}::C0(reply,committed,version,_state,events)=>Value::Data{{datatype:{obs_id:?}.into(),constructor:0,arguments:vec![{},Value::Bool(*committed),Value::U64(*version),Value::Bool(false),{}]}},_=>return Err(\"commit sequence exhausted\")}}}}else{{{ordinary}}}",crate::definition_native::encode_value(&fields[0],"reply",true),crate::definition_native::encode_value(&fields[4],"events",true))
-                }else{ordinary};
-                output.push_str(&format!("let executed=f_{}({});\nlet observed=f_{}({executed});\nlet next=f_{}({executed});\n{bounds}\nOk(({},{}))}},\n",action.execute,inputs.join(","),action.observe,action.next,projected,"next"));
+                    format!("match &observed{{D_{obs_id}::C0(reply,committed,version,_state,events)=>Value::Data{{datatype:{obs_id:?}.into(),constructor:0,arguments:vec![{},Value::Bool(*committed),Value::U64(*version),Value::Bool(false),{}]}},_=>return Err(\"commit sequence exhausted\")}}",crate::definition_native::encode_value(&fields[0],"reply",true),crate::definition_native::encode_value(&fields[4],"events",true))
+                };
+                let observation_bounds=if let ink_core::logic::Sort::Data(id)=observed_sort {format!("bounded_storage(Storage::D_{id}(&observed))?;")}else{String::new()};
+                output.push_str(&format!("let executed=f_{}({});\nlet observed=f_{}({executed});\nlet next=f_{}({executed});\n{observation_bounds}\n{bounds}\nOk(({},{}))}},\n",action.execute,inputs.join(","),action.observe,action.next,projected,"next"));
             }
             output.push_str("_=>Err(\"unknown representation action or argument count\"),}}\n");
         }
@@ -127,7 +130,8 @@ pub fn lower(
         if let Some(checked) = representations.get(i) {
             let sort = &checked.plan().physical_state;
             let t = crate::definition_native::ty(sort)?;
-            output.push_str(&format!("pub fn prepare(t:ink_core::logic::Term)->ink_core::LangResult<Box<dyn std::any::Any>>{{let value=input(t,0)?;validate_inputs(std::slice::from_ref(&value)).map_err(str::to_owned)?;let result=(||->Result<{t},&'static str>{{Ok({})}})().map_err(str::to_owned)?;Ok(Box::new(result))}}\n", crate::definition_native::decode_value(sort,"&value")));
+            let warm=if let ink_core::logic::Sort::Data(id)=sort {format!("bounded_storage(Storage::D_{id}(&result)).map_err(str::to_owned)?;")}else{String::new()};
+            output.push_str(&format!("pub fn prepare(t:ink_core::logic::Term)->ink_core::LangResult<Box<dyn std::any::Any>>{{let value=input(t,0)?;validate_inputs(std::slice::from_ref(&value)).map_err(str::to_owned)?;let result=(||->Result<{t},&'static str>{{Ok({})}})().map_err(str::to_owned)?;{warm}Ok(Box::new(result))}}\n", crate::definition_native::decode_value(sort,"&value")));
             output.push_str(&format!("pub fn materialise(t:&dyn std::any::Any)->ink_core::LangResult<ink_core::logic::Term>{{let value=t.downcast_ref::<{t}>().ok_or(\"prepared state identity\")?;Ok(output({}))}}\n",crate::definition_native::encode_value(sort,"value",true)));
             output.push_str(&format!("pub fn run_prepared(action:&str,t:&dyn std::any::Any,args:Vec<ink_core::logic::Term>,compact:bool)->ink_core::LangResult<(ink_core::logic::Term,Box<dyn std::any::Any>)>{{let state=t.downcast_ref::<{t}>().ok_or(\"prepared state identity\")?;let values=args.into_iter().map(|x|input(x,0)).collect::<ink_core::LangResult<Vec<_>>>()?;let (observed,next)=prepared_transition(action,state,&values,compact).map_err(str::to_owned)?;Ok((output(observed),Box::new(next)))}}\n"));
         }

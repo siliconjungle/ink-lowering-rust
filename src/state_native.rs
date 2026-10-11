@@ -616,7 +616,11 @@ impl Emitter<'_> {
                         Some(found) => found,
                         None => self.expr(base, env, None)?,
                     };
-                    if n == "ok_or" {
+                    if n == "unwrap_or" {
+                        let T::Option(inner) = t else { return Err("native unwrap_or needs Option".into()); };
+                        let (fallback, _) = self.expr(&args[0], env, Some(&inner))?;
+                        (format!("({s}).unwrap_or({fallback})"), *inner)
+                    } else if n == "ok_or" {
                         let T::Option(inner) = t else {
                             return Err("native ok_or needs Option".into());
                         };
@@ -1067,9 +1071,9 @@ fn emit_with_layout(
     );
     out.push_str(r#"
 impl<T:Clone> Wire for OwnedBuffer<T>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
-impl<K:Ord+Clone,V:Clone> Wire for OwnedMap<K,V>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
+impl<K:Ord+Clone+'static,V:Clone+'static> Wire for OwnedMap<K,V>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
 impl<T:Clone> InkDataEq for OwnedBuffer<T>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
-impl<K:Ord+Clone,V:Clone> InkDataEq for OwnedMap<K,V>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
+impl<K:Ord+Clone+'static,V:Clone+'static> InkDataEq for OwnedMap<K,V>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
 "#);
 
     out.push_str("\nmod transaction {\n");
