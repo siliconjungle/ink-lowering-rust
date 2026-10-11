@@ -36,3 +36,8 @@ Current complete execution coverage, GPU exclusions and integration evidence are
 Pure compute functions and stateful code can coexist. Full-width values and recursive record fields use native Rust representations without changing Ink types. The runtime adds the portable native/Wasm host ABI.
 
 `state_native::emit_selected` and `emit_selected_with_storage` retain the core-authenticated original checkpoint layout while emitting selected code. Bare Program emission keeps its own namespace. Selected code generation remains trusted; the witness does not verify machine code.
+
+All targets consume [ink-abi](https://github.com/siliconjungle/ink-abi) for shared
+type/layout contracts. Early termination, owned-buffer transforms and helper
+unfolding are checked database choices. The backend emits the resulting general
+operations literally; it does not infer those transformations from source patterns.

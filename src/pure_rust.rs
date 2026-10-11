@@ -74,6 +74,8 @@ impl Emitter<'_> {
                 Type::F32 => format!("f32::from_bits({}u32)", (*n as f32).to_bits()),
                 _ => format!("{n}u64"),
             },
+            Expr::String(s) => format!("String::from({s:?})"),
+            Expr::Unit => "()".into(),
             Expr::Float(b) => format!("f32::from_bits({b}u32)"),
             Expr::Bool(b) => b.to_string(),
             Expr::Var(n) => {
@@ -294,6 +296,34 @@ impl Emitter<'_> {
                     _ => unreachable!(),
                 };
                 match n.as_str() {
+                    "map" | "map_indexed" => {
+                        let params = if n == "map" {
+                            vec![value.clone()]
+                        } else {
+                            vec![Type::U32, value.clone()]
+                        };
+                        let (vs, body) = self.lambda(&args[0], env, &params, value)?;
+                        if n == "map" {
+                            format!("({xv}).map_inplace(|{}|{{{body}}})", vs[0])
+                        } else {
+                            format!(
+                                "({xv}).map_indexed_inplace(|{},{}|{{{body}}})",
+                                vs[0], vs[1]
+                            )
+                        }
+                    }
+                    "filter" => {
+                        let (vs, body) =
+                            self.lambda(&args[0], env, &[value.clone()], &Type::Bool)?;
+                        format!("({xv}).filter_inplace(|{}|{{{body}}})", vs[0])
+                    }
+                    "scan" => {
+                        let add = Self::arithmetic("+", "acc", "item", value);
+                        format!(
+                            "({xv}).scan_inplace({},|acc,item|{{{add}}})",
+                            Self::zero(value)
+                        )
+                    }
                     "map_parallel" => {
                         let grain = self.expr(&args[0], env, Some(&Type::U32))?;
                         let (vs, body) =
@@ -345,6 +375,25 @@ impl Emitter<'_> {
                 let (vs, body) = self.lambda(&args[2], env, &[Type::U32, t.clone()], &t)?;
                 let acc = self.fresh();
                 format!("{{let mut {acc}={initial};for {} in 0..{bound}u32 {{let {}={acc};{acc}={body};}}{acc}}}",vs[0],vs[1])
+            }
+            Expr::Call(n, args) if n == "fold_until" => {
+                let Type::List(inner) = self.infer(&args[0], env, None)? else {
+                    return Err("fold input".into());
+                };
+                let xs = self.expr(&args[0], env, None)?;
+                let initial = self.expr(&args[1], env, Some(&t))?;
+                let (stopvars, stop) = self.lambda(
+                    &args[2],
+                    env,
+                    &[inner.as_ref().clone(), t.clone()],
+                    &Type::Bool,
+                )?;
+                let (vs, body) = self.lambda(&args[3], env, &[*inner, t.clone()], &t)?;
+                let list = self.fresh();
+                let acc = self.fresh();
+                let item = self.fresh();
+                let flag = self.fresh();
+                format!("{{let {list}={xs};let mut {acc}={initial};for {item} in {list}.into_iter() {{let {}={item}.clone();let {}={acc}.clone();let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
             }
             Expr::Call(n, args) if n == "foldr" => {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
@@ -680,7 +729,7 @@ mod parallel_tests {
         use std::{fs, process::Command};
         let root = std::env::temp_dir().join(format!("ink-parallel-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        let mut source = include_str!("temporary.rs.txt").to_owned();
+        let mut source = ink_native_support::OWNED_VALUES_RUST_SOURCE.to_owned();
         source.push_str(r#"
 fn main(){
  std::env::set_var("INK_THREADS","4");
