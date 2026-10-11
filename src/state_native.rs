@@ -1045,7 +1045,7 @@ impl Wire for {id} {{
     }
     out.push_str("}\n");
     out.push_str(
-        "pub struct State {version:u64,staged:Vec<EventData>,outbox:Vec<Event>,undo:Vec<Undo>,\n",
+        "struct HostTransaction {version:u64,removed:Vec<Event>}\npub struct State {version:u64,staged:Vec<EventData>,outbox:Vec<Event>,undo:Vec<Undo>,host:Option<HostTransaction>,\n",
     );
     for s in &p.states {
         let row_type = ty(&s.ty)?;
@@ -1061,7 +1061,7 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
-    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
+    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],host:None,\n");
     for s in &p.states {
         let constructor = "BTreeMap::new()";
         writeln!(out, "{}:{constructor},", ident(&s.name)).unwrap();
@@ -1074,8 +1074,9 @@ impl Wire for {id} {{
     }
 
     out.push_str("}}\n");
-    out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox(&self)->&[Event]{&self.outbox}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){self.outbox.retain(|e|(e.commit,e.position)>(commit,position));}\n");
-    out.push_str("pub fn checkpoint(&self)->Result<Vec<u8>,String>{self.checkpoint_with_limits(SnapshotLimits::default())}\npub fn checkpoint_with_limits(&self,limits:SnapshotLimits)->Result<Vec<u8>,String>{if !self.undo.is_empty()||!self.staged.is_empty(){return Err(\"checkpoint requires transaction boundary\".into())}let layout=snapshot_layout();let tables=vec![");
+    out.push_str("pub fn begin_transaction(&mut self)->Result<bool,String>{if self.host.is_some()||!self.undo.is_empty()||!self.staged.is_empty(){return Err(\"transaction already in progress\".into())}self.host=Some(HostTransaction{version:self.version,removed:vec![]});Ok(true)}\n pub fn commit_transaction(&mut self){self.host=None;self.undo.clear();self.clear_journal_keys();}\n pub fn rollback_transaction(&mut self){if let Some(host)=self.host.take(){self.rollback();self.version=host.version;self.outbox.retain(|e|e.commit<=host.version);let mut restored=host.removed;restored.append(&mut self.outbox);self.outbox=restored;}}\n");
+    out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox(&self)->&[Event]{&self.outbox}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){let old=std::mem::take(&mut self.outbox);for e in old{if(e.commit,e.position)>(commit,position){self.outbox.push(e)}else if let Some(host)=&mut self.host{host.removed.push(e)}}}\n");
+    out.push_str("pub fn checkpoint(&self)->Result<Vec<u8>,String>{self.checkpoint_with_limits(SnapshotLimits::default())}\npub fn checkpoint_with_limits(&self,limits:SnapshotLimits)->Result<Vec<u8>,String>{if (self.host.is_none()&&!self.undo.is_empty())||!self.staged.is_empty(){return Err(\"checkpoint requires transaction boundary\".into())}let layout=snapshot_layout();let tables=vec![");
     for (n, _, _) in &layout.roots {
         writeln!(
             out,
@@ -1139,7 +1140,8 @@ impl Wire for {id} {{
         out.push_str("});}\n");
         out.push_str("result}\n");
     }
-    out.push_str("fn rollback(&mut self){for undo in self.undo.drain(..).rev(){match undo{\n");
+    out.push_str("fn rollback(&mut self){self.rollback_to(0);}
+fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){match undo{\n");
     for s in &p.states {
         let id = ident(&s.name);
         write!(out, "Undo::{id}{{key,old").unwrap();
@@ -1223,13 +1225,13 @@ impl Wire for {id} {{
         emitter.reset_ownership(&a.params, &a.body);
         let body = emitter.block(&a.body, &mut a.params.iter().cloned().collect(), &a.result)?;
         emitter.clear_ownership();
-        writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}\npub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{let result=self.action_{id}({args});").unwrap();
+        writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}\npub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{self.clear_journal_keys();let mark=self.undo.len();let result=self.action_{id}({args});").unwrap();
         if a.kind == ActionKind::Query {
             out.push_str(
                 "Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})}\n",
             );
         } else {
-            out.push_str("let version=match transaction::decide(self.version,result.is_ok()){transaction::Decision::Rollback=>{self.rollback();return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback();return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;self.undo.clear();self.clear_journal_keys();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
+            out.push_str("let version=match transaction::decide(self.version,result.is_ok()){transaction::Decision::Rollback=>{self.rollback_to(mark);return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback_to(mark);return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;if self.host.is_none(){self.undo.clear();}self.clear_journal_keys();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }

@@ -254,11 +254,11 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     let e = Emit { checked, types };
     let p = checked.module().program();
     let plan = checked.plan();
-    let queries: BTreeMap<String, ink_core::logic::Declaration> = BTreeMap::new();
+    let (queries, observers) = ink_core::field_projection::host_observers(checked)?;
     let emission = if foreign {
-        crate::definition_native::lower_typed_shared_datatypes(checked.definition())?
+        crate::definition_native::lower_typed_shared_datatypes(checked.definition(), &queries)?
     } else {
-        crate::definition_native::lower_typed_shared(checked.definition())?
+        crate::definition_native::lower_typed_shared_projected(checked.definition(), &queries)?
     };
     let mut out = emission.source;
     if foreign {
@@ -296,7 +296,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     out.push_str(&e.wire()?);
     out.push_str(&e.tables()?);
     let physical = crate::definition_native::ty(&plan.physical_state)?;
-    writeln!(out,"pub struct State{{physical:{physical},version:u64,outbox:Vec<portable::Event>,layout:portable::Layout}}\nimpl State{{").unwrap();
+    writeln!(out,"struct HostTransaction{{physical:{physical},version:u64,removed:Vec<portable::Event>}}\n pub struct State{{physical:{physical},version:u64,outbox:Vec<portable::Event>,layout:portable::Layout,host:Option<HostTransaction>}}\nimpl State{{").unwrap();
     let empty = checked
         .projection()
         .tables
@@ -304,16 +304,31 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
         .map(|t| format!("std::sync::Arc::new(D_{}::C0)", t.datatype))
         .collect::<Vec<_>>();
     out.push_str("// CALLER CONTRACT: arguments must have the declared types and canonical values.\n// No runtime type validation. Malformed input may panic, trap or corrupt state.\n");
-    writeln!(out,"pub fn new()->Result<Self,String>{{let logical=D_{}::C0{};Ok(Self{{physical:f_{}(&logical),version:0,outbox:vec![],layout:snapshot_layout()}})}}",checked.projection().state,fields(&empty),plan.encode).unwrap();
-    writeln!(out,"pub fn restore(bytes:&[u8])->Result<Self,String>{{let layout=snapshot_layout();let saved=portable::decode(&layout,bytes,SnapshotLimits::default())?;let logical=logical_from_tables(&saved.tables)?;Ok(Self{{physical:f_{}(&logical),version:saved.version,outbox:saved.outbox,layout}})}}",plan.encode).unwrap();
+    writeln!(out,"pub fn new()->Result<Self,String>{{let logical=D_{}::C0{};Ok(Self{{physical:f_{}(&logical),version:0,outbox:vec![],layout:snapshot_layout(),host:None}})}}",checked.projection().state,fields(&empty),plan.encode).unwrap();
+    writeln!(out,"pub fn restore(bytes:&[u8])->Result<Self,String>{{let layout=snapshot_layout();let saved=portable::decode(&layout,bytes,SnapshotLimits::default())?;let logical=logical_from_tables(&saved.tables)?;Ok(Self{{physical:f_{}(&logical),version:saved.version,outbox:saved.outbox,layout,host:None}})}}",plan.encode).unwrap();
     writeln!(out,"pub fn checkpoint(&self)->Result<Vec<u8>,String>{{let logical=f_{}({});portable::encode(&self.layout,&portable::Logical{{version:self.version,tables:logical_tables(&logical)?,outbox:self.outbox.clone()}},SnapshotLimits::default())}}",plan.decode,borrowed(&plan.physical_state,"self.physical")).unwrap();
-    out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox_json(&self)->Json{Json::Array(self.outbox.iter().map(|e|json!({\"commit\":e.commit,\"position\":e.position,\"channel\":self.layout.events[e.channel].0,\"value\":e.value})).collect())}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){self.outbox.retain(|e|(e.commit,e.position)>(commit,position));}\n");
+    out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox_json(&self)->Json{Json::Array(self.outbox.iter().map(|e|json!({\"commit\":e.commit,\"position\":e.position,\"channel\":self.layout.events[e.channel].0,\"value\":e.value})).collect())}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){let n=self.outbox.iter().take_while(|e|(e.commit,e.position)<=(commit,position)).count();let removed=self.outbox.drain(..n);if let Some(host)=&mut self.host{host.removed.extend(removed.filter(|e|e.commit<=host.version));}}\n pub fn begin_transaction(&mut self)->Result<bool,String>{if self.host.is_some(){return Err(\"state transaction already in progress\".into())}self.host=Some(HostTransaction{physical:self.physical.clone(),version:self.version,removed:vec![]});Ok(true)}\n pub fn commit_transaction(&mut self){self.host=None;}\n pub fn rollback_transaction(&mut self){if let Some(host)=self.host.take(){self.physical=host.physical;self.version=host.version;self.outbox.retain(|e|e.commit<=host.version);let mut restored=host.removed;restored.append(&mut self.outbox);self.outbox=restored;}}\n");
     out.push_str(
         "pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{match name{\n",
     );
     for source in &p.actions {
         let a = &plan.actions[&source.name];
-        let observation = data(&checked.projection().actions[&source.name].result)?;
+        let observation = data(
+            a.compact
+                .as_ref()
+                .map(|c| &c.result)
+                .unwrap_or(&checked.projection().actions[&source.name].result),
+        )?;
+        let observe = a
+            .compact
+            .as_ref()
+            .map(|c| c.observe.as_str())
+            .unwrap_or(&observers[&source.name]);
+        let observed_fields = if a.compact.is_some() {
+            "reply,committed,version,events"
+        } else {
+            "reply,committed,version,_,events"
+        };
         writeln!(out, "{:?}=>{{let xs=args.as_array().unwrap();", source.name).unwrap();
         let mut args = vec![
             borrowed(&plan.physical_state, "self.physical"),
@@ -331,7 +346,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
         }
         writeln!(out, "let executed=f_{}({});", a.execute, args.join(",")).unwrap();
         let executed = borrowed(&a.result, "executed");
-        writeln!(out,"let observed=f_{}({executed});let next=f_{}({executed});let(reply,committed,version,events)=match &observed{{D_{observation}::C0(reply,committed,version,_,events)=>(reply,*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let result={};let staged=logical_events(events)?;let mut published=vec![];",a.observe,a.next,e.codec(&source.result,"write","reply","0")?).unwrap();
+        writeln!(out,"let observed=f_{}({executed});let next=f_{}({executed});let(reply,committed,version,events)=match &observed{{D_{observation}::C0({observed_fields})=>(reply,*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let result={};let staged=logical_events(events)?;let mut published=vec![];",observe,a.next,e.codec(&source.result,"write","reply","0")?).unwrap();
         let names = p
             .events
             .keys()
