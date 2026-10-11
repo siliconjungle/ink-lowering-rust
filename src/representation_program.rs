@@ -456,7 +456,17 @@ fn lower_native(
             writeln!(out,"let result=f_{query}({});Ok(OutcomeView{{result,committed:false,version:self.version,events:&self.outbox[self.outbox.len()..]}})}}",args.join(",")).unwrap();
             continue;
         }
-        let observation = data(&checked.projection().actions[&source.name].result)?;
+        let observation = data(
+            a.compact.as_ref().map(|c| &c.result)
+                .unwrap_or(&checked.projection().actions[&source.name].result),
+        )?;
+        let observe = a.compact.as_ref().map(|c| c.observe.as_str())
+            .unwrap_or(&observers[&source.name]);
+        let observed_fields = if a.compact.is_some() {
+            "reply,committed,version,events"
+        } else {
+            "reply,committed,version,_,events"
+        };
         writeln!(
             out,
             "let executed={}({});let observed=f_{}({});let next=f_{}({});",
@@ -466,7 +476,7 @@ fn lower_native(
                 format!("f_{}", a.execute)
             },
             args.join(","),
-            observers[&source.name],
+            observe,
             borrowed(&a.result, "executed"),
             a.next,
             borrowed(&a.result, "executed")
@@ -477,7 +487,7 @@ fn lower_native(
         } else {
             "*reply"
         };
-        writeln!(out,"let(result,committed,version,events)=match &observed{{D_{observation}::C0(reply,committed,version,_,events)=>({owned_reply},*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let start=self.outbox.len();let staged=logical_events(events)?;if committed{{self.outbox.try_reserve(staged.len()).map_err(|_|\"outbox allocation failure\")?;for(position,(channel,value))in staged.into_iter().enumerate(){{self.outbox.push(Event{{commit:version,position:position as u64,channel,value}});}}}}self.physical=next;self.version=version;Ok(OutcomeView{{result,committed,version,events:&self.outbox[start..]}})}}").unwrap();
+        writeln!(out,"let(result,committed,version,events)=match &observed{{D_{observation}::C0({observed_fields})=>({owned_reply},*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let start=self.outbox.len();let staged=logical_events(events)?;if committed{{self.outbox.try_reserve(staged.len()).map_err(|_|\"outbox allocation failure\")?;for(position,(channel,value))in staged.into_iter().enumerate(){{self.outbox.push(Event{{commit:version,position:position as u64,channel,value}});}}}}self.physical=next;self.version=version;Ok(OutcomeView{{result,committed,version,events:&self.outbox[start..]}})}}").unwrap();
     }
     out.push_str(
         "pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{match name{\n",
