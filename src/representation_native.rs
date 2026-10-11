@@ -74,12 +74,60 @@ pub fn lower(
                 output.push_str(&format!("let executed=f_{}({});\nlet observed=f_{}({executed});\nlet next=f_{}({executed});\nOk(({},{}))}},\n",action.execute,inputs.join(","),action.observe,action.next,crate::definition_native::encode_value(observed_sort,"observed",false),crate::definition_native::encode_value(&checked.plan().physical_state,"next",false)));
             }
             output.push_str("_=>Err(\"unknown representation action or argument count\"),}}\n");
+            let physical_id = match &checked.plan().physical_state { ink_core::logic::Sort::Data(id) => id, _ => return Err("prepared state requires datatype".into()) };
+            output.push_str(&crate::representation_bounds::emit(d,physical_id)?);
+            output.push_str(&format!("pub fn prepared_transition(action:&str,state:&D_{physical_id},args:&[Value],compact:bool)->Result<(Value,D_{physical_id}), &'static str>{{validate_inputs(args)?;match action{{\n"));
+            for (name, action) in &checked.plan().actions {
+                let object: ink_core::library::Object =
+                    serde_json::from_str(&d.bundle().objects[&action.execute])
+                        .map_err(|e| e.to_string())?;
+                let ink_core::logic::Declaration::Function { params, .. } = object.declaration
+                else {
+                    return Err("representation execute is not a function".into());
+                };
+                output.push_str(&format!("{name:?} if args.len()=={}=>{{\n", params.len()-1));
+                let mut inputs = Vec::new();
+                for (j, (_, sort)) in params.iter().enumerate() {
+                    if j == 0 { inputs.push("state".to_string()); continue; }
+                    output.push_str(&format!(
+                        "let a{j}={};\n",
+                        crate::definition_native::decode_value(sort, &format!("&args[{}]",j-1))
+                    ));
+                    inputs.push(format!(
+                        "{}a{j}",
+                        if matches!(sort, ink_core::logic::Sort::Data(_)) {
+                            "&"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                let executed = if matches!(action.result, ink_core::logic::Sort::Data(_)) {
+                    "&executed"
+                } else {
+                    "executed"
+                };
+                let observed_sort = &checked.projection().actions[name].result;
+                let ordinary=crate::definition_native::encode_value(observed_sort,"observed",false);
+                let projected=if checked.module().program().actions.iter().any(|a|a.name==*name&&matches!(a.kind,ink_core::syntax::ActionKind::Query)) {
+                    let ink_core::logic::Sort::Data(obs_id)=observed_sort else{return Err("query observation datatype".into());};
+                    let ink_core::logic::Declaration::Datatype{constructors}= &checked.definition().executable_declarations()?[obs_id] else{return Err("query observation declaration".into());};
+                    let fields=&constructors[0].fields;
+                    format!("if compact{{match &observed{{D_{obs_id}::C0(reply,committed,version,_state,events)=>Value::Data{{datatype:{obs_id:?}.into(),constructor:0,arguments:vec![{},Value::Bool(*committed),Value::U64(*version),Value::Bool(false),{}]}},_=>return Err(\"commit sequence exhausted\")}}}}else{{{ordinary}}}",crate::definition_native::encode_value(&fields[0],"reply",true),crate::definition_native::encode_value(&fields[4],"events",true))
+                }else{ordinary};
+                output.push_str(&format!("let executed=f_{}({});\nlet observed=f_{}({executed});\nlet next=f_{}({executed});\nif !same_storage(state,&next){{bounded_storage(Storage::D_{physical_id}(&next))?;}}\nOk(({},{}))}},\n",action.execute,inputs.join(","),action.observe,action.next,projected,"next"));
+            }
+            output.push_str("_=>Err(\"unknown representation action or argument count\"),}}\n");
         }
-        output.push_str(r#"pub fn input(t:ink_core::logic::Term,depth:usize)->ink_core::LangResult<Value>{
-if depth>128{return Err("native representation value depth".into());}
-Ok(match t{ink_core::logic::Term::Bool(x)=>Value::Bool(x),ink_core::logic::Term::U64(x)=>Value::U64(x),ink_core::logic::Term::Construct{datatype,constructor,arguments}=>Value::Data{datatype,constructor,arguments:arguments.into_iter().map(|x|input(x,depth+1)).collect::<ink_core::LangResult<_>>()?},_=>return Err("native input is not a value".into())})}
-pub fn output(t:Value)->ink_core::logic::Term{match t{Value::Bool(x)=>ink_core::logic::Term::Bool(x),Value::U64(x)=>ink_core::logic::Term::U64(x),Value::Data{datatype,constructor,arguments}=>ink_core::logic::Term::Construct{datatype,constructor,arguments:arguments.into_iter().map(output).collect()}}}
-"#);
+        output.push_str(include_str!("representation_transport.rs.txt"));
+        if let Some(checked) = representations.get(i) {
+            let sort = &checked.plan().physical_state;
+            let t = crate::definition_native::ty(sort)?;
+            output.push_str(&format!("pub fn prepare(t:ink_core::logic::Term)->ink_core::LangResult<Box<dyn std::any::Any>>{{let value=input(t,0)?;validate_inputs(std::slice::from_ref(&value)).map_err(str::to_owned)?;let result=(||->Result<{t},&'static str>{{Ok({})}})().map_err(str::to_owned)?;Ok(Box::new(result))}}\n", crate::definition_native::decode_value(sort,"&value")));
+            output.push_str(&format!("pub fn materialise(t:&dyn std::any::Any)->ink_core::LangResult<ink_core::logic::Term>{{let value=t.downcast_ref::<{t}>().ok_or(\"prepared state identity\")?;Ok(output({}))}}\n",crate::definition_native::encode_value(sort,"value",true)));
+            output.push_str(&format!("pub fn run_prepared(action:&str,t:&dyn std::any::Any,args:Vec<ink_core::logic::Term>,compact:bool)->ink_core::LangResult<(ink_core::logic::Term,Box<dyn std::any::Any>)>{{let state=t.downcast_ref::<{t}>().ok_or(\"prepared state identity\")?;let values=args.into_iter().map(|x|input(x,0)).collect::<ink_core::LangResult<Vec<_>>>()?;let (observed,next)=prepared_transition(action,state,&values,compact).map_err(str::to_owned)?;Ok((output(observed),Box::new(next)))}}\n"));
+        }
+
         output.push_str("}\n");
     }
     output.push_str("pub struct Native;\nimpl ink_runtime::representation::Executor for Native {\nfn execute(&self, definition:&ink_core::definition::CheckedDefinition, _context:&ink_core::logic::Context,function:&str,args:Vec<ink_core::logic::Term>)->ink_core::LangResult<ink_core::logic::Term>{\nlet executable=ink_core::registry::identity(&(\"ink-sealed-executable-v1\",definition.bundle_sha256(),definition.exports(),definition.choices()))?;\nmatch executable.as_str(){\n");
@@ -97,8 +145,22 @@ pub fn output(t:Value)->ink_core::logic::Term{match t{Value::Bool(x)=>ink_core::
     for (i, checked) in representations.iter().enumerate() {
         output.push_str(&format!("({:?},{:?})=>{{let values=args.into_iter().map(|x|definition_{i}::input(x,0)).collect::<ink_core::LangResult<Vec<_>>>()?;let (observed,next)=definition_{i}::transition(action,&values).map_err(str::to_owned)?;Ok((definition_{i}::output(observed),definition_{i}::output(next)))}},\n",checked.request().representation,executable_identity(checked.definition())?));
     }
-    output.push_str(
-        "_=>Err(\"native executor does not contain the pinned representation\".into()),}}}\n",
-    );
+    output.push_str("_=>Err(\"native executor does not contain the pinned representation\".into()),}}\n");
+    for mode in ["prepare", "materialise", "transition_prepared", "transition_prepared_readonly"] {
+        let signature = match mode {
+            "prepare" => "fn prepare(&self,c:&ink_core::representation::CheckedRepresentation,p:&ink_core::logic::Term)->ink_core::LangResult<Option<Box<dyn std::any::Any>>>",
+            "materialise" => "fn materialise(&self,c:&ink_core::representation::CheckedRepresentation,p:&dyn std::any::Any)->ink_core::LangResult<ink_core::logic::Term>",
+            "transition_prepared_readonly" => "fn transition_prepared_readonly(&self,c:&ink_core::representation::CheckedRepresentation,action:&str,p:&dyn std::any::Any,args:Vec<ink_core::logic::Term>)->ink_core::LangResult<Option<(ink_core::logic::Term,Box<dyn std::any::Any>)>>",
+            _ => "fn transition_prepared(&self,c:&ink_core::representation::CheckedRepresentation,action:&str,p:&dyn std::any::Any,args:Vec<ink_core::logic::Term>)->ink_core::LangResult<(ink_core::logic::Term,Box<dyn std::any::Any>)>",
+        };
+        output.push_str(signature);
+        output.push_str("{let d=c.definition();let executable=ink_core::registry::identity(&(\"ink-sealed-executable-v1\",d.bundle_sha256(),d.exports(),d.choices()))?;match (c.request().representation.as_str(),executable.as_str()){\n");
+        for (i,c) in representations.iter().enumerate() {
+            let body = match mode { "prepare" => format!("definition_{i}::prepare(p.clone()).map(Some)"), "materialise" => format!("definition_{i}::materialise(p)"), "transition_prepared_readonly"=>format!("definition_{i}::run_prepared(action,p,args,true).map(Some)"), _ => format!("definition_{i}::run_prepared(action,p,args,false)") };
+            output.push_str(&format!("({:?},{:?})=>{body},\n",c.request().representation,executable_identity(c.definition())?));
+        }
+        output.push_str("_=>Err(\"prepared executor identity mismatch\".into()),}}\n");
+    }
+    output.push_str("}\n");
     Ok(output)
 }

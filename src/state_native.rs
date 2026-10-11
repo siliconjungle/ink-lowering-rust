@@ -1110,7 +1110,7 @@ impl<K:Ord+Clone,V:Clone> InkDataEq for OwnedMap<K,V>{fn ink_data_eq(&self,_:&Se
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)] pub struct {id}(pub u128);
 impl Wire for {id} {{
  fn to_json(&self)->Json{{json!(format!("{{:032x}}",self.0))}}
- fn from_json(v:&Json)->Result<Self,String>{{let s=v.as_str().ok_or("expected ID")?;if s.len()!=32 || !s.bytes().all(|b|b.is_ascii_hexdigit()){{return Err("invalid ID".into())}} Ok(Self(u128::from_str_radix(s,16).map_err(|e|e.to_string())?))}}
+ fn from_json(v:&Json)->Result<Self,String>{{let s=v.as_str().unwrap(); Ok(Self(u128::from_str_radix(s,16).unwrap()))}}
 }}
 "#).unwrap();
     }
@@ -1130,11 +1130,11 @@ impl Wire for {id} {{
         for (f, _) in fs {
             writeln!(out, "{f:?}:self.{}.to_json(),", ident(f)).unwrap();
         }
-        writeln!(out,"}})}} fn from_json(v:&Json)->Result<Self,String>{{let obj=v.as_object().ok_or(\"expected record\")?;if obj.len()!={}{{return Err(\"record field mismatch\".into())}}Ok(Self{{",fs.len()).unwrap();
+        writeln!(out,"}})}} fn from_json(v:&Json)->Result<Self,String>{{let obj=v.as_object().unwrap();Ok(Self{{").unwrap();
         for (f, t) in fs {
             writeln!(
                 out,
-                "{}:<{} as Wire>::from_json(obj.get({f:?}).ok_or(\"missing field\")?)?,",
+                "{}:<{} as Wire>::from_json(obj.get({f:?}).unwrap())?,",
                 ident(f),
                 field_ty(n, t, p)?
             )
@@ -1158,7 +1158,7 @@ impl Wire for {id} {{
             )
             .unwrap();
         }
-        out.push_str("_=>Err(\"invalid enum\".into())}}}\n");
+        out.push_str("_=>unreachable!(\"caller enum precondition\")}}}\n");
     }
     for n in p.ids.iter().chain(p.enums.keys()) {
         writeln!(
@@ -1530,7 +1530,7 @@ impl Wire for {id} {{
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }
-    out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
+    out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().unwrap();match name{\n");
     for f in &p.functions {
         if ink_core::local_collections::owned(&f.result, p)
             || f.params
@@ -1545,13 +1545,7 @@ impl Wire for {id} {{
             .unwrap();
             continue;
         }
-        write!(
-            out,
-            "{:?}=>{{if args.len()!={}{{return Err(\"argument count mismatch\".into())}}",
-            f.name,
-            f.params.len()
-        )
-        .unwrap();
+        write!(out, "{:?}=>{{", f.name).unwrap();
         let mut argv = vec![];
         for (i, (_, t)) in f.params.iter().enumerate() {
             write!(
@@ -1571,15 +1565,9 @@ impl Wire for {id} {{
         .unwrap();
     }
     out.push_str("_=>Err(\"unknown function\".into())}}\n");
-    out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"expected argument array\")?;match name{\n");
+    out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().unwrap();match name{\n");
     for a in &p.actions {
-        write!(
-            out,
-            "{:?}=>{{if args.len()!={}{{return Err(\"argument count mismatch\".into())}}",
-            a.name,
-            a.params.len()
-        )
-        .unwrap();
+        write!(out, "{:?}=>{{", a.name).unwrap();
         let mut argv = vec![];
         for (i, (_, t)) in a.params.iter().enumerate() {
             write!(
