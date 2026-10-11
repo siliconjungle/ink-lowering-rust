@@ -33,6 +33,7 @@ pub(crate) fn emit(
     let mut out = String::from(
         "// Borrowed native typed objects: C never owns or packs the physical state.\n",
     );
+    out.push_str(ink_native_support::CONTINUATION_FRAMES_RUST_SOURCE);
     out.push_str("thread_local!{\n");
     for (id, d) in &ds {
         if matches!(d, Declaration::Datatype { .. }) {
