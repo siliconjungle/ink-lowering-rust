@@ -36,9 +36,11 @@ struct Expression {
     sort: Sort,
     borrowed: bool,
     packed_view: bool,
-    // A matched field already owns this immutable value. Reuse that owner when
-    // constructing another field instead of allocating an identical root.
+    /// A borrowed data field may already have an immutable shared owner.
+    /// Reuse that edge when constructing another value instead of allocating
+    /// an identical shallow node around a clone of its payload.
     shared_owner: Option<String>,
+    shared_argument: Option<String>,
 }
 impl Expression {
     fn owned(&self) -> String {
@@ -67,6 +69,9 @@ struct Lower<'a> {
     typed_only: bool,
     packed_spines: bool,
     identity_memo: bool,
+    linear_step: bool,
+    recursive_sites: usize,
+    recursive_site: usize,
 }
 pub(crate) fn ty(sort: &Sort) -> LangResult<String> {
     Ok(match sort {
@@ -357,6 +362,21 @@ impl Lower<'_> {
                 function,
                 arguments,
             } => self.call(function, arguments, env, current, depth + 1)?,
+            Term::SelfCall(arguments) if self.linear_step => {
+                let result = match self.declaration(current)? {Declaration::Function {result,..} => result.clone(),_=>unreachable!()};
+                let mut next = Vec::new();
+                for a in arguments {
+                    let e=self.expression(a,env,current,depth+1)?;
+                    next.push(if matches!(e.sort,Sort::Data(_)) {e.shared_owner.clone().unwrap_or_else(||format!("std::sync::Arc::new({})",e.owned()))} else {e.owned()});
+                }
+                let code=if self.recursive_sites==1 {
+                    format!("match ink_resume.take(){{Some(value)=>value,None=>return Err(({},))}}",next.join(","))
+                } else {
+                    let site=self.recursive_site;self.recursive_site+=1;
+                    format!("match &ink_resume[{site}]{{Some(value)=>value.clone(),None=>return Err(({site},({},)))}}",next.join(","))
+                };
+                (code,result)
+            }
             Term::SelfCall(arguments) => self.call(current, arguments, env, current, depth + 1)?,
             Term::Construct {
                 datatype,
@@ -372,7 +392,7 @@ impl Lower<'_> {
                             tail.owned(),
                             if matches!(head.sort, Sort::Data(_)) {
                                 if let Some(owner) = &head.shared_owner {
-                                    format!("std::sync::Arc::clone({owner})")
+                                    owner.clone()
                                 } else {
                                     format!("std::sync::Arc::new({})", head.owned())
                                 }
@@ -384,6 +404,7 @@ impl Lower<'_> {
                         borrowed: false,
                         packed_view: false,
                         shared_owner: None,
+                        shared_argument: None,
                     });
                 }
                 let cs = self.constructors(datatype)?;
@@ -393,8 +414,20 @@ impl Lower<'_> {
                 for (t, s) in arguments.iter().zip(&c.fields) {
                     let e = self.expression(t, env, current, depth + 1)?;
                     args.push(if matches!(field_sort(s, datatype), Sort::Data(_)) {
-                        let value=if let Some(owner)=&e.shared_owner {format!("std::sync::Arc::clone({owner})")}else{format!("{}::new({})",self.storage(),e.owned())};
-                        if detachable && *s == Sort::SelfType {format!("Some({value})")}else{value
+                        let value = if self.shared {
+                            e.shared_owner
+                                .as_ref()
+                                .map(|owner| owner.clone())
+                                .unwrap_or_else(|| {
+                                    format!("{}::new({})", self.storage(), e.owned())
+                                })
+                        } else {
+                            format!("{}::new({})", self.storage(), e.owned())
+                        };
+                        if detachable && *s == Sort::SelfType {
+                            format!("Some({value})")
+                        } else {
+                            value
                         }
                     } else {
                         e.owned()
@@ -464,10 +497,14 @@ impl Lower<'_> {
                                     && self.shared
                                     && (!packed || field_index == 0)
                                 {
-                                    Some(if packed {format!("&{binder}")} else if detachable && s==Sort::SelfType {format!("{binder}.as_ref().expect(\"live recursive edge\")")}else{binder.clone()})
+                                    Some(format!("std::sync::Arc::clone({})",if packed {format!("&{binder}")} else if detachable && s==Sort::SelfType {format!("{binder}.as_ref().expect(\"live recursive edge\")")}else{binder.clone()}))
                                 } else {
                                     None
                                 },
+                                shared_argument: if data && self.shared && self.typed_only && !self.packed_spines && !self.identity_memo {
+                                    let owner = if detachable && s==Sort::SelfType {format!("{binder}.as_ref().expect(\"live recursive edge\")")}else{binder.clone()};
+                                    Some(format!("InkBorrowed::edge({owner})"))
+                                } else {None},
                             },
                         );
                         fields.push(binder);
@@ -524,7 +561,7 @@ impl Lower<'_> {
         {
             let name = self.fresh();
             let ty = ty(&sort)?;
-            Some(format!("{{static {name}:std::sync::OnceLock<std::sync::Arc<{ty}>>=std::sync::OnceLock::new();{name}.get_or_init(||std::sync::Arc::new({code}))}}"))
+            Some(format!("std::sync::Arc::clone({{static {name}:std::sync::OnceLock<std::sync::Arc<{ty}>>=std::sync::OnceLock::new();{name}.get_or_init(||std::sync::Arc::new({code}))}})"))
         } else {
             None
         };
@@ -534,6 +571,7 @@ impl Lower<'_> {
             borrowed: false,
             packed_view: false,
             shared_owner,
+            shared_argument: None,
         })
     }
     fn call(
@@ -559,7 +597,7 @@ impl Lower<'_> {
             .collect::<LangResult<Vec<_>>>()?;
         let values = expressions
             .iter()
-            .map(|e| self.argument(e))
+            .map(|e| {let argument=self.argument(e)?;Ok(if self.shared && self.typed_only && !self.packed_spines && !self.identity_memo && matches!(e.sort,Sort::Data(_)) {e.shared_argument.clone().unwrap_or_else(||format!("InkBorrowed::root({argument})"))}else{argument})})
             .collect::<LangResult<Vec<_>>>()?;
         let direct = format!("d_{id}({})", values.join(","));
         if self.identity_memo
@@ -577,7 +615,7 @@ impl Lower<'_> {
             if data.len() == 1 && !data[0].1.packed_view {
                 if let Some(owner) = &data[0].1.shared_owner {
                     let memo_input=self.fresh();
-                    let mut locals = format!("let {memo_input}={owner};");
+                    let mut locals = format!("let {memo_input}=&{owner};");
                     let mut call_args = values.clone();
                     call_args[data[0].0]=format!("{memo_input}.as_ref()");
                     let mut words = Vec::new();
@@ -790,8 +828,14 @@ pub fn emit_selected(
 pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Emission> {
     lower_with_storage(checked, false, false, true, &BTreeMap::new())
 }
+/// Typed shared functions from a checked witness, without extra definitions.
+pub fn lower_typed_shared(
+    checked: &ink_core::definition::CheckedDefinition,
+) -> LangResult<Emission> {
+    lower_with_storage(checked, true, true, true, &BTreeMap::new())
+}
 /// Literal typed functions only: no generic constructor carrier or dispatcher.
-pub(crate) fn lower_typed_shared(
+pub(crate) fn lower_typed_shared_projected(
     checked: &ink_core::definition::CheckedDefinition,
     extras: &BTreeMap<String, Declaration>,
 ) -> LangResult<Emission> {
@@ -879,6 +923,9 @@ fn lower_with_storage_mode(
         typed_only,
         packed_spines,
         identity_memo,
+        linear_step: false,
+        recursive_sites: 0,
+        recursive_site: 0,
     };
     for id in &exports {
         if !matches!(lower.declaration(id)?, Declaration::Function { .. }) {
@@ -897,6 +944,9 @@ fn lower_with_storage_mode(
     if !typed_only {
         source.push_str(include_str!("definition_value.rs.txt"));
     }
+    if shared && typed_only && functions {
+        source.push_str("struct InkBorrowed<'a,T>{value:&'a T,owner:Option<&'a std::sync::Arc<T>>}\nimpl<'a,T> Copy for InkBorrowed<'a,T>{}\nimpl<'a,T> Clone for InkBorrowed<'a,T>{fn clone(&self)->Self{*self}}\nimpl<'a,T:Clone> InkBorrowed<'a,T>{fn root(value:&'a T)->Self{Self{value,owner:None}}fn edge(owner:&'a std::sync::Arc<T>)->Self{Self{value:owner.as_ref(),owner:Some(owner)}}fn share(self)->std::sync::Arc<T>{self.owner.map(std::sync::Arc::clone).unwrap_or_else(||std::sync::Arc::new(self.value.clone()))}}\n");
+    }
     let selected: Vec<_> = lower.selected.iter().cloned().collect();
     for id in &selected {
         match lower.declaration(id)?.clone() {
@@ -912,31 +962,58 @@ fn lower_with_storage_mode(
                 if !functions {
                     continue;
                 }
+                let mut recursive_sites=0;
+                ink_core::logic::walk_term(&body,|t|if matches!(t,Term::SelfCall(_)){recursive_sites+=1});
+                let linear = shared && typed_only && !packed_spines && !identity_memo && (1..=64).contains(&recursive_sites);
+                lower.linear_step=linear;
+                lower.recursive_sites=recursive_sites;
+                lower.recursive_site=0;
                 let mut env = BTreeMap::new();
                 let mut inputs = Vec::new();
-                for (n, s) in params {
+                let mut step_inputs = Vec::new();
+                let mut initial = Vec::new();
+                let mut frame_types = Vec::new();
+                let mut frame_args = Vec::new();
+                for (i,(n, s)) in params.into_iter().enumerate() {
                     let binder = lower.fresh();
                     let data = matches!(s, Sort::Data(_));
                     let packed_view = lower.is_packed(&s)?;
-                    inputs.push(format!("{binder}: {}", lower.input_type(&s)?));
-                    env.insert(
-                        n,
-                        Expression {
-                            code: binder,
-                            sort: s,
-                            borrowed: data,
-                            packed_view,
-                            shared_owner: None,
-                        },
-                    );
+                    let shared_data = data && shared && typed_only && !packed_spines && !identity_memo;
+                    inputs.push(if shared_data {
+                        format!("{binder}: InkBorrowed<'_,{}>",ty(&s)?)
+                    } else { format!("{binder}: {}", lower.input_type(&s)?) });
+                    initial.push(if data {format!("{binder}.share()")}else{binder.clone()});
+                    frame_types.push(if data {format!("std::sync::Arc<{}>",ty(&s)?)}else{ty(&s)?});
+                    step_inputs.push(format!("{binder}: {}{}",if data {"&std::sync::Arc<"}else{""},if data {format!("{}>",ty(&s)?)}else{ty(&s)?}));
+                    frame_args.push(format!("{}ink_frame.{i}",if data {"&"}else{""}));
+                    env.insert(n, Expression {
+                        code: if linear && data {format!("{binder}.as_ref()")}else if shared_data {format!("{binder}.value")} else {binder.clone()},
+                        sort: s,
+                        borrowed: data,
+                        packed_view,
+                        shared_owner: shared_data.then(||if linear {format!("std::sync::Arc::clone({binder})")}else{format!("{binder}.share()")}),
+                        shared_argument: shared_data.then(||if linear {format!("InkBorrowed::edge({binder})")}else{binder.clone()}),
+                    });
                 }
                 let body = lower.expression(&body, &env, id, 0)?;
-                source.push_str(&format!(
-                    "fn d_{id}({}) -> {} {{ {} }}\n",
-                    inputs.join(","),
-                    ty(&result)?,
-                    body.owned()
-                ));
+                lower.linear_step=false;
+                if linear {
+                    let result_type=ty(&result)?;
+                    let frame_type=format!("({},)",frame_types.join(","));
+                    let arguments=frame_args.join(",");
+                    if recursive_sites==1 {
+                    // Defunctionalise one recursive call site. Replaying a frame
+                    // recomputes only pure checked terms; it adds no semantic law.
+                    source.push_str(&format!("fn s_{id}({},mut ink_resume:Option<{result_type}>)->Result<{result_type},{frame_type}>{{Ok({})}}\n",step_inputs.join(","),body.owned()));
+                    source.push_str(&format!("fn d_{id}({})->{result_type}{{let mut ink_frame=({},);let mut ink_frames=Vec::new();let ink_frame_limit=1_000_000usize.min(64_000_000/std::mem::size_of::<{frame_type}>().max(1));let mut ink_result=loop{{match s_{id}({arguments},None){{Ok(value)=>break value,Err(next)=>{{assert!(ink_frames.len()<ink_frame_limit,\"definition continuation frame limit\");if ink_frames.len()==ink_frames.capacity(){{let capacity=ink_frames.capacity();let next=capacity.max(32).saturating_mul(2).min(ink_frame_limit);ink_frames.reserve_exact(next-capacity);}}ink_frames.push(ink_frame);ink_frame=next;}}}}}};while let Some(ink_frame)=ink_frames.pop(){{ink_result=match s_{id}({arguments},Some(ink_result)){{Ok(value)=>value,Err(_)=>unreachable!(\"checked single recursive call site\")}};}}ink_result}}\n",inputs.join(","),initial.join(",")));
+                    } else {
+                        let full_frame_type=format!("({frame_type},[Option<{result_type}>;{recursive_sites}],usize)");
+                        source.push_str(&format!("fn s_{id}({},ink_resume:&[Option<{result_type}>;{recursive_sites}])->Result<{result_type},(usize,{frame_type})>{{Ok({})}}\n",step_inputs.join(","),body.owned()));
+                        source.push_str(&format!("fn d_{id}({})->{result_type}{{let mut ink_frame=({},);let mut ink_resume=[const{{None}};{recursive_sites}];let mut ink_frames:Vec<{full_frame_type}>=Vec::new();let ink_frame_limit=1_000_000usize.min(64_000_000/std::mem::size_of::<{full_frame_type}>().max(1));loop{{match s_{id}({arguments},&ink_resume){{Ok(value)=>{{if let Some((parent,results,site))=ink_frames.pop(){{ink_frame=parent;ink_resume=results;ink_resume[site]=Some(value);}}else{{return value;}}}},Err((site,next))=>{{assert!(ink_frames.len()<ink_frame_limit,\"definition continuation frame limit\");if ink_frames.len()==ink_frames.capacity(){{let capacity=ink_frames.capacity();let next=capacity.max(32).saturating_mul(2).min(ink_frame_limit);ink_frames.reserve_exact(next-capacity);}}ink_frames.push((ink_frame,ink_resume,site));ink_frame=next;ink_resume=[const{{None}};{recursive_sites}];}}}}}}}}\n",inputs.join(","),initial.join(",")));
+                    }
+                } else {
+                    source.push_str(&format!("fn d_{id}({}) -> {} {{ {} }}\n",inputs.join(","),ty(&result)?,body.owned()));
+                }
             }
             _ => return Err("non-executable dependency selected".into()),
         }
@@ -961,6 +1038,8 @@ fn lower_with_storage_mode(
             ));
             args.push(if lower.is_packed(s)? {
                 format!("{binder}.as_view()")
+            } else if shared && typed_only && !packed_spines && !identity_memo && matches!(s, Sort::Data(_)) {
+                format!("InkBorrowed::root({binder})")
             } else {
                 binder
             });

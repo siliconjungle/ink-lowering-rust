@@ -31,7 +31,7 @@ fn cached_subtree_measures_preserve_limits_and_release_dead_owners() {
     }, vec![physical.clone()]);
     add(Declaration::Datatype { constructors: vec![Constructor { name: "ProofOnly".into(), fields: vec![] }] }, vec![]);
     let checked = ink_core::definition::check(&bundle, &[identity], None).unwrap();
-    let mut source = crate::definition_native::lower_typed_shared(&checked, &std::collections::BTreeMap::new()).unwrap().source;
+    let mut source = crate::definition_native::lower_typed_shared(&checked).unwrap().source;
     source.push_str(&super::emit(&checked, Some(&physical)).unwrap());
     let scalar=super::emit(&checked,None).unwrap();
     assert!(scalar.contains("fn bounded_storage("));assert!(!scalar.contains("fn same_storage("));

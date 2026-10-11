@@ -94,7 +94,7 @@ fn matched_owners_and_constant_templates_retain_exact_values_and_share_storage()
     );
     let checked =
         ink_core::definition::check(&bundle, &[rebuild.clone(), template.clone()], None).unwrap();
-    let emitted = lower_typed_shared(&checked, &std::collections::BTreeMap::new()).unwrap();
+    let emitted = lower_typed_shared(&checked).unwrap();
     let directory = std::env::temp_dir().join(format!(
         "ink-generic-sharing-{}-{}",
         std::process::id(),

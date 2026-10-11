@@ -63,6 +63,7 @@ pub(crate) fn emit(
         "// Borrowed native typed objects: C never owns or packs the physical state.\n",
     );
     out.push_str(include_str!("constructor_arena.rs.txt"));
+    out.push_str(ink_native_support::CONTINUATION_FRAMES_RUST_SOURCE);
     out.push_str("thread_local!{\n");
     for (id, d) in &ds {
         if matches!(d, Declaration::Datatype { .. }) {
