@@ -26,7 +26,7 @@ pub(crate) fn ty(t: &Type) -> LangResult<String> {
         Type::Map(k, v) => format!("OwnedMap<{},{}>", ty(k)?, ty(v)?),
         Type::Option(a) => format!("Option<{}>", ty(a)?),
         Type::Result(a, b) => format!("Result<{},{}>", ty(a)?, ty(b)?),
-        Type::Table(a, b) => format!("BTreeMap<{},{}>", ty(a)?, ty(b)?),
+        Type::Table(a, b) => format!("InkTable<{},{}>", ty(a)?, ty(b)?),
         Type::Unknown => {
             return Err("native state backend needs a resolved type; add an annotation".into())
         }
@@ -378,11 +378,37 @@ impl Emitter<'_> {
                         unreachable!()
                     };
                     let field = ident(&root.name);
-                    if n == "values" {
+                    if n=="shared_keys" {
+                        let Expr::Var(other)=&args[0] else{return Err("shared_keys root".into());};
+                        let other=ident(other);
+                        return Ok((format!("{{if self.{field}.len()<=self.{other}.len(){{self.{field}.keys().filter(|key|self.{other}.contains_key(*key)).cloned().collect::<Vec<_>>()}}else{{self.{other}.keys().filter(|key|self.{field}.contains_key(*key)).cloned().collect::<Vec<_>>()}}}}"),T::List(k.clone())));
+                    }
+                    if n=="sum_by" || n=="count_where" {
+                        let Expr::Lambda(parameter,body)=&args[0] else {return Err("scan lambda".into());};
+                        let mut local=env.clone();local.insert(parameter.clone(),*v.clone());
+                        let result_type=self.execution.type_of(e).cloned().ok_or("scan result type")?;
+                        let (body,_)=self.expr(body,&local,None)?;
+                        let iterator=if ownership::expr_mutates_state(self.p,&args[0]) {format!("self.{field}.values().cloned().collect::<Vec<_>>().into_iter()")} else {format!("self.{field}.values()")};
+                        if n=="count_where" {return Ok((format!("{{let mut count=BigInt::from(0u8);for {} in {iterator}{{if {body}{{count+=1;}}}}count}}",ident(parameter)),T::Int));}
+                        let zero=if result_type==T::Int {"BigInt::from(0u8)".into()} else {format!("0{}",ty(&result_type)?)};
+                        let add=if result_type==T::F32 {"temporary::ink_f32(acc+contribution)"} else if result_type==T::Int {"acc+contribution"} else {"acc.wrapping_add(contribution)"};
+                        return Ok((format!("{{let mut acc={zero};for {} in {iterator}{{let contribution={body};acc={add};}}acc}}",ident(parameter)),result_type));
+                    }
+                    if n == "values" || n == "keys" {
                         (
-                            format!("self.{field}.values().cloned().collect::<Vec<_>>()"),
-                            T::List(v.clone()),
+                            format!("self.{field}.{}().cloned().collect::<Vec<_>>()", n),
+                            T::List(if n == "keys" { k.clone() } else { v.clone() }),
                         )
+                    } else if ["intersect_keys", "put_many", "remove_many"].contains(&n.as_str()) {
+                        let keys = self.expr(&args[0], env, Some(&T::List(k.clone())))?.0;
+                        match n.as_str() {
+                            "intersect_keys" => (format!("{{let selected=({keys}).into_iter().collect::<std::collections::BTreeSet<_>>();self.{field}.keys().filter(|key|selected.contains(*key)).cloned().collect::<Vec<_>>()}}"), T::List(k.clone())),
+                            "remove_many" => (format!("{{let keys={keys};for key in keys{{self.set_{field}(key,None,false);}}}}"), T::Unit),
+                            _ => {
+                                let values = self.expr(&args[1], env, Some(&T::List(v.clone())))?.0;
+                                (format!("{{let keys={keys};let values={values};if keys.len()!=values.len(){{Err(String::from(\"table bulk length mismatch\"))}}else{{self.{field}.reserve(keys.len());for(key,value)in keys.into_iter().zip(values){{self.set_{field}(key,Some(value),false);}}Ok(())}}}}"), T::Result(Box::new(T::Unit),Box::new(T::String)))
+                            }
+                        }
                     } else {
                         // Lookups only need the key by reference.
                         let borrowed_key = match &args[0] {
@@ -410,7 +436,7 @@ impl Emitter<'_> {
                                 format!("{{let key={key};self.set_{field}(key,None,true)}}"),
                                 T::Option(v.clone()),
                             ),
-                            "insert" | "replace" => {
+                            "insert" | "replace" | "put" => {
                                 let (value, _) = self.expr(&args[1], env, Some(v))?;
                                 (format!("{{let key={key};let value={value};self.set_{field}(key,Some(value),false);}}"),T::Unit)
                             }
@@ -744,8 +770,11 @@ impl Emitter<'_> {
 }
 
 pub fn emit_selected(selected: &ink_core::optimisation::CheckedSelection) -> LangResult<String> {
-    let layout = crate::snapshot::selected_layout(selected)?;
-    emit_with_layout(selected.module().program(), &layout)
+    emit_selected_with_table_storage(selected, TableStorage::Ordered)
+}
+pub fn emit_selected_with_table_storage(selected:&ink_core::optimisation::CheckedSelection,storage:TableStorage)->LangResult<String>{
+    let layout=crate::snapshot::selected_layout(selected)?;
+    emit_with_layout(selected.module().program(),&layout,storage)
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
@@ -765,9 +794,18 @@ fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
 }
 pub fn emit(p: &Program) -> LangResult<String> {
     let layout = crate::snapshot::layout(p)?;
-    emit_with_layout(p, &layout)
+    emit_with_layout(p, &layout, TableStorage::Ordered)
 }
-fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout) -> LangResult<String> {
+/// Operational implementations of the same fixed finite-map primitive.
+/// This choice grants no mathematical rewrite authority. The ordered baseline
+/// remains default; callers measure their complete lifecycle before choosing slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableStorage { Ordered, IndexedSlots }
+pub fn emit_with_table_storage(p: &Program, storage: TableStorage) -> LangResult<String> {
+    let layout=crate::snapshot::layout(p)?;
+    emit_with_layout(p,&layout,storage)
+}
+fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage) -> LangResult<String> {
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
     let execution = action_ir.execution()?;
@@ -784,6 +822,7 @@ fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout) -> LangR
     let mut out = String::from(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
     );
+    writeln!(out,"pub const INK_TABLE_STORAGE:&str={:?};",match storage {TableStorage::Ordered=>"ordered",TableStorage::IndexedSlots=>"indexed-slots"}).unwrap();
     let describe = |t: &Type| ink_abi::describe(t, &p.records, &p.enums, &p.ids);
     let functions=p.functions.iter().map(|f|Ok(serde_json::json!({"name":f.name,"params":f.params.iter().map(|(n,t)|Ok(serde_json::json!({"name":n,"type":describe(t)?}))).collect::<LangResult<Vec<_>>>()?,"result":describe(&f.result)?}))).collect::<LangResult<Vec<_>>>()?;
     let actions=p.actions.iter().map(|a|Ok(serde_json::json!({"name":a.name,"params":a.params.iter().map(|(n,t)|Ok(serde_json::json!({"name":n,"type":describe(t)?}))).collect::<LangResult<Vec<_>>>()?,"result":describe(&a.result)?}))).collect::<LangResult<Vec<_>>>()?;
@@ -804,9 +843,14 @@ fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout) -> LangR
     out.push_str(ink_native_support::TYPED_VALUES_RUST_SOURCE);
     out.push_str("\nmod temporary {\n");
     out.push_str(ink_native_support::OWNED_VALUES_RUST_SOURCE);
+    match storage {
+        TableStorage::IndexedSlots => out.push_str(ink_native_support::INDEXED_TABLE_RUST_SOURCE),
+        TableStorage::Ordered => out.push_str("pub type InkTable<K,V> = std::collections::BTreeMap<K,V>; pub trait TableCapacity {fn reserve(&mut self,additional:usize);} impl<K,V> TableCapacity for InkTable<K,V>{fn reserve(&mut self,_:usize){}}"),
+    }
     out.push_str(
-        "\n}\nuse temporary::{OwnedBuffer,OwnedMap,ink_parallel_map,ink_parallel_update};\n",
+        "\n}\nuse temporary::{OwnedBuffer,OwnedMap,InkTable,ink_parallel_map,ink_parallel_update};\n",
     );
+    if storage==TableStorage::Ordered {out.push_str("use temporary::TableCapacity;\n");}
     out.push_str(r#"
 impl<T:Clone> Wire for OwnedBuffer<T>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
 impl<K:Ord+Clone+'static,V:Clone+'static> Wire for OwnedMap<K,V>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
@@ -958,7 +1002,7 @@ impl Wire for {id} {{
     }
     out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
     for s in &p.states {
-        let constructor = "BTreeMap::new()";
+        let constructor = "InkTable::new()";
         writeln!(out, "{}:{constructor},", ident(&s.name)).unwrap();
     }
 
