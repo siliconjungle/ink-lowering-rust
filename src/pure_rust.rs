@@ -55,9 +55,20 @@ impl Emitter<'_> {
     }
     // Read-only traversals borrow a lexical list instead of cloning the entire
     // vector. Computed receivers still finish eagerly and are consumed once.
+    fn borrowed_place(e: &Expr, env: &Env) -> Option<String> {
+        let (root, fields) = ink_core::collection_facts::lexical_projection(e)?;
+        let mut place = env.get(root)?.0.clone();
+        for field in fields {
+            place = format!("({place}).l_{field}");
+        }
+        Some(place)
+    }
+
     fn read_iterator(e: &Expr, value: &str, env: &Env) -> LangResult<String> {
-        Ok(if let Expr::Var(n) = e {
-            format!("({}).iter().cloned()", env.get(n).ok_or("list binding")?.0)
+        Ok(if let Some(place) = Self::borrowed_place(e, env) {
+            // Lexical record projections have no evaluation side effects.
+            // Borrow only for this traversal; subsequent source uses survive.
+            format!("({place}).iter().cloned()")
         } else {
             format!("({value}).into_iter()")
         })
@@ -213,6 +224,22 @@ impl Emitter<'_> {
                     }
                 }
                 let xt = self.infer(x, env, None)?;
+                if let Type::Named(owner) = &xt {
+                    if let Some(place) = Self::borrowed_place(e, env) {
+                        let ft = &self.p.records[owner]
+                            .iter()
+                            .find(|(field, _)| field == n)
+                            .ok_or("field")?
+                            .1;
+                        if !ink_core::local_collections::owned(ft, self.p) {
+                            return Ok(if crate::state_native::boxed_field(owner, ft, self.p) {
+                                format!("(*({place})).clone()")
+                            } else {
+                                format!("({place}).clone()")
+                            });
+                        }
+                    }
+                }
                 let x = self.expr(x, env, None)?;
                 if matches!(xt, Type::Vector(..)) {
                     let i = ["x", "y", "z", "w"]
@@ -630,13 +657,13 @@ impl Emitter<'_> {
             Expr::Method(xs, n, args) if n == "concat" => {
                 // Borrow variable operands directly. Computed operands are evaluated
                 // once and their temporaries live through the two result copies.
-                let left = if let Expr::Var(n) = xs.as_ref() {
-                    format!("&{}", env.get(n).ok_or("list binding")?.0)
+                let left = if let Some(place) = Self::borrowed_place(xs, env) {
+                    format!("&({place})")
                 } else {
                     format!("&({})", self.expr(xs, env, Some(&t))?)
                 };
-                let right = if let Expr::Var(n) = &args[0] {
-                    format!("&{}", env.get(n).ok_or("list binding")?.0)
+                let right = if let Some(place) = Self::borrowed_place(&args[0], env) {
+                    format!("&({place})")
                 } else {
                     format!("&({})", self.expr(&args[0], env, Some(&t))?)
                 };
@@ -811,6 +838,68 @@ mod tests {
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn nested_record_reads_clone_only_observed_elements() {
+        let p=parse(r#"module fields;
+record Item{key:u32,} record Inner{first:List<Item>,second:List<Item>,id:u32,} record Outer{nested:Inner,}
+fn key(r:Outer)->u32{return r.nested.id;}
+fn mapped(r:Outer)->List<u32>{return r.nested.first.map(fn(x)=>x.key+1);}
+fn joined(r:Outer)->List<Item>{return r.nested.first.concat(r.nested.first);}
+fn selected(r:Outer)->List<Item>{return r.nested.first;}
+"#).unwrap();
+        check::check(&p).unwrap();
+        let mut source = String::from(
+            r#"
+#![allow(non_camel_case_types)]
+use std::sync::atomic::{AtomicUsize,Ordering};
+static COPIES:AtomicUsize=AtomicUsize::new(0);
+struct l_Item{l_key:u32}
+impl Clone for l_Item{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed);Self{l_key:self.l_key}}}
+#[derive(Clone)]struct l_Inner{l_first:Vec<l_Item>,l_second:Vec<l_Item>,l_id:u32}
+#[derive(Clone)]struct l_Outer{l_nested:l_Inner}
+"#,
+        );
+        for (name, result) in [
+            ("key", "u32"),
+            ("mapped", "Vec<u32>"),
+            ("joined", "Vec<l_Item>"),
+            ("selected", "Vec<l_Item>"),
+        ] {
+            let f = p.functions.iter().find(|f| f.name == name).unwrap();
+            source.push_str(&format!(
+                "fn {name}(l_r:&l_Outer)->{result}{{{}}}\n",
+                body(&p, f).unwrap()
+            ));
+        }
+        source.push_str(r#"
+fn main(){
+let r=l_Outer{l_nested:l_Inner{l_first:vec![l_Item{l_key:0},l_Item{l_key:u32::MAX},l_Item{l_key:9}],l_second:(0..1000).map(|i|l_Item{l_key:i}).collect(),l_id:17}};
+assert_eq!(key(&r),17);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(mapped(&r),vec![1,0,10]);assert_eq!(COPIES.swap(0,Ordering::Relaxed),3);
+let mut a=joined(&r);assert_eq!(a.len(),6);assert_eq!(COPIES.swap(0,Ordering::Relaxed),6);
+a[0].l_key=42;assert_eq!(r.l_nested.l_first[0].l_key,0);
+let a=selected(&r);assert_eq!(a.len(),3);assert_eq!(COPIES.swap(0,Ordering::Relaxed),3);assert_eq!(r.l_nested.l_second.len(),1000);
+}
+"#);
+        let dir = std::env::temp_dir().join(format!("ink-record-read-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("test.rs"), source).unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-O"])
+            .arg(dir.join("test.rs"))
+            .arg("-o")
+            .arg(dir.join("test"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(Command::new(dir.join("test")).status().unwrap().success());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn concat_borrows_operands_and_copies_each_element_once_into_a_fresh_vec() {
