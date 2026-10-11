@@ -605,3 +605,36 @@ fn lower_with_storage(
     };
     Ok(Emission { source, receipt })
 }
+
+/// Export the same sealed definitions through the C/Wasm ground-value word ABI.
+/// Scheduling and transport do not select or reinterpret implementation bodies.
+pub fn lower_portable(
+    checked: &ink_core::definition::CheckedDefinition,
+) -> LangResult<(Emission, serde_json::Value)> {
+    let mut emission = lower(checked)?;
+    let mut datatypes = Vec::new();
+    for id in &emission.receipt.executable_closure {
+        let object: Object =
+            serde_json::from_str(&checked.bundle().objects[id]).map_err(|e| e.to_string())?;
+        if matches!(object.declaration, Declaration::Datatype { .. }) {
+            datatypes.push(id.clone());
+        }
+    }
+    emission.source.push_str(&format!(
+        "\nconst WORD_DATATYPES:&[&str]=&{:?};\nconst WORD_EXPORTS:&[&str]=&{:?};\n",
+        datatypes,
+        checked.exports()
+    ));
+    emission
+        .source
+        .push_str(include_str!("definition_word_abi.rs.txt"));
+    emission.receipt.source_sha256 = format!("{:x}", Sha256::digest(emission.source.as_bytes()));
+    let identity = ink_core::registry::identity(&(
+        "ink-sealed-executable-v1",
+        checked.bundle_sha256(),
+        checked.exports(),
+        checked.choices(),
+    ))?;
+    let manifest = serde_json::json!({"schema":1,"semantics":"ink-definition-rust-words-v1","executable":identity,"exports":checked.exports(),"datatypes":datatypes,"checked_closure":checked.closure(),"executable_closure":emission.receipt.executable_closure});
+    Ok((emission, manifest))
+}
