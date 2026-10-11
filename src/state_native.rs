@@ -58,6 +58,22 @@ fn field_ty(owner: &str, t: &Type, p: &Program) -> LangResult<String> {
     })
 }
 type Env = BTreeMap<String, Type>;
+pub(crate) fn word_expression(name: &str, args: &[String]) -> String {
+    match name {
+        "word_not" => format!("!({})", args[0]),
+        "word_and" | "word_or" | "word_xor" => format!(
+            "(({}) {} ({}))",
+            args[0],
+            match name {
+                "word_and" => "&",
+                "word_or" => "|",
+                _ => "^",
+            },
+            args[1]
+        ),
+        _ => format!("({}).{name}({})", args[0], args[1]),
+    }
+}
 // Certificates inhabit exact arithmetic at every subexpression, including
 // constant-only subtrees. Never infer their literals as modular u64 values.
 fn exact_expression(e: &Expr) -> LangResult<String> {
@@ -283,7 +299,16 @@ impl Emitter<'_> {
                 };
                 (code, t)
             }
-            Expr::Let(..) => return Err("compute expression belongs in a pure function".into()),
+            Expr::Let(n, annotation, value, body) => {
+                let (value, t) = self.expr(value, env, annotation.as_deref())?;
+                let mut local = env.clone();
+                local.insert(n.clone(), t.clone());
+                let (body, result) = self.expr(body, &local, want)?;
+                (
+                    format!("{{let {}:{}={value};{body}}}", ident(n), ty(&t)?),
+                    result,
+                )
+            }
             Expr::Num(n) => {
                 let t = want
                     .filter(|t| matches!(t, T::U32 | T::Int | T::I32 | T::F32))
@@ -437,6 +462,36 @@ impl Emitter<'_> {
                 (s, if arithmetic { at } else { T::Bool })
             }
             Expr::Call(n, args) => match n.as_str() {
+                name if ink_core::word::primitive(name) => {
+                    let t = want
+                        .cloned()
+                        .or_else(|| self.execution.type_of(e).cloned())
+                        .ok_or("resolved word type")?;
+                    let ts = ink_core::word::arguments(name, &t);
+                    let args = args
+                        .iter()
+                        .zip(ts)
+                        .map(|(a, t)| self.expr(a, env, Some(&t)).map(|x| x.0))
+                        .collect::<LangResult<Vec<_>>>()?;
+                    (word_expression(name, &args), t)
+                }
+                "choose" => {
+                    let (c, _) = self.expr(&args[0], env, Some(&T::Bool))?;
+                    let (a, t) = self.expr(&args[1], env, resolved.as_ref().or(want))?;
+                    let (b, _) = self.expr(&args[2], env, Some(&t))?;
+                    (format!("if {c} {{{a}}} else {{{b}}}"), t)
+                }
+                "list" => {
+                    let t = resolved.as_ref().or(want).ok_or("list type")?;
+                    let T::List(inner) = t else {
+                        return Err("list type".into());
+                    };
+                    let values = args
+                        .iter()
+                        .map(|e| self.expr(e, env, Some(inner)).map(|(s, _)| s))
+                        .collect::<LangResult<Vec<_>>>()?;
+                    (format!("vec![{}]", values.join(",")), t.clone())
+                }
                 "vec2" | "vec3" | "vec4" => {
                     let t = resolved.as_ref().or(want).ok_or("vector type")?;
                     let code = args
@@ -465,7 +520,11 @@ impl Emitter<'_> {
                     (format!("BigInt::from({s})"), T::Int)
                 }
                 "checked_add" | "checked_sub" | "checked_mul" => {
-                    let (a, t) = self.expr(&args[0], env, None)?;
+                    let context = match want {
+                        Some(T::Result(t, _)) => Some(t.as_ref()),
+                        _ => None,
+                    };
+                    let (a, t) = self.expr(&args[0], env, context)?;
                     let (b, _) = self.expr(&args[1], env, Some(&t))?;
                     (
                         format!("({a}).{n}({b}).ok_or(InkArithmeticError::Overflow)"),
@@ -620,7 +679,47 @@ impl Emitter<'_> {
                         Some(found) => found,
                         None => self.expr(base, env, None)?,
                     };
-                    if n == "ok_or" {
+                    if n == "fold" {
+                        let (a, b, tag_a, tag_b) = match &t {
+                            T::Option(a) => (a.as_ref().clone(), T::Unit, "Some", "None"),
+                            T::Result(a, b) => {
+                                (a.as_ref().clone(), b.as_ref().clone(), "Ok", "Err")
+                            }
+                            _ => return Err("fold receiver".into()),
+                        };
+                        let target = want
+                            .cloned()
+                            .or_else(|| self.execution.type_of(e).cloned())
+                            .ok_or("fold result")?;
+                        let mut codes = vec![];
+                        let mut vars = vec![];
+                        for (arg, input) in args.iter().zip([a, b]) {
+                            let Expr::Lambda(v, body) = arg else {
+                                return Err("fold lambda".into());
+                            };
+                            let mut local = env.clone();
+                            local.insert(v.clone(), input);
+                            vars.push(ident(v));
+                            codes.push(self.expr(body, &local, Some(&target))?.0);
+                        }
+                        let right = if tag_b == "None" {
+                            format!("None=>{{let {}=();{}}}", vars[1], codes[1])
+                        } else {
+                            format!("Err({})=>{{{}}}", vars[1], codes[1])
+                        };
+                        let s = if borrowed_rows {
+                            format!("({s}).map(Clone::clone)")
+                        } else {
+                            s
+                        };
+                        (
+                            format!(
+                                "match {s} {{{tag_a}({})=>{{{}}},{right}}}",
+                                vars[0], codes[0]
+                            ),
+                            target,
+                        )
+                    } else if n == "ok_or" {
                         let T::Option(inner) = t else {
                             return Err("native ok_or needs Option".into());
                         };
