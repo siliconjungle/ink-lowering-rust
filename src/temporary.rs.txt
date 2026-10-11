@@ -130,6 +130,7 @@ pub fn ink_parallel_map<T: Clone + Sync, U: Send, F: Fn(u32, T) -> U + Sync>(
             .collect();
     }
     let chunk = (xs.len() + workers - 1) / workers;
+    ink_parallel_start_receipt();
     std::thread::scope(|scope| {
         let handles = xs
             .chunks(chunk)
@@ -169,6 +170,7 @@ pub fn ink_parallel_update<T: Clone + Send, F: Fn(u32, T) -> T + Sync>(
         return xs;
     }
     let chunk = (xs.len() + workers - 1) / workers;
+    ink_parallel_start_receipt();
     std::thread::scope(|scope| {
         for (part, slice) in xs.chunks_mut(chunk).enumerate() {
             let f = &f;
@@ -188,9 +190,10 @@ pub fn ink_parallel_nested()->bool{INK_PARALLEL_DEPTH.with(|d|d.get()>0)}
 pub fn with_parallel_worker<T>(f:impl FnOnce()->T)->T{let _guard=InkParallelGuard::enter();f()}
 
 // Diagnostic receipt counts actual entered OS threads, never planned jobs.
-static INK_PARALLEL_RECEIPT: std::sync::LazyLock<std::sync::Mutex<(u64,std::collections::BTreeSet<String>)>> = std::sync::LazyLock::new(||std::sync::Mutex::new((0,std::collections::BTreeSet::new())));
-fn ink_parallel_record_thread(){let mut r=INK_PARALLEL_RECEIPT.lock().expect("parallel receipt lock");r.0+=1;r.1.insert(format!("{:?}",std::thread::current().id()));}
-pub fn ink_parallel_statistics()->(u64,Vec<String>){let r=INK_PARALLEL_RECEIPT.lock().expect("parallel receipt lock");(r.0,r.1.iter().cloned().collect())}
+static INK_PARALLEL_RECEIPT: std::sync::LazyLock<std::sync::Mutex<(u64,std::collections::BTreeSet<String>,std::collections::BTreeSet<String>)>> = std::sync::LazyLock::new(||std::sync::Mutex::new((0,std::collections::BTreeSet::new(),std::collections::BTreeSet::new())));
+fn ink_parallel_start_receipt(){INK_PARALLEL_RECEIPT.lock().expect("parallel receipt lock").2.clear();}
+fn ink_parallel_record_thread(){let mut r=INK_PARALLEL_RECEIPT.lock().expect("parallel receipt lock");r.0+=1;let id=format!("{:?}",std::thread::current().id());r.1.insert(id.clone());r.2.insert(id);}
+pub fn ink_parallel_statistics()->(u64,Vec<String>,Vec<String>){let r=INK_PARALLEL_RECEIPT.lock().expect("parallel receipt lock");(r.0,r.1.iter().cloned().collect(),r.2.iter().cloned().collect())}
 
 #[inline(never)]
 pub fn ink_f32(value:f32)->f32{if value.is_nan(){f32::from_bits(0x7fc00000)}else{value}}

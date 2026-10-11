@@ -1243,7 +1243,7 @@ impl Wire for {id} {{
     for n in emitter.plans.keys() {
         writeln!(out, "cache_{}:{},", ident(n), emitter.cache_type(n)).unwrap();
     }
-    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
+    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
     for s in &p.states {
         let constructor = if let Some(config) = storage.and_then(|policy| policy.roots.get(&s.name))
         {
