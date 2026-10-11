@@ -1050,11 +1050,27 @@ impl Wire for {id} {{
     for s in &p.states {
         let row_type = ty(&s.ty)?;
         writeln!(out, "{}:{row_type},", ident(&s.name)).unwrap();
+        let Type::Table(key, _) = &s.ty else {
+            unreachable!()
+        };
+        writeln!(
+            out,
+            "journal_keys_{}:std::collections::BTreeSet<{}>,",
+            ident(&s.name),
+            ty(key)?
+        )
+        .unwrap();
     }
     out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
     for s in &p.states {
         let constructor = "BTreeMap::new()";
         writeln!(out, "{}:{constructor},", ident(&s.name)).unwrap();
+        writeln!(
+            out,
+            "journal_keys_{}:std::collections::BTreeSet::new(),",
+            ident(&s.name)
+        )
+        .unwrap();
     }
 
     out.push_str("}}\n");
@@ -1116,11 +1132,11 @@ impl Wire for {id} {{
 
         write!(
             out,
-            "let result=if return_old{{old.clone()}}else{{None}};self.undo.push(Undo::{field}{{key,old"
+            "let result=if return_old{{old.clone()}}else{{None}};if self.journal_keys_{field}.insert(key.clone()){{self.undo.push(Undo::{field}{{key,old"
         )
         .unwrap();
 
-        out.push_str("});\n");
+        out.push_str("});}\n");
         out.push_str("result}\n");
     }
     out.push_str("fn rollback(&mut self){for undo in self.undo.drain(..).rev(){match undo{\n");
@@ -1132,7 +1148,13 @@ impl Wire for {id} {{
 
         out.push_str("},\n");
     }
-    out.push_str("}}self.staged.clear();}\n");
+    out.push_str(
+        "}}self.clear_journal_keys();self.staged.clear();}\nfn clear_journal_keys(&mut self){",
+    );
+    for s in &p.states {
+        writeln!(out, "self.journal_keys_{}.clear();", ident(&s.name)).unwrap();
+    }
+    out.push_str("}\n");
     for k in execution.keeps() {
         let body = emitter.expr(&k.value, &Env::new(), Some(&k.ty))?.0;
         writeln!(
@@ -1207,7 +1229,7 @@ impl Wire for {id} {{
                 "Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})}\n",
             );
         } else {
-            out.push_str("let version=match transaction::decide(self.version,result.is_ok()){transaction::Decision::Rollback=>{self.rollback();return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback();return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;self.undo.clear();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
+            out.push_str("let version=match transaction::decide(self.version,result.is_ok()){transaction::Decision::Rollback=>{self.rollback();return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback();return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;self.undo.clear();self.clear_journal_keys();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }
