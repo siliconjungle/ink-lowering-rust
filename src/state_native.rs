@@ -429,6 +429,8 @@ impl Emitter<'_> {
                         _ => "wrapping_mul",
                     };
                     format!("({ac}).{method}({bc})")
+                } else if arithmetic && at == T::F32 {
+                    format!("temporary::ink_f32(({ac}) {op} ({bc}))")
                 } else {
                     format!("(({ac}) {op} ({bc}))")
                 };
@@ -483,7 +485,9 @@ impl Emitter<'_> {
                         } else {
                             format!("0{}", ty(&t)?)
                         };
-                        let add = if matches!(*t, T::Int | T::F32) {
+                        let add = if *t == T::F32 {
+                            "temporary::ink_f32(a+b)"
+                        } else if *t == T::Int {
                             "a+b"
                         } else {
                             "a.wrapping_add(b)"
@@ -1239,7 +1243,7 @@ impl Wire for {id} {{
     for n in emitter.plans.keys() {
         writeln!(out, "cache_{}:{},", ident(n), emitter.cache_type(n)).unwrap();
     }
-    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
+    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
     for s in &p.states {
         let constructor = if let Some(config) = storage.and_then(|policy| policy.roots.get(&s.name))
         {
@@ -1467,8 +1471,10 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
+    let mut parallel_tasks = Vec::new();
     for f in &p.functions {
-        let body = crate::pure_rust::body(p, f)?;
+        let (body, tasks) = crate::pure_rust::body_with_tasks(p, f)?;
+        parallel_tasks.extend(tasks);
         let params = f
             .params
             .iter()
@@ -1492,6 +1498,19 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
+    for (_, method) in &parallel_tasks {
+        out.push_str(method);
+        out.push('\n');
+    }
+    out.push_str("#[cfg(target_arch=\"wasm32\")] pub fn parallel_worker(&self,task:&Json)->Result<Json,String>{let start=task[\"start\"].as_u64().and_then(|x|u32::try_from(x).ok()).ok_or(\"parallel start\")?;let items=task[\"items\"].as_array().ok_or(\"parallel items\")?;let captures=task[\"captures\"].as_array().ok_or(\"parallel captures\")?;temporary::with_parallel_worker(||match task[\"callback\"].as_str().ok_or(\"parallel callback\")?{\n");
+    for (name, _) in &parallel_tasks {
+        writeln!(
+            out,
+            "{name:?}=>self.parallel_task_{name}(start,items,captures),"
+        )
+        .unwrap();
+    }
+    out.push_str("_=>Err(\"unknown compiled parallel callback\".into()),})}\n");
     for a in execution.actions() {
         // A direct bounded keep query admits an allocation-free exact host ABI.
         // The ordinary language/JSON API still returns Int. This extra view is
