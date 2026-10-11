@@ -57,7 +57,7 @@ pub(crate) fn emit(
     let exports = checked
         .exports()
         .iter()
-        .chain(queries.keys())
+        .chain(queries.iter().filter_map(|(id,d)| matches!(d,Declaration::Function{..}).then_some(id)))
         .collect::<Vec<_>>();
     let mut out = String::from(
         "// Borrowed native typed objects: C never owns or packs the physical state.\n",
