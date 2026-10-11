@@ -100,9 +100,10 @@ impl Emitter<'_> {
                 let a = self.expr(a, env, Some(&at))?;
                 let v = self.fresh();
                 let mut local = env.clone();
+                let annotation = crate::state_native::ty(&at)?;
                 local.insert(n.clone(), (v.clone(), at));
                 let b = self.expr(b, &local, Some(&t))?;
-                format!("{{let {v}={a};{b}}}")
+                format!("{{let {v}:{annotation}={a};{b}}}")
             }
             Expr::Record(n, fields) => {
                 // Evaluate in source order, even when declaration order differs.

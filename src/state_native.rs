@@ -8,7 +8,7 @@ use std::fmt::Write;
 fn ident(s: &str) -> String {
     format!("l_{s}")
 }
-fn ty(t: &Type) -> LangResult<String> {
+pub(crate) fn ty(t: &Type) -> LangResult<String> {
     Ok(match t {
         Type::I32 => "i32".into(),
         Type::F32 => "f32".into(),
