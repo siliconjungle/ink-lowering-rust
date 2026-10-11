@@ -550,13 +550,6 @@ pub fn emit_selected(
 pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Emission> {
     lower_with_storage(checked, false, false, true)
 }
-/// Pure immutable constructor fields may share storage. Equality and dynamic
-/// transport stay structural; no pointer identity acquires semantic meaning.
-pub(crate) fn lower_shared(
-    checked: &ink_core::definition::CheckedDefinition,
-) -> LangResult<Emission> {
-    lower_with_storage(checked, true, false, true)
-}
 /// Literal typed functions only: no generic constructor carrier or dispatcher.
 pub(crate) fn lower_typed_shared(
     checked: &ink_core::definition::CheckedDefinition,
