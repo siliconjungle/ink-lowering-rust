@@ -361,7 +361,7 @@ impl Lower<'_> {
                             tail.owned(),
                             if matches!(head.sort, Sort::Data(_)) {
                                 if let Some(owner) = &head.shared_owner {
-                                    format!("std::sync::Arc::clone(&({owner}))")
+                                    format!("std::sync::Arc::clone({owner})")
                                 } else {
                                     format!("std::sync::Arc::new({})", head.owned())
                                 }
@@ -457,7 +457,7 @@ impl Lower<'_> {
                                     && self.shared
                                     && (!packed || field_index == 0)
                                 {
-                                    Some(binder.clone())
+                                    Some(if packed {format!("&{binder}")} else {binder.clone()})
                                 } else {
                                     None
                                 },
@@ -569,8 +569,10 @@ impl Lower<'_> {
                 .collect::<Vec<_>>();
             if data.len() == 1 && !data[0].1.packed_view {
                 if let Some(owner) = &data[0].1.shared_owner {
-                    let mut locals = String::new();
+                    let memo_input=self.fresh();
+                    let mut locals = format!("let {memo_input}={owner};");
                     let mut call_args = values.clone();
+                    call_args[data[0].0]=format!("{memo_input}.as_ref()");
                     let mut words = Vec::new();
                     for (i, e) in expressions.iter().enumerate() {
                         if matches!(e.sort, Sort::Data(_)) {
@@ -589,7 +591,7 @@ impl Lower<'_> {
                     let compute = format!("d_{id}({})", call_args.join(","));
                     return Ok((
                         format!(
-                            "{{{locals}ink_identity_memo(&({owner}),{id:?},[{}],||{compute})}}",
+                            "{{{locals}ink_identity_memo({memo_input},{id:?},[{}],||{compute})}}",
                             words.join(",")
                         ),
                         result,
