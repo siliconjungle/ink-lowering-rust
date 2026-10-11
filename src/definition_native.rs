@@ -570,69 +570,6 @@ pub(crate) fn lower_typed_shared_datatypes(
 ) -> LangResult<Emission> {
     lower_with_storage(checked, true, true, false)
 }
-/// Emit an additional literal function over the sealed declaration types.
-/// The representation compiler checks the residual term using the existing
-/// equality context; this emitter grants no replacement authority.
-pub(crate) fn literal_function(
-    checked: &ink_core::definition::CheckedDefinition,
-    name: &str,
-    declaration: &Declaration,
-) -> LangResult<String> {
-    let objects = checked
-        .bundle()
-        .objects
-        .iter()
-        .map(|(id, raw)| {
-            Ok((
-                id.clone(),
-                serde_json::from_str::<Object>(raw).map_err(|e| e.to_string())?,
-            ))
-        })
-        .collect::<LangResult<BTreeMap<_, _>>>()?;
-    let mut lower = Lower {
-        objects: &objects,
-        selected: BTreeSet::new(),
-        binder: 0,
-        nodes: 0,
-        shared: true,
-        typed_only: true,
-    };
-    let Declaration::Function {
-        params,
-        result,
-        body,
-        ..
-    } = declaration
-    else {
-        return Err("literal function".into());
-    };
-    let mut env = BTreeMap::new();
-    let mut inputs = vec![];
-    for (n, s) in params {
-        let binder = lower.fresh();
-        let data = matches!(s, Sort::Data(_));
-        inputs.push(format!(
-            "{binder}:{}{}",
-            if data { "&" } else { "" },
-            ty(s)?
-        ));
-        env.insert(
-            n.clone(),
-            Expression {
-                code: binder,
-                sort: s.clone(),
-                borrowed: data,
-            },
-        );
-    }
-    let value = lower.expression(body, &env, name, 0)?;
-    Ok(format!(
-        "fn {name}({})->{}{{{}}}\n",
-        inputs.join(","),
-        ty(result)?,
-        value.owned()
-    ))
-}
 fn lower_with_storage(
     checked: &ink_core::definition::CheckedDefinition,
     shared: bool,
