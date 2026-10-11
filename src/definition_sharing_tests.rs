@@ -1,5 +1,5 @@
 use super::*;
-use ink_core::{knowledge::Lock, logic::Branch};
+use ink_core::{content::Lock, logic::Branch};
 
 fn add(
     bundle: &mut library::Bundle,

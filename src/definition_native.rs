@@ -83,6 +83,17 @@ fn field_sort(sort: &Sort, id: &str) -> Sort {
         sort.clone()
     }
 }
+// An empty base and one recursive edge per nonempty constructor permit an
+// iterative release. Option uses Arc's null niche: it adds no pointer-sized
+// storage, and None is used only after detaching an edge during destruction.
+pub(crate) fn detachable_spine(cs: &[Constructor]) -> bool {
+    cs.len() > 1
+        && cs[0].fields.is_empty()
+        && cs
+            .iter()
+            .skip(1)
+            .all(|c| c.fields.iter().filter(|s| **s == Sort::SelfType).count() == 1)
+}
 impl Lower<'_> {
     fn storage(&self) -> &'static str {
         if self.shared {
@@ -297,7 +308,7 @@ impl Lower<'_> {
                             Sort::U64,
                         ),
                         "+" | "-" | "*" => (
-                            format!("(({a}) {operator} ({b})).to_bits() as u64"),
+                            format!("ink_def_f32_word(({a}) {operator} ({b}))"),
                             Sort::U64,
                         ),
                         "==" | "!=" | "<" | "<=" | ">" | ">=" => {
@@ -377,14 +388,13 @@ impl Lower<'_> {
                 }
                 let cs = self.constructors(datatype)?;
                 let c = cs.get(*constructor).ok_or("invalid lowered constructor")?;
+                let detachable = self.typed_only && detachable_spine(&cs);
                 let mut args = Vec::new();
                 for (t, s) in arguments.iter().zip(&c.fields) {
                     let e = self.expression(t, env, current, depth + 1)?;
                     args.push(if matches!(field_sort(s, datatype), Sort::Data(_)) {
-                        if let Some(owner) = &e.shared_owner {
-                            format!("std::sync::Arc::clone({owner})")
-                        } else {
-                            format!("{}::new({})", self.storage(), e.owned())
+                        let value=if let Some(owner)=&e.shared_owner {format!("std::sync::Arc::clone({owner})")}else{format!("{}::new({})",self.storage(),e.owned())};
+                        if detachable && *s == Sort::SelfType {format!("Some({value})")}else{value
                         }
                     } else {
                         e.owned()
@@ -425,6 +435,7 @@ impl Lower<'_> {
                 };
                 let cs = self.constructors(id)?;
                 let packed = self.packed_cell(id)?.is_some();
+                let detachable = self.typed_only && detachable_spine(&cs);
                 let mut arms = Vec::new();
                 let mut result = None;
                 for (i, (branch, constructor)) in branches.iter().zip(cs).enumerate() {
@@ -439,14 +450,10 @@ impl Lower<'_> {
                         local.insert(
                             name.clone(),
                             Expression {
-                                code: if packed && data && field_index == 1 {
-                                    binder.clone()
-                                } else if packed && data {
-                                    format!("{binder}.as_ref()")
-                                } else if packed {
-                                    binder.clone()
-                                } else if data {
-                                    format!("{binder}.as_ref()")
+                                code: if packed && data && field_index == 1 {binder.clone()}
+                                else if packed && data {format!("{binder}.as_ref()")}
+                                else if packed {binder.clone()}
+                                else if data {if detachable && s==Sort::SelfType{format!("{binder}.as_deref().expect(\"live recursive edge\")")}else{format!("{binder}.as_ref()")}
                                 } else {
                                     format!("*{binder}")
                                 },
@@ -457,7 +464,7 @@ impl Lower<'_> {
                                     && self.shared
                                     && (!packed || field_index == 0)
                                 {
-                                    Some(if packed {format!("&{binder}")} else {binder.clone()})
+                                    Some(if packed {format!("&{binder}")} else if detachable && s==Sort::SelfType {format!("{binder}.as_ref().expect(\"live recursive edge\")")}else{binder.clone()})
                                 } else {
                                     None
                                 },
@@ -605,6 +612,7 @@ impl Lower<'_> {
         if let Some(cell) = self.packed_cell(id)? {
             return Ok(format!("#[derive(Debug)]pub struct PackedTag_{id};\npub type D_{id}=PackedSpine<PackedTag_{id},{}>;\n",self.packed_cell_type(&cell)?));
         }
+        let detachable = self.typed_only && detachable_spine(cs);
         let mut variants = Vec::new();
         let mut decode = Vec::new();
         let mut encode = Vec::new();
@@ -612,10 +620,16 @@ impl Lower<'_> {
             let sorts: Vec<_> = c.fields.iter().map(|s| field_sort(s, id)).collect();
             let types = sorts
                 .iter()
-                .map(|s| {
+                .zip(&c.fields)
+                .map(|(s, source_sort)| {
                     let t = ty(s)?;
                     Ok(if matches!(s, Sort::Data(_)) {
-                        format!("{}<{t}>", self.storage())
+                        let value = format!("{}<{t}>", self.storage());
+                        if detachable && *source_sort == Sort::SelfType {
+                            format!("Option<{value}>")
+                        } else {
+                            value
+                        }
                     } else {
                         t
                     })
@@ -663,12 +677,7 @@ impl Lower<'_> {
             // A linear inductive spine must also be released iteratively. In
             // Wasm, ordinary Arc drop glue otherwise consumes the engine's
             // call stack even when literal evaluation itself fits its limits.
-            if cs[0].fields.is_empty()
-                && cs
-                    .iter()
-                    .skip(1)
-                    .all(|c| c.fields.iter().filter(|s| **s == Sort::SelfType).count() == 1)
-            {
+            if detachable {
                 code.push_str(&format!("impl D_{id}{{fn take_tail(&mut self)->Option<std::sync::Arc<Self>>{{match self{{Self::C0=>None,"));
                 for (i, c) in cs.iter().enumerate().skip(1) {
                     let bs = c
@@ -677,7 +686,7 @@ impl Lower<'_> {
                         .map(|s| if *s == Sort::SelfType { "tail" } else { "_" })
                         .collect::<Vec<_>>()
                         .join(",");
-                    code.push_str(&format!("Self::C{i}({bs})=>Some(std::mem::replace(tail,std::sync::Arc::new(Self::C0))),"));
+                    code.push_str(&format!("Self::C{i}({bs})=>tail.take(),"));
                 }
                 code.push_str("}}}\n");
                 code.push_str(&format!("impl Drop for D_{id}{{fn drop(&mut self){{let mut pending=self.take_tail();while let Some(tail)=pending{{match std::sync::Arc::try_unwrap(tail){{Ok(mut node)=>pending=node.take_tail(),Err(_)=>break,}}}}}}}}\n"));
@@ -780,13 +789,6 @@ pub fn emit_selected(
 /// Only a core-checked witness may enter this backend.
 pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Emission> {
     lower_with_storage(checked, false, false, true)
-}
-/// Pure immutable constructor fields may share storage. Equality and dynamic
-/// transport stay structural; no pointer identity acquires semantic meaning.
-pub(crate) fn lower_shared(
-    checked: &ink_core::definition::CheckedDefinition,
-) -> LangResult<Emission> {
-    lower_with_storage(checked, true, false, true)
 }
 /// Literal typed functions only: no generic constructor carrier or dispatcher.
 pub(crate) fn lower_typed_shared(
@@ -952,6 +954,7 @@ fn lower_with_storage_mode(
     if identity_memo {
         source.push_str(include_str!("identity_memo.rs.txt"));
     }
+    source.push_str("#[inline(never)] fn ink_def_f32_word(v:f32)->u64{if v.is_nan(){0x7fc00000}else{v.to_bits() as u64}}\n");
     if !typed_only {
         source.push_str(include_str!("definition_value.rs.txt"));
     }
@@ -1077,3 +1080,35 @@ fn lower_with_storage_mode(
 #[cfg(test)]
 #[path = "definition_sharing_tests.rs"]
 mod sharing_tests;
+/// Export the same sealed definitions through the C/Wasm ground-value word ABI.
+/// Scheduling and transport do not select or reinterpret implementation bodies.
+pub fn lower_portable(
+    checked: &ink_core::definition::CheckedDefinition,
+) -> LangResult<(Emission, serde_json::Value)> {
+    let mut emission = lower(checked)?;
+    let mut datatypes = Vec::new();
+    for id in &emission.receipt.executable_closure {
+        let object: Object =
+            serde_json::from_str(&checked.bundle().objects[id]).map_err(|e| e.to_string())?;
+        if matches!(object.declaration, Declaration::Datatype { .. }) {
+            datatypes.push(id.clone());
+        }
+    }
+    emission.source.push_str(&format!(
+        "\nconst WORD_DATATYPES:&[&str]=&{:?};\nconst WORD_EXPORTS:&[&str]=&{:?};\n",
+        datatypes,
+        checked.exports()
+    ));
+    emission
+        .source
+        .push_str(include_str!("definition_word_abi.rs.txt"));
+    emission.receipt.source_sha256 = format!("{:x}", Sha256::digest(emission.source.as_bytes()));
+    let identity = ink_core::registry::identity(&(
+        "ink-sealed-executable-v1",
+        checked.bundle_sha256(),
+        checked.exports(),
+        checked.choices(),
+    ))?;
+    let manifest = serde_json::json!({"schema":1,"semantics":"ink-definition-rust-words-v1","executable":identity,"exports":checked.exports(),"datatypes":datatypes,"checked_closure":checked.closure(),"executable_closure":emission.receipt.executable_closure});
+    Ok((emission, manifest))
+}

@@ -84,6 +84,7 @@ pub(crate) fn emit(
         let Declaration::Datatype { constructors } = d else {
             continue;
         };
+        let detachable = crate::definition_native::detachable_spine(constructors);
         writeln!(out,"#[no_mangle] unsafe extern \"C\" fn ink_rep_tag_{id}(v:*const D_{id})->u32{{match &*v{{").unwrap();
         for (i, c) in constructors.iter().enumerate() {
             writeln!(
@@ -106,7 +107,12 @@ pub(crate) fn emit(
                 .enumerate()
                 .map(|(j, s)| {
                     if matches!(s, Sort::Data(_)) {
-                        format!("std::sync::Arc::new((*a{j}).clone())")
+                        let value = format!("std::sync::Arc::new((*a{j}).clone())");
+                        if detachable && c.fields[j] == Sort::SelfType {
+                            format!("Some({value})")
+                        } else {
+                            value
+                        }
                     } else {
                         format!("a{j}")
                     }
@@ -118,7 +124,9 @@ pub(crate) fn emit(
                     .map(|k| if k == j { "value" } else { "_" })
                     .collect::<Vec<_>>()
                     .join(",");
-                let value = if matches!(s, Sort::Data(_)) {
+                let value = if detachable && c.fields[j] == Sort::SelfType {
+                    "value.as_deref().expect(\"live recursive edge\") as *const _"
+                } else if matches!(s, Sort::Data(_)) {
                     "value.as_ref() as *const _"
                 } else {
                     "*value"
