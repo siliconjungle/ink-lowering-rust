@@ -74,12 +74,13 @@ pub fn lower(
                 output.push_str(&format!("let executed=f_{}({});\nlet observed=f_{}({executed});\nlet next=f_{}({executed});\nOk(({},{}))}},\n",action.execute,inputs.join(","),action.observe,action.next,crate::definition_native::encode_value(observed_sort,"observed",false),crate::definition_native::encode_value(&checked.plan().physical_state,"next",false)));
             }
             output.push_str("_=>Err(\"unknown representation action or argument count\"),}}\n");
-            let physical_id = match &checked.plan().physical_state {
-                ink_core::logic::Sort::Data(id) => id,
-                _ => return Err("prepared state requires datatype".into()),
-            };
-            output.push_str(&crate::representation_bounds::emit(d, physical_id)?);
-            output.push_str(&format!("pub fn prepared_transition(action:&str,state:&D_{physical_id},args:&[Value])->Result<(Value,D_{physical_id}), &'static str>{{validate_inputs(args)?;match action{{\n"));
+            let physical_sort = &checked.plan().physical_state;
+            let physical_type = crate::definition_native::ty(physical_sort)?;
+            let bounds = if let ink_core::logic::Sort::Data(id) = physical_sort {
+                output.push_str(&crate::representation_bounds::emit(d,id)?);
+                format!("if !same_storage(state,&next){{bounded_storage(Storage::D_{id}(&next))?;}}")
+            } else { String::new() };
+            output.push_str(&format!("pub fn prepared_transition(action:&str,state:&{physical_type},args:&[Value])->Result<(Value,{physical_type}), &'static str>{{validate_inputs(args)?;match action{{\n"));
             for (name, action) in &checked.plan().actions {
                 let object: ink_core::library::Object =
                     serde_json::from_str(&d.bundle().objects[&action.execute])
@@ -94,10 +95,7 @@ pub fn lower(
                 ));
                 let mut inputs = Vec::new();
                 for (j, (_, sort)) in params.iter().enumerate() {
-                    if j == 0 {
-                        inputs.push("state".to_string());
-                        continue;
-                    }
+                    if j == 0 { inputs.push(if matches!(physical_sort, ink_core::logic::Sort::Data(_)) { "state" } else { "*state" }.to_string()); continue; }
                     output.push_str(&format!(
                         "let a{j}={};\n",
                         crate::definition_native::decode_value(sort, &format!("&args[{}]", j - 1))
@@ -117,10 +115,8 @@ pub fn lower(
                     "executed"
                 };
                 let observed_sort = &checked.projection().actions[name].result;
-                let ordinary =
-                    crate::definition_native::encode_value(observed_sort, "observed", false);
-                let projected = ordinary;
-                output.push_str(&format!("let executed=f_{}({});\nlet observed=f_{}({executed});\nlet next=f_{}({executed});\nif !same_storage(state,&next){{bounded_storage(Storage::D_{physical_id}(&next))?;}}\nOk(({},{}))}},\n",action.execute,inputs.join(","),action.observe,action.next,projected,"next"));
+                let ordinary = crate::definition_native::encode_value(observed_sort, "observed", false);
+                output.push_str(&format!("let executed=f_{}({});\nlet observed=f_{}({executed});\nlet next=f_{}({executed});\n{bounds}\nOk(({},{}))}},\n",action.execute,inputs.join(","),action.observe,action.next,ordinary,"next"));
             }
             output.push_str("_=>Err(\"unknown representation action or argument count\"),}}\n");
         }

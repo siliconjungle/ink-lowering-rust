@@ -229,7 +229,7 @@ impl Lower<'_> {
                             Sort::U64,
                         ),
                         "+" | "-" | "*" => (
-                            format!("(({a}) {operator} ({b})).to_bits() as u64"),
+                            format!("ink_def_f32_word(({a}) {operator} ({b}))"),
                             Sort::U64,
                         ),
                         "==" | "!=" | "<" | "<=" | ">" | ">=" => {
@@ -605,6 +605,7 @@ fn lower_with_storage(
         lower.select(choices.get(id).unwrap_or(id))?;
     }
     let mut source = String::from("// ink-definition-rust-v1: checked bodies; Rust/backend are trusted.\n#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, unused_variables, unused_parens, unused_unsafe, improper_ctypes_definitions)]\n");
+    source.push_str("#[inline(never)] fn ink_def_f32_word(v:f32)->u64{if v.is_nan(){0x7fc00000}else{v.to_bits() as u64}}\n");
     if !typed_only {
         source.push_str(include_str!("definition_value.rs.txt"));
     }
@@ -722,4 +723,37 @@ fn lower_with_storage(
         scope: "exact checked first-order definition bodies; trusted Rust lowering, codecs and Rust/LLVM backend; boxed baseline; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound".into(),
     };
     Ok(Emission { source, receipt })
+}
+
+/// Export the same sealed definitions through the C/Wasm ground-value word ABI.
+/// Scheduling and transport do not select or reinterpret implementation bodies.
+pub fn lower_portable(
+    checked: &ink_core::definition::CheckedDefinition,
+) -> LangResult<(Emission, serde_json::Value)> {
+    let mut emission = lower(checked)?;
+    let mut datatypes = Vec::new();
+    for id in &emission.receipt.executable_closure {
+        let object: Object =
+            serde_json::from_str(&checked.bundle().objects[id]).map_err(|e| e.to_string())?;
+        if matches!(object.declaration, Declaration::Datatype { .. }) {
+            datatypes.push(id.clone());
+        }
+    }
+    emission.source.push_str(&format!(
+        "\nconst WORD_DATATYPES:&[&str]=&{:?};\nconst WORD_EXPORTS:&[&str]=&{:?};\n",
+        datatypes,
+        checked.exports()
+    ));
+    emission
+        .source
+        .push_str(include_str!("definition_word_abi.rs.txt"));
+    emission.receipt.source_sha256 = format!("{:x}", Sha256::digest(emission.source.as_bytes()));
+    let identity = ink_core::registry::identity(&(
+        "ink-sealed-executable-v1",
+        checked.bundle_sha256(),
+        checked.exports(),
+        checked.choices(),
+    ))?;
+    let manifest = serde_json::json!({"schema":1,"semantics":"ink-definition-rust-words-v1","executable":identity,"exports":checked.exports(),"datatypes":datatypes,"checked_closure":checked.closure(),"executable_closure":emission.receipt.executable_closure});
+    Ok((emission, manifest))
 }
