@@ -227,10 +227,15 @@ pub fn lower_c_host(checked: &CheckedRepresentation) -> LangResult<String> {
 }
 
 fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<String> {
+    let executable = checked.definition().reachable_executable_declarations()?;
     let types = checked
         .projection()
         .types
         .iter()
+        // Source projection also records internal-only carrier types. Emitting
+        // codecs for unreachable ones references datatypes the literal emitter
+        // correctly omitted (for example an unused Table<_,Bool> remove result).
+        .filter(|(_,sort)| match sort { Sort::Data(id)=>executable.contains_key(id), _=>true })
         .enumerate()
         .map(|(i, (key, sort))| {
             Ok((
