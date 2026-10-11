@@ -887,7 +887,7 @@ fn lower_with_storage_mode(
     let exports = checked
         .exports()
         .iter()
-        .chain(extras.keys())
+        .chain(extras.iter().filter_map(|(id,d)| matches!(d,Declaration::Function{..}).then_some(id)))
         .cloned()
         .collect::<Vec<_>>();
     let choices = checked.choices();
