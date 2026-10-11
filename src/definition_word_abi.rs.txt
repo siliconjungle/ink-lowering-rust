@@ -1,0 +1,26 @@
+// Ground-value word transport. The emitted typed functions remain the executor.
+thread_local!{static WORD_INPUT:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};static WORD_OUTPUT:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};}
+#[no_mangle]
+pub extern "C" fn ink_definition_input()->*mut u32{WORD_INPUT.with(|input|{let mut input=input.borrow_mut();input.resize(4*1024*1024,0);input.as_mut_ptr()})}
+#[no_mangle]
+pub extern "C" fn ink_definition_result()->*const u32{WORD_OUTPUT.with(|out|out.borrow().as_ptr())}
+fn portable_read(words:&[u32])->Result<Vec<Value>, &'static str>{
+ if words.len()<2||words[0]>100000||words[1]>64||words.len()<2+words[1] as usize{return Err("definition input header");}
+ let mut nodes:Vec<Option<Value>>=Vec::new();let mut depths:Vec<usize>=Vec::new();let mut at=2+words[1] as usize;
+ for i in 0..words[0] as usize{
+  let h=words.get(at..at+6).ok_or("definition input node")?;let count=h[5] as usize;if count>64{return Err("definition field limit");}let refs=words.get(at+6..at+6+count).ok_or("definition input children")?;
+  if refs.iter().any(|r|*r as usize>=i){return Err("definition forward child");}let depth=refs.iter().map(|r|depths[*r as usize]+1).max().unwrap_or(0);if depth>64{return Err("definition input depth");}let bits=u64::from(h[1])|(u64::from(h[2])<<32);
+  let value=match h[0]{0 if bits<=1&&count==0&&h[3]==0&&h[4]==0=>Value::Bool(bits!=0),1 if count==0&&h[3]==0&&h[4]==0=>Value::U64(bits),2 if bits==0=>Value::Data{datatype:WORD_DATATYPES.get(h[3] as usize).ok_or("unknown input datatype")?.to_string(),constructor:h[4] as usize,arguments:refs.iter().map(|r|nodes[*r as usize].take().ok_or("aliased input child")).collect::<Result<Vec<_>,_>>()?},_=>return Err("definition input tag")};nodes.push(Some(value));depths.push(depth);at+=6+count;
+ }
+ if at!=words.len(){return Err("definition trailing input");}let args=words[2..2+words[1] as usize].iter().map(|r|nodes.get_mut(*r as usize).and_then(Option::take).ok_or("invalid argument root")).collect::<Result<Vec<_>,_>>()?;if nodes.iter().any(Option::is_some){return Err("unused input nodes");}Ok(args)
+}
+fn portable_write(value:Value,body:&mut Vec<u32>,count:&mut u32,depth:usize)->Result<u32,&'static str>{
+ if depth>64||*count>=100000{return Err("definition output resource limit");}
+ let(tag,bits,datatype,constructor,args)=match value{Value::Bool(v)=>(0,u64::from(v),0,0,vec![]),Value::U64(v)=>(1,v,0,0,vec![]),Value::Data{datatype,constructor,arguments}=>{if arguments.len()>64{return Err("definition output fields");}let id=WORD_DATATYPES.iter().position(|id|*id==datatype).ok_or("definition output datatype")?;let args=arguments.into_iter().map(|a|portable_write(a,body,count,depth+1)).collect::<Result<Vec<_>,_>>()?;(2,0,id as u32,u32::try_from(constructor).map_err(|_|"constructor index")?,args)}};
+ if *count>=100000||body.len()+6+args.len()>4*1024*1024-3{return Err("definition output word limit");}body.extend([tag,bits as u32,(bits>>32)as u32,datatype,constructor,args.len()as u32]);body.extend(args);let root=*count;*count+=1;Ok(root)
+}
+#[no_mangle]
+pub unsafe extern "C" fn ink_definition_call(function:u32,input:*const u32,length:u32)->u32{
+ let result=(||->Result<Vec<u32>,&'static str>{if length>4*1024*1024{return Err("definition input word limit");}let words=std::slice::from_raw_parts(input,length as usize);let args=portable_read(words)?;let function=WORD_EXPORTS.get(function as usize).ok_or("unknown definition export")?;let value=invoke(function,&args)?;let mut body=Vec::new();let mut count=0;let root=portable_write(value,&mut body,&mut count,0)?;let mut out=vec![count,1,root];out.extend(body);Ok(out)})();
+ match result{Ok(out)=>{let length=out.len()as u32;WORD_OUTPUT.with(|output|*output.borrow_mut()=out);length},Err(_)=>{WORD_OUTPUT.with(|output|output.borrow_mut().clear());0}}
+}
