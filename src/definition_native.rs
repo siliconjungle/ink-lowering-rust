@@ -595,32 +595,46 @@ pub fn emit_selected(
 }
 /// Only a core-checked witness may enter this backend.
 pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Emission> {
-    lower_with_storage(checked, false, false, true)
+    lower_with_storage(checked, false, false, true, &BTreeMap::new())
 }
-/// Literal typed functions only: no generic constructor carrier or dispatcher.
+/// Typed shared functions from a checked witness, without extra definitions.
 pub fn lower_typed_shared(
     checked: &ink_core::definition::CheckedDefinition,
 ) -> LangResult<Emission> {
-    lower_with_storage(checked, true, true, true)
+    lower_with_storage(checked, true, true, true, &BTreeMap::new())
+}
+/// Literal typed functions only: no generic constructor carrier or dispatcher.
+pub(crate) fn lower_typed_shared_projected(
+    checked: &ink_core::definition::CheckedDefinition,
+    extras: &BTreeMap<String, Declaration>,
+) -> LangResult<Emission> {
+    lower_with_storage(checked, true, true, true, extras)
 }
 /// Typed immutable storage for literal foreign functions. The generated C ABI
 /// borrows these objects directly; it never serialises physical state.
 pub(crate) fn lower_typed_shared_datatypes(
     checked: &ink_core::definition::CheckedDefinition,
+    extras: &BTreeMap<String, Declaration>,
 ) -> LangResult<Emission> {
-    lower_with_storage(checked, true, true, false)
+    lower_with_storage(checked, true, true, false, extras)
 }
 fn lower_with_storage(
     checked: &ink_core::definition::CheckedDefinition,
     shared: bool,
     typed_only: bool,
     functions: bool,
+    extras: &BTreeMap<String, Declaration>,
 ) -> LangResult<Emission> {
     let bundle = checked.bundle();
-    let exports = checked.exports();
+    let exports = checked
+        .exports()
+        .iter()
+        .chain(extras.keys())
+        .cloned()
+        .collect::<Vec<_>>();
     let choices = checked.choices();
     let bundle_sha256 = checked.bundle_sha256().to_owned();
-    let objects = bundle
+    let mut objects = bundle
         .objects
         .iter()
         .map(|(id, raw)| {
@@ -630,6 +644,18 @@ fn lower_with_storage(
             ))
         })
         .collect::<LangResult<BTreeMap<_, _>>>()?;
+    for (id, declaration) in extras {
+        objects.insert(
+            id.clone(),
+            Object {
+                schema: 1,
+                semantics: library::SEMANTICS.into(),
+                name: "compiler-demand-projection".into(),
+                dependencies: vec![],
+                declaration: declaration.clone(),
+            },
+        );
+    }
     let mut lower = Lower {
         objects: &objects,
         selected: BTreeSet::new(),
@@ -638,7 +664,7 @@ fn lower_with_storage(
         shared,
         typed_only,
     };
-    for id in exports {
+    for id in &exports {
         if !matches!(lower.declaration(id)?, Declaration::Function { .. }) {
             return Err("definition export must be a function".into());
         }
@@ -724,7 +750,7 @@ fn lower_with_storage(
     }
     if !typed_only {
         source.push_str("pub fn invoke(function: &str, args: &[Value]) -> Result<Value, &'static str> { validate_inputs(args)?; match function {\n");
-        for id in exports {
+        for id in &exports {
             let Declaration::Function { params, result, .. } = &objects[id].declaration else {
                 unreachable!()
             };
@@ -761,7 +787,7 @@ fn lower_with_storage(
         executable_closure: selected,
         selections: exports.iter().map(|id| (id.clone(), choices.get(id).unwrap_or(id).clone())).collect(),
         selection_package_sha256: checked.selection_sha256().map(str::to_owned),
-        scope: format!("exact checked first-order definition bodies; trusted Rust lowering, codecs and Rust/LLVM backend; {}; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound", if shared { "immutable shared fields" } else { "boxed baseline" }),
+        scope: "checked first-order definitions with compiler demand projections; trusted Rust lowering, codecs and Rust/LLVM backend; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound".into(),
     };
     Ok(Emission { source, receipt })
 }
