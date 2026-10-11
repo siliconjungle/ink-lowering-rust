@@ -80,7 +80,7 @@ impl Emit<'_> {
                 Type::Int => {
                     let id=data(sort)?;
                     let natural=self.checked.projection().objects[id].payload["declaration"]["Datatype"]["constructors"][1]["fields"][0]["Data"].as_str().ok_or("binary magnitude datatype")?;
-                    format!("{{let text=v.get(\"Int\").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string());let n=text.parse::<num_bigint::BigInt>().unwrap();let bits=n.bits() as usize;let(_,bytes)=n.to_bytes_le();let mut tail=D_{natural}::C0;for bit in (0..bits).rev(){{tail=if bytes[bit/8]&(1<<(bit%8))==0{{D_{natural}::C1(std::sync::Arc::new(tail))}}else{{D_{natural}::C2(std::sync::Arc::new(tail))}};}}if bits==0{{D_{id}::C0}}else if n.sign()==num_bigint::Sign::Minus{{D_{id}::C2(std::sync::Arc::new(tail))}}else{{D_{id}::C1(std::sync::Arc::new(tail))}}}}")
+                    format!("{{let text=v.get(\"Int\").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string());let n=text.parse::<num_bigint::BigInt>().unwrap();let bits=n.bits() as usize;let(_,bytes)=n.to_bytes_le();let mut tail=D_{natural}::C0;for bit in (0..bits).rev(){{tail=if bytes[bit/8]&(1<<(bit%8))==0{{D_{natural}::C1(Some(std::sync::Arc::new(tail)))}}else{{D_{natural}::C2(Some(std::sync::Arc::new(tail)))}};}}if bits==0{{D_{id}::C0}}else if n.sign()==num_bigint::Sign::Minus{{D_{id}::C2(std::sync::Arc::new(tail))}}else{{D_{id}::C1(std::sync::Arc::new(tail))}}}}")
                 }
                 Type::Bool => "v.as_bool().unwrap()".into(),
                 Type::Unit => format!("{{D_{}::C0}}", data(sort)?),
@@ -112,7 +112,7 @@ impl Emit<'_> {
                 Type::List(a) => {
                     let id=data(sort)?;
                     let read=stored(self.sort(a)?,&self.codec(a,"read","x","d+1")?);
-                    format!("{{let xs=v.as_array().unwrap();let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail=D_{id}::C1({read},std::sync::Arc::new(tail));}}tail}}")
+                    format!("{{let xs=v.as_array().unwrap();let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail=D_{id}::C1({read},Some(std::sync::Arc::new(tail)));}}tail}}")
                 }
                 _ => return Err("unsupported standalone source codec".into()),
             };
@@ -129,7 +129,7 @@ impl Emit<'_> {
                 Type::Int => {
                     let id=data(sort)?;
                     let natural=self.checked.projection().objects[id].payload["declaration"]["Datatype"]["constructors"][1]["fields"][0]["Data"].as_str().ok_or("binary magnitude datatype")?;
-                    format!("{{match v{{D_{id}::C0=>json!({{\"Int\":\"0\"}}),D_{id}::C1(tail)|D_{id}::C2(tail)=>{{let mut cursor=tail.as_ref();let mut magnitude=num_bigint::BigUint::from(0u8);let mut bits=0;loop{{match cursor{{D_{natural}::C0=>break,D_{natural}::C1(tail)|D_{natural}::C2(tail)=>{{if matches!(cursor,D_{natural}::C2(_)){{magnitude|=num_bigint::BigUint::from(1u8)<<bits;}}bits+=1;cursor=tail.as_ref();}}}}}}let sign=if matches!(v,D_{id}::C2(_)){{num_bigint::Sign::Minus}}else{{num_bigint::Sign::Plus}};json!({{\"Int\":num_bigint::BigInt::from_biguint(sign,magnitude).to_string()}})}}}}}}")
+                    format!("{{match v{{D_{id}::C0=>json!({{\"Int\":\"0\"}}),D_{id}::C1(tail)|D_{id}::C2(tail)=>{{let mut cursor=tail.as_ref();let mut magnitude=num_bigint::BigUint::from(0u8);let mut bits=0;loop{{match cursor{{D_{natural}::C0=>break,D_{natural}::C1(tail)|D_{natural}::C2(tail)=>{{if matches!(cursor,D_{natural}::C2(_)){{magnitude|=num_bigint::BigUint::from(1u8)<<bits;}}bits+=1;cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}let sign=if matches!(v,D_{id}::C2(_)){{num_bigint::Sign::Minus}}else{{num_bigint::Sign::Plus}};json!({{\"Int\":num_bigint::BigInt::from_biguint(sign,magnitude).to_string()}})}}}}}}")
                 }
                 Type::Unit => "Json::Null".into(),
                 Type::Named(n) if p.enums.contains_key(n) => {
@@ -146,7 +146,7 @@ impl Emit<'_> {
                 Type::Option(a) => format!("match v{{D_{}::C0=>json!({{\"None\":null}}),D_{}::C1(x)=>json!({{\"Some\":{}}})}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
                 Type::Result(a,b) => format!("match v{{D_{}::C0(x)=>json!({{\"Ok\":{}}}),D_{}::C1(x)=>json!({{\"Err\":{}}})}}",data(sort)?,self.codec(a,"write","x","d+1")?,data(sort)?,self.codec(b,"write","x","d+1")?),
                 Type::Vector(a,n)=>{let bs=(0..*n).map(|i|format!("b{i}")).collect::<Vec<_>>();let xs=(0..*n).map(|i|self.codec(a,"write",&format!("&b{i}"),"d+1")).collect::<LangResult<Vec<_>>>()?;format!("{{let D_{}::C0{}=v;Json::Array(vec![{}])}}",data(sort)?,fields(&bs),xs.join(","))},
-                Type::List(a) => format!("{{let mut cursor=v;let mut xs=vec![];loop{{match cursor{{D_{}::C0=>break,D_{}::C1(x,tail)=>{{xs.push({});cursor=tail.as_ref();}}}}}}Json::Array(xs)}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
+                Type::List(a) => format!("{{let mut cursor=v;let mut xs=vec![];loop{{match cursor{{D_{}::C0=>break,D_{}::C1(x,tail)=>{{xs.push({});cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}Json::Array(xs)}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
                 _ => unreachable!(),
             };
             writeln!(out, "{json})}}").unwrap();
@@ -166,14 +166,14 @@ impl Emit<'_> {
             let id = &model.datatype;
             let t = &model.value_type;
             let read = stored(self.sort(t)?, &self.codec(t, "read", "row", "0")?);
-            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}=D_{id}::C1(key.as_u64().unwrap(),{read},std::sync::Arc::new(root{i}));}}").unwrap();
+            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}=D_{id}::C1(key.as_u64().unwrap(),{read},Some(std::sync::Arc::new(root{i})));}}").unwrap();
             roots.push(format!("std::sync::Arc::new(root{i})"));
         }
         writeln!(out,"Ok(D_{}::C0{})}}\nfn logical_tables(state:&D_{})->Result<Vec<Vec<(Json,Json)>>,String>{{let D_{}::C0{}=state;",projection.state,fields(&roots),projection.state,projection.state,fields(&(0..roots.len()).map(|i|format!("r{i}")).collect::<Vec<_>>())).unwrap();
         for (i, model) in projection.tables.iter().enumerate() {
             let id = &model.datatype;
             let write = self.codec(&model.value_type, "write", "value", "0")?;
-            writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push((json!(key),{write}));cursor=tail.as_ref();}}}}}}").unwrap();
+            writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push((json!(key),{write}));cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}").unwrap();
         }
         let ordered = order
             .iter()
@@ -209,7 +209,7 @@ impl Emit<'_> {
             )
             .unwrap();
         }
-        out.push_str("};out.push(value);cursor=tail.as_ref();}}}Ok(out)}\n");
+        out.push_str("};out.push(value);cursor=tail.as_deref().expect(\"live recursive edge\");}}}Ok(out)}\n");
         Ok(out)
     }
 }
@@ -235,7 +235,10 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
         // Source projection also records internal-only carrier types. Emitting
         // codecs for unreachable ones references datatypes the literal emitter
         // correctly omitted (for example an unused Table<_,Bool> remove result).
-        .filter(|(_,sort)| match sort { Sort::Data(id)=>executable.contains_key(id), _=>true })
+        .filter(|(_, sort)| match sort {
+            Sort::Data(id) => executable.contains_key(id),
+            _ => true,
+        })
         .enumerate()
         .map(|(i, (key, sort))| {
             Ok((

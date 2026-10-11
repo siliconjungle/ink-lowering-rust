@@ -74,6 +74,17 @@ fn field_sort(sort: &Sort, id: &str) -> Sort {
         sort.clone()
     }
 }
+// An empty base and one recursive edge per nonempty constructor permit an
+// iterative release. Option uses Arc's null niche: it adds no pointer-sized
+// storage, and None is used only after detaching an edge during destruction.
+pub(crate) fn detachable_spine(cs: &[Constructor]) -> bool {
+    cs.len() > 1
+        && cs[0].fields.is_empty()
+        && cs
+            .iter()
+            .skip(1)
+            .all(|c| c.fields.iter().filter(|s| **s == Sort::SelfType).count() == 1)
+}
 impl Lower<'_> {
     fn storage(&self) -> &'static str {
         if self.shared {
@@ -286,11 +297,17 @@ impl Lower<'_> {
             } => {
                 let cs = self.constructors(datatype)?;
                 let c = cs.get(*constructor).ok_or("invalid lowered constructor")?;
+                let detachable = self.typed_only && detachable_spine(&cs);
                 let mut args = Vec::new();
                 for (t, s) in arguments.iter().zip(&c.fields) {
                     let e = self.expression(t, env, current, depth + 1)?;
                     args.push(if matches!(field_sort(s, datatype), Sort::Data(_)) {
-                        format!("{}::new({})", self.storage(), e.owned())
+                        let value = format!("{}::new({})", self.storage(), e.owned());
+                        if detachable && *s == Sort::SelfType {
+                            format!("Some({value})")
+                        } else {
+                            value
+                        }
                     } else {
                         e.owned()
                     });
@@ -329,6 +346,7 @@ impl Lower<'_> {
                     return Err("invalid lowered match".into());
                 };
                 let cs = self.constructors(id)?;
+                let detachable = self.typed_only && detachable_spine(&cs);
                 let mut arms = Vec::new();
                 let mut result = None;
                 for (i, (branch, constructor)) in branches.iter().zip(cs).enumerate() {
@@ -342,7 +360,13 @@ impl Lower<'_> {
                             name.clone(),
                             Expression {
                                 code: if data {
-                                    format!("{binder}.as_ref()")
+                                    if detachable && s == Sort::SelfType {
+                                        format!(
+                                            "{binder}.as_deref().expect(\"live recursive edge\")"
+                                        )
+                                    } else {
+                                        format!("{binder}.as_ref()")
+                                    }
                                 } else {
                                     format!("*{binder}")
                                 },
@@ -397,6 +421,7 @@ impl Lower<'_> {
         Ok((format!("d_{id}({})", args.join(",")), result))
     }
     fn datatype(&self, id: &str, cs: &[Constructor]) -> LangResult<String> {
+        let detachable = self.typed_only && detachable_spine(cs);
         let mut variants = Vec::new();
         let mut decode = Vec::new();
         let mut encode = Vec::new();
@@ -404,10 +429,16 @@ impl Lower<'_> {
             let sorts: Vec<_> = c.fields.iter().map(|s| field_sort(s, id)).collect();
             let types = sorts
                 .iter()
-                .map(|s| {
+                .zip(&c.fields)
+                .map(|(s, source_sort)| {
                     let t = ty(s)?;
                     Ok(if matches!(s, Sort::Data(_)) {
-                        format!("{}<{t}>", self.storage())
+                        let value = format!("{}<{t}>", self.storage());
+                        if detachable && *source_sort == Sort::SelfType {
+                            format!("Option<{value}>")
+                        } else {
+                            value
+                        }
                     } else {
                         t
                     })
@@ -455,12 +486,7 @@ impl Lower<'_> {
             // A linear inductive spine must also be released iteratively. In
             // Wasm, ordinary Arc drop glue otherwise consumes the engine's
             // call stack even when literal evaluation itself fits its limits.
-            if cs[0].fields.is_empty()
-                && cs
-                    .iter()
-                    .skip(1)
-                    .all(|c| c.fields.iter().filter(|s| **s == Sort::SelfType).count() == 1)
-            {
+            if detachable {
                 code.push_str(&format!("impl D_{id}{{fn take_tail(&mut self)->Option<std::sync::Arc<Self>>{{match self{{Self::C0=>None,"));
                 for (i, c) in cs.iter().enumerate().skip(1) {
                     let bs = c
@@ -469,7 +495,7 @@ impl Lower<'_> {
                         .map(|s| if *s == Sort::SelfType { "tail" } else { "_" })
                         .collect::<Vec<_>>()
                         .join(",");
-                    code.push_str(&format!("Self::C{i}({bs})=>Some(std::mem::replace(tail,std::sync::Arc::new(Self::C0))),"));
+                    code.push_str(&format!("Self::C{i}({bs})=>tail.take(),"));
                 }
                 code.push_str("}}}\n");
                 code.push_str(&format!("impl Drop for D_{id}{{fn drop(&mut self){{let mut pending=self.take_tail();while let Some(tail)=pending{{match std::sync::Arc::try_unwrap(tail){{Ok(mut node)=>pending=node.take_tail(),Err(_)=>break,}}}}}}}}\n"));
