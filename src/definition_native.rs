@@ -229,7 +229,7 @@ impl Lower<'_> {
                             Sort::U64,
                         ),
                         "+" | "-" | "*" => (
-                            format!("(({a}) {operator} ({b})).to_bits() as u64"),
+                            format!("ink_def_f32_word(({a}) {operator} ({b}))"),
                             Sort::U64,
                         ),
                         "==" | "!=" | "<" | "<=" | ">" | ">=" => {
@@ -668,6 +668,7 @@ fn lower_with_storage(
         lower.select(choices.get(id).unwrap_or(id))?;
     }
     let mut source = String::from("// ink-definition-rust-v1: checked bodies; Rust/backend are trusted.\n#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, unused_variables, unused_parens, unused_unsafe, improper_ctypes_definitions)]\n");
+    source.push_str("#[inline(never)] fn ink_def_f32_word(v:f32)->u64{if v.is_nan(){0x7fc00000}else{v.to_bits() as u64}}\n");
     if !typed_only {
         source.push_str(include_str!("definition_value.rs.txt"));
     }
