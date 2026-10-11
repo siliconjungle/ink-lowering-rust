@@ -64,6 +64,8 @@ struct Lower<'a> {
     shared: bool,
     typed_only: bool,
     linear_step: bool,
+    recursive_sites: usize,
+    recursive_site: usize,
 }
 pub(crate) fn ty(sort: &Sort) -> LangResult<String> {
     Ok(match sort {
@@ -302,7 +304,13 @@ impl Lower<'_> {
                     let e=self.expression(a,env,current,depth+1)?;
                     next.push(if matches!(e.sort,Sort::Data(_)) {e.shared_owner.clone().unwrap_or_else(||format!("std::sync::Arc::new({})",e.owned()))} else {e.owned()});
                 }
-                (format!("match ink_resume.take(){{Some(value)=>value,None=>return Err(({},))}}",next.join(",")),result)
+                let code=if self.recursive_sites==1 {
+                    format!("match ink_resume.take(){{Some(value)=>value,None=>return Err(({},))}}",next.join(","))
+                } else {
+                    let site=self.recursive_site;self.recursive_site+=1;
+                    format!("match &ink_resume[{site}]{{Some(value)=>value.clone(),None=>return Err(({site},({},)))}}",next.join(","))
+                };
+                (code,result)
             }
             Term::SelfCall(arguments) => self.call(current, arguments, env, current, depth + 1)?,
             Term::Construct {
@@ -689,6 +697,8 @@ fn lower_with_storage(
         shared,
         typed_only,
         linear_step: false,
+        recursive_sites: 0,
+        recursive_site: 0,
     };
     for id in &exports {
         if !matches!(lower.declaration(id)?, Declaration::Function { .. }) {
@@ -721,8 +731,10 @@ fn lower_with_storage(
                 }
                 let mut recursive_sites=0;
                 ink_core::logic::walk_term(&body,|t|if matches!(t,Term::SelfCall(_)){recursive_sites+=1});
-                let linear = shared && typed_only && recursive_sites==1;
+                let linear = shared && typed_only && (1..=64).contains(&recursive_sites);
                 lower.linear_step=linear;
+                lower.recursive_sites=recursive_sites;
+                lower.recursive_site=0;
                 let mut env = BTreeMap::new();
                 let mut inputs = Vec::new();
                 let mut step_inputs = Vec::new();
@@ -754,10 +766,16 @@ fn lower_with_storage(
                     let result_type=ty(&result)?;
                     let frame_type=format!("({},)",frame_types.join(","));
                     let arguments=frame_args.join(",");
+                    if recursive_sites==1 {
                     // Defunctionalise one recursive call site. Replaying a frame
                     // recomputes only pure checked terms; it adds no semantic law.
                     source.push_str(&format!("fn s_{id}({},mut ink_resume:Option<{result_type}>)->Result<{result_type},{frame_type}>{{Ok({})}}\n",step_inputs.join(","),body.owned()));
                     source.push_str(&format!("fn d_{id}({})->{result_type}{{let mut ink_frame=({},);let mut ink_frames=Vec::new();let ink_frame_limit=1_000_000usize.min(64_000_000/std::mem::size_of::<{frame_type}>().max(1));let mut ink_result=loop{{match s_{id}({arguments},None){{Ok(value)=>break value,Err(next)=>{{assert!(ink_frames.len()<ink_frame_limit,\"definition continuation frame limit\");if ink_frames.len()==ink_frames.capacity(){{let capacity=ink_frames.capacity();let next=capacity.max(32).saturating_mul(2).min(ink_frame_limit);ink_frames.reserve_exact(next-capacity);}}ink_frames.push(ink_frame);ink_frame=next;}}}}}};while let Some(ink_frame)=ink_frames.pop(){{ink_result=match s_{id}({arguments},Some(ink_result)){{Ok(value)=>value,Err(_)=>unreachable!(\"checked single recursive call site\")}};}}ink_result}}\n",inputs.join(","),initial.join(",")));
+                    } else {
+                        let full_frame_type=format!("({frame_type},[Option<{result_type}>;{recursive_sites}],usize)");
+                        source.push_str(&format!("fn s_{id}({},ink_resume:&[Option<{result_type}>;{recursive_sites}])->Result<{result_type},(usize,{frame_type})>{{Ok({})}}\n",step_inputs.join(","),body.owned()));
+                        source.push_str(&format!("fn d_{id}({})->{result_type}{{let mut ink_frame=({},);let mut ink_resume=[const{{None}};{recursive_sites}];let mut ink_frames:Vec<{full_frame_type}>=Vec::new();let ink_frame_limit=1_000_000usize.min(64_000_000/std::mem::size_of::<{full_frame_type}>().max(1));loop{{match s_{id}({arguments},&ink_resume){{Ok(value)=>{{if let Some((parent,results,site))=ink_frames.pop(){{ink_frame=parent;ink_resume=results;ink_resume[site]=Some(value);}}else{{return value;}}}},Err((site,next))=>{{assert!(ink_frames.len()<ink_frame_limit,\"definition continuation frame limit\");if ink_frames.len()==ink_frames.capacity(){{let capacity=ink_frames.capacity();let next=capacity.max(32).saturating_mul(2).min(ink_frame_limit);ink_frames.reserve_exact(next-capacity);}}ink_frames.push((ink_frame,ink_resume,site));ink_frame=next;ink_resume=[const{{None}};{recursive_sites}];}}}}}}}}\n",inputs.join(","),initial.join(",")));
+                    }
                 } else {
                     source.push_str(&format!("fn d_{id}({}) -> {} {{ {} }}\n",inputs.join(","),ty(&result)?,body.owned()));
                 }
