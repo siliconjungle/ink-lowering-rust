@@ -313,7 +313,22 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
     );
     for source in &p.actions {
         let a = &plan.actions[&source.name];
-        let observation = data(&checked.projection().actions[&source.name].result)?;
+        let observation = data(
+            a.compact
+                .as_ref()
+                .map(|c| &c.result)
+                .unwrap_or(&checked.projection().actions[&source.name].result),
+        )?;
+        let observe = a
+            .compact
+            .as_ref()
+            .map(|c| c.observe.as_str())
+            .unwrap_or(&a.observe);
+        let observed_fields = if a.compact.is_some() {
+            "reply,committed,version,events"
+        } else {
+            "reply,committed,version,_,events"
+        };
         writeln!(out, "{:?}=>{{let xs=args.as_array().unwrap();", source.name).unwrap();
         let mut args = vec![
             borrowed(&plan.physical_state, "self.physical"),
@@ -331,7 +346,7 @@ fn lower_native(checked: &CheckedRepresentation, foreign: bool) -> LangResult<St
         }
         writeln!(out, "let executed=f_{}({});", a.execute, args.join(",")).unwrap();
         let executed = borrowed(&a.result, "executed");
-        writeln!(out,"let observed=f_{}({executed});let next=f_{}({executed});let(reply,committed,version,events)=match &observed{{D_{observation}::C0(reply,committed,version,_,events)=>(reply,*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let result={};let staged=logical_events(events)?;let mut published=vec![];",a.observe,a.next,e.codec(&source.result,"write","reply","0")?).unwrap();
+        writeln!(out,"let observed=f_{}({executed});let next=f_{}({executed});let(reply,committed,version,events)=match &observed{{D_{observation}::C0({observed_fields})=>(reply,*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let result={};let staged=logical_events(events)?;let mut published=vec![];",observe,a.next,e.codec(&source.result,"write","reply","0")?).unwrap();
         let names = p
             .events
             .keys()

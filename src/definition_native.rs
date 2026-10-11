@@ -34,6 +34,10 @@ struct Expression {
     code: String,
     sort: Sort,
     borrowed: bool,
+    /// A borrowed data field may already have an immutable shared owner.
+    /// Reuse that edge when constructing another value instead of allocating
+    /// an identical shallow node around a clone of its payload.
+    shared_owner: Option<String>,
 }
 impl Expression {
     fn owned(&self) -> String {
@@ -302,7 +306,16 @@ impl Lower<'_> {
                 for (t, s) in arguments.iter().zip(&c.fields) {
                     let e = self.expression(t, env, current, depth + 1)?;
                     args.push(if matches!(field_sort(s, datatype), Sort::Data(_)) {
-                        let value = format!("{}::new({})", self.storage(), e.owned());
+                        let value = if self.shared {
+                            e.shared_owner
+                                .as_ref()
+                                .map(|owner| format!("std::sync::Arc::clone({owner})"))
+                                .unwrap_or_else(|| {
+                                    format!("{}::new({})", self.storage(), e.owned())
+                                })
+                        } else {
+                            format!("{}::new({})", self.storage(), e.owned())
+                        };
                         if detachable && *s == Sort::SelfType {
                             format!("Some({value})")
                         } else {
@@ -372,6 +385,13 @@ impl Lower<'_> {
                                 },
                                 sort,
                                 borrowed: data,
+                                shared_owner: data.then(|| {
+                                    if detachable && s == Sort::SelfType {
+                                        format!("{binder}.as_ref().expect(\"live recursive edge\")")
+                                    } else {
+                                        binder.clone()
+                                    }
+                                }),
                             },
                         );
                         fields.push(binder);
@@ -398,6 +418,7 @@ impl Lower<'_> {
             code,
             sort,
             borrowed: false,
+            shared_owner: None,
         })
     }
     fn call(
@@ -577,7 +598,7 @@ pub fn lower(checked: &ink_core::definition::CheckedDefinition) -> LangResult<Em
     lower_with_storage(checked, false, false, true)
 }
 /// Literal typed functions only: no generic constructor carrier or dispatcher.
-pub(crate) fn lower_typed_shared(
+pub fn lower_typed_shared(
     checked: &ink_core::definition::CheckedDefinition,
 ) -> LangResult<Emission> {
     lower_with_storage(checked, true, true, true)
@@ -659,6 +680,7 @@ fn lower_with_storage(
                             code: binder,
                             sort: s,
                             borrowed: data,
+                            shared_owner: None,
                         },
                     );
                 }
@@ -739,7 +761,7 @@ fn lower_with_storage(
         executable_closure: selected,
         selections: exports.iter().map(|id| (id.clone(), choices.get(id).unwrap_or(id).clone())).collect(),
         selection_package_sha256: checked.selection_sha256().map(str::to_owned),
-        scope: "exact checked first-order definition bodies; trusted Rust lowering, codecs and Rust/LLVM backend; boxed baseline; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound".into(),
+        scope: format!("exact checked first-order definition bodies; trusted Rust lowering, codecs and Rust/LLVM backend; {}; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound", if shared { "immutable shared fields" } else { "boxed baseline" }),
     };
     Ok(Emission { source, receipt })
 }
