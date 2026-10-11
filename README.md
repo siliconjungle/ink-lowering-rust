@@ -35,9 +35,27 @@ Physical rollback, codecs, payload lowering and Rust/LLVM remain trusted.
 Current complete execution coverage, GPU exclusions and integration evidence are documented in the [lowering parity contract](https://github.com/siliconjungle/ink-lang/blob/main/docs/lowering-parity.md).
 Pure compute functions and stateful code can coexist. Full-width values and recursive record fields use native Rust representations without changing Ink types. The runtime adds the portable native/Wasm host ABI.
 
-`state_native::emit_selected` and `emit_selected_with_storage` retain the core-authenticated original checkpoint layout while emitting selected code. Bare Program emission keeps its own namespace. Selected code generation remains trusted; the witness does not verify machine code.
+`state_native::emit_selected` retain the core-authenticated original checkpoint layout while emitting selected code. Bare Program emission keeps its own namespace. Selected code generation remains trusted; the witness does not verify machine code.
 
 All targets consume [ink-abi](https://github.com/siliconjungle/ink-abi) for shared
 type/layout contracts. Early termination, owned-buffer transforms and helper
 unfolding are checked database choices. The backend emits the resulting general
 operations literally; it does not infer those transformations from source patterns.
+
+Standalone proof-selected representations use the compile-time checked witness
+and emit literal functions with native state retained between calls. Generated
+applications carry no proof package, checker context, source AST or Ink runtime
+dependency. See ink-lang/docs/database-representations.md and the shared
+`representation_parity` conformance gate. Recursive GPU state uses the complete
+host lane; device eligibility remains separate.
+
+
+Generated entry points trust the caller's declared argument types, arity, shapes,
+tags and canonical ranges. Bad data is unsafe and may crash, trap, corrupt state
+or produce incorrect results; raw native pointers also require valid alignment,
+length and lifetime. No malformed-input diagnostic or rollback is promised.
+Representation conversion/JSON parsing and explicit portable checkpoint integrity
+checks remain. Source/proof checking happens during compilation. Standalone
+representation calls skip whole-state checkpoint validation; read-only observation
+envelopes are erased when existing definitional computation establishes unchanged
+logical state/version and no events.

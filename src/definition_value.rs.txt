@@ -18,7 +18,7 @@ fn validate_inputs(args: &[Value]) -> Result<(), &'static str> {
     let mut nodes = 0;
     while let Some((v, depth)) = pending.pop() {
         nodes += 1;
-        if depth > 64 || nodes > 100_000 { return Err("input value resource limit"); }
+        if depth > 8192 || nodes > 100_000 { return Err("input value resource limit"); }
         if let Value::Data { datatype, arguments, .. } = v {
             if datatype.len() != 64 || arguments.len() > 64 { return Err("input constructor limit"); }
             pending.extend(arguments.iter().map(|v| (v, depth + 1)));
