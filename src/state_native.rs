@@ -1,7 +1,7 @@
 //! Typed Rust lowering for the checked stateful subset. Generated programs do
 //! not depend on this crate and do not carry an AST or expression evaluator.
 use crate::ownership::{self, Uses};
-use crate::{aggregate, syntax::*, LangResult};
+use crate::{syntax::*, LangResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -58,66 +58,9 @@ fn field_ty(owner: &str, t: &Type, p: &Program) -> LangResult<String> {
     })
 }
 type Env = BTreeMap<String, Type>;
-// Certificates inhabit exact arithmetic at every subexpression, including
-// constant-only subtrees. Never infer their literals as modular u64 values.
-fn exact_expression(e: &Expr) -> LangResult<String> {
-    // Bindings are borrowed exact integers. Read them directly as operands;
-    // arithmetic temporaries remain owned so BigInt may reuse their storage.
-    // A root variable still produces the owned result required by the cache.
-    fn operand(e: &Expr) -> LangResult<String> {
-        if let Expr::Var(n) = e {
-            Ok(ident(n))
-        } else {
-            exact_expression(e)
-        }
-    }
-    match e {
-        Expr::Num(n) => Ok(format!("BigInt::from({n}u64)")),
-        Expr::Var(n) => Ok(format!("(*{}).clone()", ident(n))),
-        Expr::Binary(op, a, b) if ["+", "-", "*"].contains(&op.as_str()) => {
-            Ok(format!("({} {op} {})", operand(a)?, operand(b)?))
-        }
-        _ => Err("invalid exact certificate expression".into()),
-    }
-}
-// Ownership lowering preserves the AST and its evaluation order. Earlier
-// reads of the consumed binding copy it; its final read moves the allocation.
-fn exact_owned_expression(e: &Expr, owner: &str) -> LangResult<String> {
-    fn occurrences(e: &Expr, owner: &str) -> usize {
-        match e {
-            Expr::Var(n) => usize::from(n == owner),
-            Expr::Binary(_, a, b) => occurrences(a, owner) + occurrences(b, owner),
-            _ => 0,
-        }
-    }
-    fn emit(e: &Expr, owner: &str, remaining: &mut usize, operand: bool) -> LangResult<String> {
-        match e {
-            Expr::Var(n) if n == owner => {
-                *remaining -= 1;
-                Ok(if *remaining == 0 {
-                    ident(n)
-                } else {
-                    format!("{}.clone()", ident(n))
-                })
-            }
-            Expr::Var(n) if operand => Ok(ident(n)),
-            Expr::Var(n) => Ok(format!("(*{}).clone()", ident(n))),
-            Expr::Num(n) => Ok(format!("BigInt::from({n}u64)")),
-            Expr::Binary(op, a, b) if ["+", "-", "*"].contains(&op.as_str()) => {
-                let a = emit(a, owner, remaining, true)?;
-                let b = emit(b, owner, remaining, true)?;
-                Ok(format!("({a} {op} {b})"))
-            }
-            _ => Err("invalid owned exact certificate expression".into()),
-        }
-    }
-    emit(e, owner, &mut occurrences(e, owner), false)
-}
 struct Emitter<'a> {
     p: &'a Program,
     execution: &'a ink_core::action_ir::Execution,
-    plans: BTreeMap<String, aggregate::Plan>,
-    bounded: BTreeMap<String, BoundEvidence>,
     serial: usize,
     /// Lexical ownership state for the action body being emitted.
     uses: Uses,
@@ -130,107 +73,10 @@ struct Emitter<'a> {
     aliases: BTreeMap<(String, String), String>,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct BoundEvidence {
-    pub root: String,
-    pub field: String,
-    pub key_bits: u32,
-    pub value_bits: u32,
-    pub maximum_total: String,
-    pub justification: &'static str,
-}
-
 /// Conservative range analysis for one exact sum of an unsigned row field.
 /// Full key-domain cardinality is used, not an observed size or host RAM bound.
-pub fn bounded_caches(p: &Program) -> BTreeMap<String, BoundEvidence> {
-    use num_bigint::BigInt;
-    let mut result = BTreeMap::new();
-    for k in &p.keeps {
-        let Some(plan) = aggregate::plan(k) else {
-            continue;
-        };
-        if plan.count || plan.stages.len() != 1 {
-            continue;
-        }
-        let (op, binder, body) = &plan.stages[0];
-        if op != "map" {
-            continue;
-        }
-        let Expr::Call(conversion, args) = body else {
-            continue;
-        };
-        if conversion != "Int" || args.len() != 1 {
-            continue;
-        }
-        let Expr::Field(base, field) = &args[0] else {
-            continue;
-        };
-        if !matches!(&**base,Expr::Var(v) if v==binder) {
-            continue;
-        }
-        let Some(root) = p.states.iter().find(|s| s.name == plan.root) else {
-            continue;
-        };
-        let Type::Table(key, row) = &root.ty else {
-            continue;
-        };
-        let key_bits = match &**key {
-            Type::U32 => 32,
-            Type::U64 => 64,
-            Type::Named(n) if p.ids.contains(n) => 128,
-            _ => continue,
-        };
-        let Type::Named(record) = &**row else {
-            continue;
-        };
-        let Some(fields) = p.records.get(record) else {
-            continue;
-        };
-        let Some((_, field_type)) = fields.iter().find(|(f, _)| f == field) else {
-            continue;
-        };
-        let value_bits = match field_type {
-            Type::U32 => 32,
-            Type::U64 => 64,
-            _ => continue,
-        };
-        let maximum = (BigInt::from(1u8) << key_bits) * ((BigInt::from(1u8) << value_bits) - 1u8);
-        if maximum > BigInt::from(u128::MAX) {
-            continue;
-        }
-        result.insert(k.name.clone(),BoundEvidence{root:root.name.clone(),field:field.clone(),key_bits,value_bits,maximum_total:maximum.to_string(),justification:"nonnegative unsigned field; finite map has at most 2^key_bits entries; maximum = 2^key_bits * (2^value_bits - 1) < 2^128"});
-    }
-    result
-}
 
-fn modular128_expression(e: &Expr) -> LangResult<String> {
-    match e {
-        Expr::Num(n) => Ok(format!("{n}u128")),
-        Expr::Var(n) => Ok(ident(n)),
-        Expr::Binary(op, a, b) => {
-            let method = match op.as_str() {
-                "+" => "wrapping_add",
-                "-" => "wrapping_sub",
-                "*" => "wrapping_mul",
-                _ => return Err("invalid polynomial operator".into()),
-            };
-            Ok(format!(
-                "({}).{method}({})",
-                modular128_expression(a)?,
-                modular128_expression(b)?
-            ))
-        }
-        _ => Err("invalid polynomial expression".into()),
-    }
-}
 impl Emitter<'_> {
-    fn cache_type(&self, n: &str) -> &'static str {
-        if self.bounded.contains_key(n) {
-            "u128"
-        } else {
-            "BigInt"
-        }
-    }
     fn movable(&self, n: &str) -> bool {
         self.binders.get(n) == Some(&1) && !self.borrowed.contains(n)
     }
@@ -891,80 +737,11 @@ impl Emitter<'_> {
         }
         Ok(out)
     }
-    fn contribution(&mut self, name: &str, plan: &aggregate::Plan) -> LangResult<String> {
-        let root = self
-            .p
-            .states
-            .iter()
-            .find(|s| s.name == plan.root)
-            .ok_or("unknown plan root")?;
-        let Type::Table(_, row) = &root.ty else {
-            unreachable!()
-        };
-        if let Some(bound) = self.bounded.get(name) {
-            return Ok(format!(
-                "fn contribution_{}(row:&{})->u128{{row.{} as u128}}\n",
-                ident(name),
-                ty(row)?,
-                ident(&bound.field)
-            ));
-        }
-        let mut current = "row".to_string();
-        let mut current_ty = *row.clone();
-        let mut out = String::new();
-        for (op, v, body) in &plan.stages {
-            let env = [(v.clone(), current_ty.clone())].into();
-            let (e, t) = self.expr(body, &env, None)?;
-            if op == "filter" {
-                write!(
-                    out,
-                    "{{let {}=&{current};if !({e}){{return BigInt::from(0u8)}}}}",
-                    ident(v)
-                )
-                .unwrap();
-            } else {
-                let next = self.fresh();
-                write!(out, "let {next}={{let {}=&{current};{e}}};", ident(v)).unwrap();
-                current = next;
-                current_ty = t;
-            }
-        }
-        let result = if plan.count {
-            "BigInt::from(1u8)".into()
-        } else {
-            if current_ty != Type::Int {
-                return Err("native maintenance needs exact Int contributions".into());
-            }
-            current
-        };
-        Ok(format!(
-            "fn contribution_{}(row:&{})->BigInt{{{out}{result}}}\n",
-            ident(name),
-            ty(row)?
-        ))
-    }
 }
 
-pub fn emit_selected(
-    selected: &ink_core::optimisation::CheckedSelection,
-    certificate: Option<&aggregate::Certificate>,
-) -> LangResult<String> {
-    emit_selected_with_storage(selected, certificate, false, None)
-}
-pub fn emit_selected_with_storage(
-    selected: &ink_core::optimisation::CheckedSelection,
-    certificate: Option<&aggregate::Certificate>,
-    narrow: bool,
-    storage: Option<&crate::storage::Policy>,
-) -> LangResult<String> {
+pub fn emit_selected(selected: &ink_core::optimisation::CheckedSelection) -> LangResult<String> {
     let layout = crate::snapshot::selected_layout(selected)?;
-    emit_with_layout(
-        selected.module().program(),
-        certificate,
-        narrow,
-        storage,
-        &layout,
-    )
+    emit_with_layout(selected.module().program(), &layout)
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
@@ -982,77 +759,17 @@ fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
         _ => false,
     }
 }
-pub fn emit(p: &Program, certificate: Option<&aggregate::Certificate>) -> LangResult<String> {
-    emit_with_bounds(p, certificate, false)
-}
-
-pub fn bounded_caches_with_certificate(
-    p: &Program,
-    c: &aggregate::Certificate,
-) -> BTreeMap<String, BoundEvidence> {
-    let mut bounds = bounded_caches(p);
-    bounds.retain(|n, _| {
-        p.keeps
-            .iter()
-            .find(|k| &k.name == n)
-            .is_some_and(|k| aggregate::plan_with_certificate(p, k, c).is_some())
-    });
-    bounds
-}
-
-pub fn emit_with_bounds(
-    p: &Program,
-    certificate: Option<&aggregate::Certificate>,
-    narrow: bool,
-) -> LangResult<String> {
-    emit_with_storage(p, certificate, narrow, None)
-}
-
-pub fn emit_with_storage(
-    p: &Program,
-    certificate: Option<&aggregate::Certificate>,
-    narrow: bool,
-    storage: Option<&crate::storage::Policy>,
-) -> LangResult<String> {
+pub fn emit(p: &Program) -> LangResult<String> {
     let layout = crate::snapshot::layout(p)?;
-    emit_with_layout(p, certificate, narrow, storage, &layout)
+    emit_with_layout(p, &layout)
 }
-fn emit_with_layout(
-    p: &Program,
-    certificate: Option<&aggregate::Certificate>,
-    narrow: bool,
-    storage: Option<&crate::storage::Policy>,
-    layout: &crate::snapshot_wire::Layout,
-) -> LangResult<String> {
-    if narrow && certificate.is_none() {
-        return Err("bounded cache admission requires a source-bound representation entry".into());
-    }
+fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout) -> LangResult<String> {
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
     let execution = action_ir.execution()?;
-    if let Some(c) = certificate {
-        aggregate::verify(c)?;
-    }
-    if let Some(policy) = storage {
-        policy.check(p, certificate)?;
-    }
-    let plans = if let Some(c) = certificate {
-        p.keeps
-            .iter()
-            .filter_map(|k| aggregate::plan_with_certificate(p, k, c).map(|v| (k.name.clone(), v)))
-            .collect()
-    } else {
-        BTreeMap::new()
-    };
     let mut emitter = Emitter {
         p,
         execution: &execution,
-        plans,
-        bounded: if narrow && certificate.is_some() {
-            bounded_caches_with_certificate(p, certificate.unwrap())
-        } else {
-            BTreeMap::new()
-        },
         serial: 0,
         uses: Uses::default(),
         binders: BTreeMap::new(),
@@ -1063,9 +780,26 @@ fn emit_with_layout(
     let mut out = String::from(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
     );
-    out.push_str(include_str!("state_native_support.txt"));
+    let describe = |t: &Type| ink_abi::describe(t, &p.records, &p.enums, &p.ids);
+    let functions=p.functions.iter().map(|f|Ok(serde_json::json!({"name":f.name,"params":f.params.iter().map(|(n,t)|Ok(serde_json::json!({"name":n,"type":describe(t)?}))).collect::<LangResult<Vec<_>>>()?,"result":describe(&f.result)?}))).collect::<LangResult<Vec<_>>>()?;
+    let actions=p.actions.iter().map(|a|Ok(serde_json::json!({"name":a.name,"params":a.params.iter().map(|(n,t)|Ok(serde_json::json!({"name":n,"type":describe(t)?}))).collect::<LangResult<Vec<_>>>()?,"result":describe(&a.result)?}))).collect::<LangResult<Vec<_>>>()?;
+    let contract =
+        serde_json::json!({"abi":ink_abi::VALUE_ABI,"functions":functions,"actions":actions});
+    writeln!(
+        out,
+        "pub const INK_ABI_CONTRACT:&str={:?};",
+        serde_json::to_string(&contract).map_err(|e| e.to_string())?
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "pub const INK_VALUE_ABI:&str={:?};",
+        ink_abi::VALUE_ABI
+    )
+    .unwrap();
+    out.push_str(ink_native_support::TYPED_VALUES_RUST_SOURCE);
     out.push_str("\nmod temporary {\n");
-    out.push_str(include_str!("temporary.rs.txt"));
+    out.push_str(ink_native_support::OWNED_VALUES_RUST_SOURCE);
     out.push_str(
         "\n}\nuse temporary::{OwnedBuffer,OwnedMap,ink_parallel_map,ink_parallel_update};\n",
     );
@@ -1079,11 +813,7 @@ impl<K:Ord+Clone,V:Clone> InkDataEq for OwnedMap<K,V>{fn ink_data_eq(&self,_:&Se
     out.push_str("\nmod transaction {\n");
     out.push_str(ink_core::TRANSACTION_RUST_SOURCE);
     out.push_str("\n}\n");
-    if storage.is_some() {
-        out.push_str("\nmod ordered_storage {\n");
-        out.push_str(include_str!("ordered_storage.rs"));
-        out.push_str("\n}\nuse ordered_storage::OrderedStorage;\n");
-    }
+
     out.push_str("\nmod portable {\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
@@ -1211,18 +941,7 @@ impl Wire for {id} {{
             ty(v)?
         )
         .unwrap();
-        for (n, plan) in &emitter.plans {
-            if plan.root == s.name {
-                let cache_ty = if aggregate::journal(certificate.unwrap()).is_some()
-                    && !emitter.bounded.contains_key(n)
-                {
-                    "Option<(u8,BigInt)>"
-                } else {
-                    emitter.cache_type(n)
-                };
-                write!(out, ",cache_{}:{}", ident(n), cache_ty).unwrap();
-            }
-        }
+
         out.push_str("},\n");
     }
     out.push_str("}\n");
@@ -1230,46 +949,15 @@ impl Wire for {id} {{
         "pub struct State {version:u64,staged:Vec<EventData>,outbox:Vec<Event>,undo:Vec<Undo>,\n",
     );
     for s in &p.states {
-        let row_type = if storage.is_some_and(|policy| policy.roots.contains_key(&s.name)) {
-            let Type::Table(k, v) = &s.ty else {
-                unreachable!()
-            };
-            format!("OrderedStorage<{},{}>", ty(k)?, ty(v)?)
-        } else {
-            ty(&s.ty)?
-        };
+        let row_type = ty(&s.ty)?;
         writeln!(out, "{}:{row_type},", ident(&s.name)).unwrap();
-    }
-    for n in emitter.plans.keys() {
-        writeln!(out, "cache_{}:{},", ident(n), emitter.cache_type(n)).unwrap();
     }
     out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],\n");
     for s in &p.states {
-        let constructor = if let Some(config) = storage.and_then(|policy| policy.roots.get(&s.name))
-        {
-            let mode = match config.layout {
-                crate::storage::Layout::InlineRows => "rows",
-                crate::storage::Layout::Columns => "columns",
-            };
-            let limit = match config.promote_at {
-                Some(n) => format!("Some({n})"),
-                None => "None".into(),
-            };
-            format!("OrderedStorage::{mode}({limit})")
-        } else {
-            "BTreeMap::new()".into()
-        };
+        let constructor = "BTreeMap::new()";
         writeln!(out, "{}:{constructor},", ident(&s.name)).unwrap();
     }
-    for n in emitter.plans.keys() {
-        writeln!(
-            out,
-            "cache_{}:{}::from(0u8),",
-            ident(n),
-            emitter.cache_type(n)
-        )
-        .unwrap();
-    }
+
     out.push_str("}}\n");
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox(&self)->&[Event]{&self.outbox}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){self.outbox.retain(|e|(e.commit,e.position)>(commit,position));}\n");
     out.push_str("pub fn checkpoint(&self)->Result<Vec<u8>,String>{self.checkpoint_with_limits(SnapshotLimits::default())}\npub fn checkpoint_with_limits(&self,limits:SnapshotLimits)->Result<Vec<u8>,String>{if !self.undo.is_empty()||!self.staged.is_empty(){return Err(\"checkpoint requires transaction boundary\".into())}let layout=snapshot_layout();let tables=vec![");
@@ -1305,20 +993,10 @@ impl Wire for {id} {{
         .unwrap();
     }
     out.push_str("_=>return Err(\"unknown event channel\".into())};Ok(Event{commit:e.commit,position:e.position,data})}).collect::<Result<Vec<_>,String>>()?;");
-    for (n, plan) in &emitter.plans {
-        let id = ident(n);
-        let root = ident(&plan.root);
-        if emitter.bounded.contains_key(n) {
-            writeln!(out,"for row in state.{root}.values(){{state.cache_{id}=state.cache_{id}.checked_add(Self::contribution_{id}(row)).ok_or(\"restored aggregate violates range\")?;}}").unwrap();
-        } else {
-            writeln!(out,"for row in state.{root}.values(){{state.cache_{id}+=Self::contribution_{id}(row);}}").unwrap();
-        }
-    }
+
     out.push_str("Ok(state)}\n");
-    for (n, plan) in emitter.plans.clone() {
-        out.push_str(&emitter.contribution(&n, &plan)?);
-    }
-    // A single typed write primitive per root owns its undo and cache entries.
+
+    // A single typed write primitive per root owns its undo entries.
     for s in &p.states {
         let field = ident(&s.name);
         let Type::Table(k, v) = &s.ty else {
@@ -1334,87 +1012,15 @@ impl Wire for {id} {{
             ty(v)?
         )
         .unwrap();
-        for (n, plan) in &emitter.plans {
-            if plan.root == s.name {
-                writeln!(
-                    out,
-                    "let new_part_{}=value.as_ref().map(Self::contribution_{});",
-                    ident(n),
-                    ident(n)
-                )
-                .unwrap();
-            }
-        }
+
         writeln!(out,"let old=match value{{Some(v)=>self.{field}.insert(key.clone(),v),None=>self.{field}.remove(&key)}};").unwrap();
-        for (n, plan) in emitter.plans.clone() {
-            if plan.root != s.name {
-                continue;
-            }
-            let id = ident(&n);
-            let c = certificate.unwrap();
-            let bounded = emitter.bounded.contains_key(&n);
-            let journal = aggregate::journal(c).filter(|_| !bounded);
-            let total = if bounded {
-                format!("self.cache_{id}.clone()")
-            } else {
-                format!("&self.cache_{id}")
-            };
-            if journal.is_none() {
-                writeln!(out, "let undo_{id}=self.cache_{id}.clone();").unwrap();
-            }
-            writeln!(out,"let (next_{id}, saved_{id})={{let total={total};let old_part=old.as_ref().map(Self::contribution_{id});match (old_part,new_part_{id}){{").unwrap();
-            for (kind, pattern, e, vars) in [
-                (0, "(None,Some(new))", &c.insert, vec!["total", "new"]),
-                (
-                    1,
-                    "(Some(old),Some(new))",
-                    &c.replace,
-                    vec!["total", "old", "new"],
-                ),
-                (2, "(Some(old),None)", &c.remove, vec!["total", "old"]),
-            ] {
-                write!(out, "{pattern}=>{{").unwrap();
-                for v in vars {
-                    let borrow = if bounded || v == "total" { "" } else { "&" };
-                    write!(out, "let {}={borrow}{v};", ident(v)).unwrap();
-                }
-                if let Some(journal) = journal {
-                    let action = journal.action(kind);
-                    writeln!(out,"let saved={};let l_saved=&saved;let l_total=std::mem::take(&mut self.cache_{id});let next={};(next,Some(({kind}u8,saved))) }},", exact_expression(&action.save)?,exact_owned_expression(&action.apply,"total")?).unwrap();
-                } else {
-                    let expr = if bounded {
-                        modular128_expression(e)?
-                    } else {
-                        write!(out, "let l_total=std::mem::take(&mut self.cache_{id});").unwrap();
-                        exact_owned_expression(e, "total")?
-                    };
-                    writeln!(out, "({expr},None::<(u8,BigInt)>) }},").unwrap();
-                }
-            }
-            let identity = if bounded {
-                "total".into()
-            } else {
-                format!("std::mem::take(&mut self.cache_{id})")
-            };
-            writeln!(
-                out,
-                "(None,None)=>({identity},None)}}}};self.cache_{id}=next_{id};"
-            )
-            .unwrap();
-            if journal.is_some() {
-                writeln!(out, "let undo_{id}=saved_{id};").unwrap();
-            }
-        }
+
         write!(
             out,
             "let result=if return_old{{old.clone()}}else{{None}};self.undo.push(Undo::{field}{{key,old"
         )
         .unwrap();
-        for (n, plan) in &emitter.plans {
-            if plan.root == s.name {
-                write!(out, ",cache_{}:undo_{}", ident(n), ident(n)).unwrap();
-            }
-        }
+
         out.push_str("});\n");
         out.push_str("result}\n");
     }
@@ -1422,47 +1028,14 @@ impl Wire for {id} {{
     for s in &p.states {
         let id = ident(&s.name);
         write!(out, "Undo::{id}{{key,old").unwrap();
-        for (n, plan) in &emitter.plans {
-            if plan.root == s.name {
-                write!(out, ",cache_{}", ident(n)).unwrap();
-            }
-        }
+
         write!(out,"}}=>{{match old{{Some(v)=>{{self.{id}.insert(key,v);}},None=>{{self.{id}.remove(&key);}}}}").unwrap();
-        for (n, plan) in &emitter.plans {
-            if plan.root == s.name {
-                let cache = ident(n);
-                if let Some(journal) = certificate
-                    .and_then(aggregate::journal)
-                    .filter(|_| !emitter.bounded.contains_key(n))
-                {
-                    write!(out,"if let Some((kind,saved))=cache_{cache}{{let l_total=std::mem::take(&mut self.cache_{cache});let l_saved=&saved;self.cache_{cache}=match kind{{").unwrap();
-                    for kind in 0..3 {
-                        write!(
-                            out,
-                            "{kind}=>{},",
-                            exact_owned_expression(&journal.action(kind).restore, "total")?
-                        )
-                        .unwrap();
-                    }
-                    out.push_str("_=>unreachable!(\"internal journal operation\")};}");
-                } else {
-                    write!(out, "self.cache_{cache}=cache_{cache};").unwrap();
-                }
-            }
-        }
+
         out.push_str("},\n");
     }
     out.push_str("}}self.staged.clear();}\n");
     for k in execution.keeps() {
-        let body = if emitter.plans.contains_key(&k.name) {
-            if emitter.bounded.contains_key(&k.name) {
-                format!("BigInt::from(self.cache_{})", ident(&k.name))
-            } else {
-                format!("self.cache_{}.clone()", ident(&k.name))
-            }
-        } else {
-            emitter.expr(&k.value, &Env::new(), Some(&k.ty))?.0
-        };
+        let body = emitter.expr(&k.value, &Env::new(), Some(&k.ty))?.0;
         writeln!(
             out,
             "fn keep_{}(&mut self)->{}{{{body}}}",
@@ -1512,16 +1085,6 @@ impl Wire for {id} {{
     }
     out.push_str("_=>Err(\"unknown compiled parallel callback\".into()),})}\n");
     for a in execution.actions() {
-        // A direct bounded keep query admits an allocation-free exact host ABI.
-        // The ordinary language/JSON API still returns Int. This extra view is
-        // generated from checked structure, never an application name.
-        if a.kind == ActionKind::Query && a.params.is_empty() && a.result == Type::Int {
-            if let [Statement::Return(Expr::Var(keep))] = a.body.as_slice() {
-                if emitter.bounded.contains_key(keep) {
-                    writeln!(out,"pub fn query_words_{}(&self)->(u64,u64){{let v=self.cache_{};(v as u64,(v>>64) as u64)}}",ident(&a.name),ident(keep)).unwrap();
-                }
-            }
-        }
         let id = ident(&a.name);
         let params = a
             .params
