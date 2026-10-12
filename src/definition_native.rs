@@ -857,7 +857,8 @@ pub(crate) fn lower_typed_shared_projected(
     lower_with_storage(checked, true, true, true, extras)
 }
 pub(crate) fn lower_typed_planned(checked: &ink_core::definition::CheckedDefinition, extras: &BTreeMap<String, Declaration>, physical: &ink_core::physical::CheckedPhysicalPlan) -> LangResult<Emission> {
-    lower_with_storage_mode(checked,true,true,true,physical.plan().definitions==ink_core::physical::Definitions::Packed,physical.plan().definitions==ink_core::physical::Definitions::Memo,extras,Some(physical))
+    let choices=physical.plan();
+    lower_with_storage_mode(checked,true,true,true,!choices.packed_datatypes.is_empty(),!choices.memo_functions.is_empty(),extras,Some(physical))
 }
 /// Exact chunked scalar spines, selected explicitly by the standalone target.
 pub(crate) fn lower_typed_packed(
