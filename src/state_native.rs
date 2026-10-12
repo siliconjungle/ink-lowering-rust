@@ -77,6 +77,7 @@ pub(crate) fn word_expression(name: &str, args: &[String]) -> String {
 struct Emitter<'a> {
     p: &'a Program,
     execution: &'a ink_core::action_ir::Execution,
+    physical: Option<&'a ink_core::physical::CheckedPhysicalPlan>,
     serial: usize,
     /// Lexical ownership state for the action body being emitted.
     uses: Uses,
@@ -512,6 +513,7 @@ impl Emitter<'_> {
                     let closure_borrows_self = args
                         .iter()
                         .any(|arg| ownership::expr_mutates_state(self.p, arg));
+                    if self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_row(&id))) {
                     if let Expr::Method(r, m, margs) = base.as_ref() {
                         if let Expr::Var(root) = r.as_ref() {
                             if let Some(state) = self.p.states.iter().find(|s| &s.name == root) {
@@ -545,6 +547,7 @@ impl Emitter<'_> {
                                 }
                             }
                         }
+                    }
                     }
                     let borrowed_rows = by_ref.is_some();
                     let (s, t) = match by_ref {
@@ -740,6 +743,7 @@ impl Emitter<'_> {
     /// `let row = T.get(key).ok_or(error)?;` may hold a shared borrow of the
     /// stored row instead of cloning it, until `release_borrows` ends it.
     fn borrowed_row<'e>(&self, n: &str, e: &'e Expr) -> Option<(&'e str, &'e Expr, &'e Expr)> {
+        if !self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_row(&id))) {return None;}
         let Expr::Try(inner) = e else { return None };
         let Expr::Method(base, m, args) = inner.as_ref() else {
             return None;
@@ -873,7 +877,7 @@ pub fn emit_selected(selected: &ink_core::optimisation::CheckedSelection) -> Lan
 }
 pub fn emit_selected_with_table_storage(selected:&ink_core::optimisation::CheckedSelection,storage:TableStorage)->LangResult<String>{
     let layout=crate::snapshot::selected_layout(selected)?;
-    emit_with_layout(selected.module().program(),&layout,storage)
+    emit_with_layout(selected.module().program(),&layout,storage,None)
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
@@ -893,7 +897,7 @@ fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
 }
 pub fn emit(p: &Program) -> LangResult<String> {
     let layout = crate::snapshot::layout(p)?;
-    emit_with_layout(p, &layout, TableStorage::Ordered)
+    emit_with_layout(p, &layout, TableStorage::Ordered,None)
 }
 /// Operational implementations of the same fixed finite-map primitive.
 /// This choice grants no mathematical rewrite authority. The ordered baseline
@@ -902,15 +906,24 @@ pub fn emit(p: &Program) -> LangResult<String> {
 pub enum TableStorage { Ordered, IndexedSlots }
 pub fn emit_with_table_storage(p: &Program, storage: TableStorage) -> LangResult<String> {
     let layout=crate::snapshot::layout(p)?;
-    emit_with_layout(p,&layout,storage)
+    emit_with_layout(p,&layout,storage,None)
 }
-fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage) -> LangResult<String> {
+pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
+    let layout=crate::snapshot::layout(plan.original().program())?;
+    let storage=match plan.physical().map(|p|p.plan().tables).unwrap_or_default() {
+        ink_core::physical::Tables::Ordered=>TableStorage::Ordered,
+        ink_core::physical::Tables::IndexedSlots=>TableStorage::IndexedSlots,
+    };
+    emit_with_layout(plan.module().program(),&layout,storage,plan.physical())
+}
+fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>) -> LangResult<String> {
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
     let execution = action_ir.execution()?;
     let mut emitter = Emitter {
         p,
         execution: &execution,
+        physical,
         serial: 0,
         uses: Uses::default(),
         binders: BTreeMap::new(),
@@ -1217,7 +1230,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     }
     let mut parallel_tasks = Vec::new();
     for f in &p.functions {
-        let (body, tasks) = crate::pure_rust::body_with_tasks(p, f)?;
+        let (body, tasks) = crate::pure_rust::body_with_tasks_planned(p, f, physical)?;
         parallel_tasks.extend(tasks);
         let params = f
             .params

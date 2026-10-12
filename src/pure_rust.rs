@@ -8,6 +8,7 @@ fn references(e: &Expr, name: &str) -> bool {
 
 struct Emitter<'a> {
     p: &'a Program,
+    physical: Option<&'a ink_core::physical::CheckedPhysicalPlan>,
     next: usize,
     prefix: String,
     tasks: Vec<(String, String)>,
@@ -55,7 +56,8 @@ impl Emitter<'_> {
     }
     // Read-only traversals borrow a lexical list instead of cloning the entire
     // vector. Computed receivers still finish eagerly and are consumed once.
-    fn borrowed_place(e: &Expr, env: &Env) -> Option<String> {
+    fn borrowed_place(&self, e: &Expr, env: &Env) -> Option<String> {
+        if !self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_read(&id))) {return None;}
         let (root, fields) = ink_core::collection_facts::lexical_projection(e)?;
         let mut place = env.get(root)?.0.clone();
         for field in fields {
@@ -64,8 +66,8 @@ impl Emitter<'_> {
         Some(place)
     }
 
-    fn read_iterator(e: &Expr, value: &str, env: &Env) -> LangResult<String> {
-        Ok(if let Some(place) = Self::borrowed_place(e, env) {
+    fn read_iterator(&self, e: &Expr, value: &str, env: &Env) -> LangResult<String> {
+        Ok(if let Some(place) = self.borrowed_place(e, env) {
             // Lexical record projections have no evaluation side effects.
             // Borrow only for this traversal; subsequent source uses survive.
             format!("({place}).iter().cloned()")
@@ -225,7 +227,7 @@ impl Emitter<'_> {
                 }
                 let xt = self.infer(x, env, None)?;
                 if let Type::Named(owner) = &xt {
-                    if let Some(place) = Self::borrowed_place(e, env) {
+                    if let Some(place) = self.borrowed_place(e, env) {
                         let ft = &self.p.records[owner]
                             .iter()
                             .find(|(field, _)| field == n)
@@ -562,7 +564,7 @@ impl Emitter<'_> {
                     return Err("fold input".into());
                 };
                 let xs = self.expr(&args[0], env, None)?;
-                let iterator = Self::read_iterator(&args[0], &xs, env)?;
+                let iterator = self.read_iterator(&args[0], &xs, env)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 let (vs, body) = self.lambda(&args[2], env, &[*inner, t.clone()], &t)?;
                 let acc = self.fresh();
@@ -589,7 +591,7 @@ impl Emitter<'_> {
                         format!("({value}).len() as u64")
                     }
                 } else {
-                    let iterator = Self::read_iterator(&args[0], &xs, env)?;
+                    let iterator = self.read_iterator(&args[0], &xs, env)?;
                     let acc = self.fresh();
                     let item = self.fresh();
                     format!(
@@ -657,12 +659,12 @@ impl Emitter<'_> {
             Expr::Method(xs, n, args) if n == "concat" => {
                 // Borrow variable operands directly. Computed operands are evaluated
                 // once and their temporaries live through the two result copies.
-                let left = if let Some(place) = Self::borrowed_place(xs, env) {
+                let left = if let Some(place) = self.borrowed_place(xs, env) {
                     format!("&({place})")
                 } else {
                     format!("&({})", self.expr(xs, env, Some(&t))?)
                 };
-                let right = if let Some(place) = Self::borrowed_place(&args[0], env) {
+                let right = if let Some(place) = self.borrowed_place(&args[0], env) {
                     format!("&({place})")
                 } else {
                     format!("&({})", self.expr(&args[0], env, Some(&t))?)
@@ -680,7 +682,7 @@ impl Emitter<'_> {
                 };
                 let receiver = xs.as_ref();
                 let xs = self.expr(receiver, env, None)?;
-                let iterator = Self::read_iterator(receiver, &xs, env)?;
+                let iterator = self.read_iterator(receiver, &xs, env)?;
                 match n.as_str() {
                     "at_or" => {
                         let index = self.expr(&args[0], env, Some(&Type::U32))?;
@@ -751,7 +753,7 @@ impl Emitter<'_> {
                             return Err("zip output".into());
                         };
                         let ys = self.expr(&args[0], env, None)?;
-                        let right_iterator = Self::read_iterator(&args[0], &ys, env)?;
+                        let right_iterator = self.read_iterator(&args[0], &ys, env)?;
                         let (vs, body) = self.lambda(&args[1], env, &[*inner, *other], out)?;
                         let a = self.fresh();
                         let b = self.fresh();
@@ -805,7 +807,11 @@ impl Emitter<'_> {
 pub fn body(p: &Program, f: &Function) -> LangResult<String> {
     Ok(body_with_tasks(p, f)?.0)
 }
+#[cfg(test)]
 pub fn body_with_tasks(p: &Program, f: &Function) -> LangResult<(String, Vec<(String, String)>)> {
+    body_with_tasks_planned(p,f,None)
+}
+pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_core::physical::CheckedPhysicalPlan>) -> LangResult<(String, Vec<(String, String)>)> {
     let env = f
         .params
         .iter()
@@ -813,6 +819,7 @@ pub fn body_with_tasks(p: &Program, f: &Function) -> LangResult<(String, Vec<(St
         .collect();
     let mut emitter = Emitter {
         p,
+        physical,
         next: 0,
         prefix: f.name.clone(),
         tasks: Vec::new(),
@@ -849,6 +856,12 @@ fn joined(r:Outer)->List<Item>{return r.nested.first.concat(r.nested.first);}
 fn selected(r:Outer)->List<Item>{return r.nested.first;}
 "#).unwrap();
         check::check(&p).unwrap();
+        let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
+        let mut sites=std::collections::BTreeSet::new();
+        for f in &p.functions {let env=ink_core::check::params_env(&f.params).unwrap();ink_core::analysis::walk(&f.body,|e|if matches!(e,Expr::Var(_)|Expr::Field(..))&&ink_core::check::infer(e,&env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());});}
+        sites.insert(ink_core::registry::identity(&Expr::Field(Box::new(Expr::Var("x".into())),"key".into())).unwrap());
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
+
         let mut source = String::from(
             r#"
 #![allow(non_camel_case_types)]
@@ -869,7 +882,7 @@ impl Clone for l_Item{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed
             let f = p.functions.iter().find(|f| f.name == name).unwrap();
             source.push_str(&format!(
                 "fn {name}(l_r:&l_Outer)->{result}{{{}}}\n",
-                body(&p, f).unwrap()
+                body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0
             ));
         }
         source.push_str(r#"
@@ -915,6 +928,10 @@ let a=selected(&r);assert_eq!(a.len(),3);assert_eq!(COPIES.swap(0,Ordering::Rela
             fn contextual(a: List<u32>, b: List<u32>) -> List<u32> { return a.map(fn(x) => 0).concat(b); }
         "#).unwrap();
         check::check(&p).unwrap();
+        let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
+        let mut sites=vec![ink_core::registry::identity(&Expr::Var("a".into())).unwrap(),ink_core::registry::identity(&Expr::Var("b".into())).unwrap()];sites.sort();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
+
         let mut rust = String::from(
             r#"
 #![allow(non_camel_case_types)]
@@ -933,7 +950,7 @@ impl Clone for l_Item { fn clone(&self)->Self { COPIES.fetch_add(1,Ordering::Rel
             ("records", "l_Item"),
         ] {
             let f = p.functions.iter().find(|f| f.name == name).unwrap();
-            let emitted = body(&p, f).unwrap();
+            let emitted = body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0;
             assert!(!emitted.contains(".clone()"), "{emitted}");
             assert_eq!(emitted.matches("Vec::with_capacity").count(), 1);
             rust.push_str(&format!(
@@ -943,12 +960,12 @@ impl Clone for l_Item { fn clone(&self)->Self { COPIES.fetch_add(1,Ordering::Rel
         let f = p.functions.iter().find(|f| f.name == "computed").unwrap();
         rust.push_str(&format!(
             "fn computed(l_a:Vec<u32>,l_b:Vec<u32>,l_flag:bool)->Vec<u32>{{{}}}\n",
-            body(&p, f).unwrap()
+            body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0
         ));
         let f = p.functions.iter().find(|f| f.name == "contextual").unwrap();
         rust.push_str(&format!(
             "fn contextual(l_a:Vec<u32>,l_b:Vec<u32>)->Vec<u32>{{{}}}\n",
-            body(&p, f).unwrap()
+            body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0
         ));
         rust.push_str(r#"
 fn main() {

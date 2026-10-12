@@ -239,27 +239,34 @@ impl Emit<'_> {
 /// Emit one already selected representation as an ordinary compiled program.
 /// The private checker witness is consumed only by this compile-time function.
 pub fn lower(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, false, false, false)
+    lower_native(checked, false, false, false,None)
 }
 /// Explicit exact packed storage for scalar columns, lists and local owners.
 pub fn lower_packed(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, false, true, false)
+    lower_native(checked, false, true, false,None)
 }
 
 /// Standalone native host for the C lowering's type-specific borrowed ABI.
 /// C bodies are linked separately. This emits no interpreter or Ink dependency.
 pub fn lower_c_host(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, true, false, false)
+    lower_native(checked, true, false, false,None)
 }
 
 pub fn lower_memo(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, false, false, true)
+    lower_native(checked, false, false, true,None)
+}
+pub fn lower_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
+    let checked=plan.representation().ok_or("planned representation missing")?;
+    let physical=plan.physical();
+    let definitions=physical.map(|p|p.plan().definitions).unwrap_or_default();
+    lower_native(checked,false,definitions==ink_core::physical::Definitions::Packed,definitions==ink_core::physical::Definitions::Memo,physical)
 }
 fn lower_native(
     checked: &CheckedRepresentation,
     foreign: bool,
     packed: bool,
     memo: bool,
+    physical: Option<&ink_core::physical::CheckedPhysicalPlan>,
 ) -> LangResult<String> {
     let reachable = checked.definition().reachable_executable_declarations()?;
     let types = checked
@@ -289,7 +296,9 @@ fn lower_native(
             ))
         })
         .collect::<LangResult<BTreeMap<_, _>>>()?;
-    let packed_ids = if packed {
+    let packed_ids = if let Some(physical)=physical {
+        physical.plan().packed_datatypes.iter().cloned().collect()
+    } else if packed {
         checked
             .definition()
             .reachable_executable_declarations()?
@@ -317,11 +326,11 @@ fn lower_native(
     };
     let p = checked.module().program();
     let plan = checked.plan();
-    let (mut queries, observers) = ink_core::field_projection::host_observers(checked)?;
-    queries.extend(crate::representation_query::declarations(checked)?);
-    let transitions = crate::representation_transition::declarations(checked)?;
-    queries.extend(transitions.clone());
-    let emission = if foreign {
+    let (queries, observers) = ink_core::field_projection::host_observers(checked)?;
+    let transitions: BTreeMap<String,Declaration> = BTreeMap::new();
+    let emission = if let Some(physical)=physical {
+        crate::definition_native::lower_typed_planned(checked.definition(),&queries,physical)?
+    } else if foreign {
         crate::definition_native::lower_typed_shared_datatypes(checked.definition(), &queries)?
     } else if memo {
         crate::definition_native::lower_typed_memo(checked.definition(), &queries)?
@@ -345,7 +354,7 @@ fn lower_native(
     out.push_str("\nuse serde_json::{Value as Json,json};\nmod portable{\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
-    let layout = ink_core::snapshot::layout(p)?;
+    let layout = ink_core::snapshot::layout(checked.snapshot_module().program())?;
     writeln!(out,"fn snapshot_layout()->portable::Layout{{portable::Layout{{program:{:?},schema:{:?},roots:vec![",layout.program,layout.schema).unwrap();
     for (n, k, v) in &layout.roots {
         writeln!(
