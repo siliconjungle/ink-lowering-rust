@@ -555,7 +555,10 @@ impl Emitter<'_> {
                         Some(found) => found,
                         None => self.expr(base, env, None)?,
                     };
-                    if n == "fold" {
+                    if n == "concat" {
+                        let (right, _) = self.expr(&args[0], env, Some(&t))?;
+                        (format!("{{let mut left={s};let right={right};left.extend(right);left}}"), t)
+                    } else if n == "fold" {
                         let (a, b, tag_a, tag_b) = match &t {
                             T::Option(a) => (a.as_ref().clone(), T::Unit, "Some", "None"),
                             T::Result(a, b) => {
