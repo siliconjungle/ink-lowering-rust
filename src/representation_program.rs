@@ -412,7 +412,9 @@ fn lower_native(
         .collect::<Vec<_>>();
     out.push_str("// CALLER CONTRACT: arguments must have the declared types and canonical values.\n// No runtime type validation. Malformed input may panic, trap or corrupt state.\n");
     writeln!(out,"pub fn new()->Result<Self,String>{{let logical=D_{}::C0{};Ok(Self{{physical:f_{}(&logical),version:0,outbox:vec![],layout:snapshot_layout(),host:None}})}}",checked.projection().state,fields(&empty),plan.encode).unwrap();
-    writeln!(out,"pub fn restore(bytes:&[u8])->Result<Self,String>{{let layout=snapshot_layout();let saved=portable::decode(&layout,bytes,SnapshotLimits::default())?;let logical=logical_from_tables(&saved.tables)?;Ok(Self{{physical:f_{}(&logical),version:saved.version,outbox:saved.outbox,layout,host:None}})}}",plan.encode).unwrap();
+    writeln!(out,"pub fn restore(bytes:&[u8])->Result<Self,String>{{let layout=snapshot_layout();let saved=portable::decode(&layout,bytes,SnapshotLimits::default())?;let logical=logical_from_tables(&saved.tables)?;let mut state=Self{{physical:f_{}(&logical),version:saved.version,outbox:saved.outbox,layout,host:None}};",plan.encode).unwrap();
+    for guard in &p.contracts.invariant_checks{writeln!(out,"if state.invoke_json({guard:?},&json!([]))?[\"result\"]!=Json::Bool(true){{return Err(\"snapshot violates state invariant\".into());}}").unwrap();}
+    out.push_str("Ok(state)}\n");
     writeln!(out,"pub fn checkpoint(&self)->Result<Vec<u8>,String>{{let logical=f_{}({});portable::encode(&self.layout,&portable::Logical{{version:self.version,tables:logical_tables(&logical)?,outbox:self.outbox.clone()}},SnapshotLimits::default())}}",plan.decode,borrowed(&plan.physical_state,"self.physical")).unwrap();
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox_json(&self)->Json{Json::Array(self.outbox.iter().map(|e|json!({\"commit\":e.commit,\"position\":e.position,\"channel\":self.layout.events[e.channel].0,\"value\":e.value})).collect())}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){let n=self.outbox.iter().take_while(|e|(e.commit,e.position)<=(commit,position)).count();let removed=self.outbox.drain(..n);if let Some(host)=&mut self.host{host.removed.extend(removed.filter(|e|e.commit<=host.version));}}\n pub fn begin_transaction(&mut self)->Result<bool,String>{if self.host.is_some(){return Err(\"state transaction already in progress\".into())}self.host=Some(HostTransaction{physical:self.physical.clone(),version:self.version,removed:vec![]});Ok(true)}\n pub fn commit_transaction(&mut self){self.host=None;}\n pub fn rollback_transaction(&mut self){if let Some(host)=self.host.take(){self.physical=host.physical;self.version=host.version;self.outbox.retain(|e|e.commit<=host.version);let mut restored=host.removed;restored.append(&mut self.outbox);self.outbox=restored;}}\n");
     // Typed query entry points bypass JSON and the complete transaction envelope.
@@ -521,9 +523,13 @@ fn lower_native(
         };
         writeln!(out,"let(result,committed,version,events)=match &observed{{D_{observation}::C0({observed_fields})=>({owned_reply},*committed,*version,events),D_{observation}::C1(..)=>return Err(\"commit sequence exhausted\".into())}};let start=self.outbox.len();let staged=logical_events(events)?;if committed{{self.outbox.try_reserve(staged.len()).map_err(|_|\"outbox allocation failure\")?;for(position,(channel,value))in staged.into_iter().enumerate(){{self.outbox.push(Event{{commit:version,position:position as u64,channel,value}});}}}}self.physical=next;self.version=version;Ok(OutcomeView{{result,committed,version,events:&self.outbox[start..]}})}}").unwrap();
     }
-    out.push_str(
-        "pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{match name{\n",
-    );
+    out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{");
+    if !p.contracts.precondition_checks.is_empty(){
+        out.push_str("let guard=match name{");
+        for (name,guard) in &p.contracts.precondition_checks{if p.actions.iter().any(|a|&a.name==name){writeln!(out,"{name:?}=>Some({guard:?}),").unwrap();}}
+        out.push_str("_=>None};if let Some(guard)=guard{if self.invoke_json(guard,args)?[\"result\"]!=Json::Bool(true){return Err(\"contract precondition failed\".into());}}");
+    }
+    out.push_str("match name{\n");
     for source in &p.actions {
         let a = &plan.actions[&source.name];
         let observation = data(

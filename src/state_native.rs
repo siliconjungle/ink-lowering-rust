@@ -419,7 +419,7 @@ impl Emitter<'_> {
                         values.push(v)
                     }
                     let call = format!("self.{prefix}_{}({})", ident(n), values.join(","));
-                    let call = if is_change {
+                    let call = if is_change && matches!(result, T::Result(..)) {
                         format!("transaction::nested_change({call})?")
                     } else {
                         call
@@ -1177,6 +1177,9 @@ impl Wire for {id} {{
     }
     out.push_str("_=>return Err(\"unknown event channel\".into())};Ok(Event{commit:e.commit,position:e.position,data})}).collect::<Result<Vec<_>,String>>()?;");
 
+    for name in &p.contracts.invariant_checks {
+        writeln!(out, "if !state.action_{}(){{return Err(\"snapshot violates state invariant\".into());}}", ident(name)).unwrap();
+    }
     out.push_str("Ok(state)}\n");
 
     // A single typed write primitive per root owns its undo entries.
@@ -1292,13 +1295,20 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         emitter.reset_ownership(&a.params, &a.body);
         let body = emitter.block(&a.body, &mut a.params.iter().cloned().collect(), &a.result)?;
         emitter.clear_ownership();
-        writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}\npub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{self.clear_journal_keys();let mark=self.undo.len();let result=self.action_{id}({args});").unwrap();
+        writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}\npub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{").unwrap();
+        if let Some(guard)=p.contracts.precondition_checks.get(&a.name){
+            let copied=a.params.iter().map(|(n,_)|format!("{}.clone()",ident(n))).collect::<Vec<_>>().join(",");
+            writeln!(out,"if !self.action_{}({copied}){{return Err(\"contract precondition failed\".into());}}",ident(guard)).unwrap();
+        }
+        writeln!(out,"self.clear_journal_keys();let mark=self.undo.len();let result=self.action_{id}({args});").unwrap();
         if a.kind == ActionKind::Query {
             out.push_str(
                 "Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})}\n",
             );
         } else {
-            out.push_str("let version=match transaction::decide(self.version,result.is_ok()){transaction::Decision::Rollback=>{self.rollback_to(mark);return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback_to(mark);return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;if self.host.is_none(){self.undo.clear();}self.clear_journal_keys();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
+            out.push_str("let version=match transaction::decide(self.version,");
+            out.push_str(if matches!(a.result, Type::Result(..)) { "result.is_ok()" } else { "true" });
+            out.push_str("){transaction::Decision::Rollback=>{self.rollback_to(mark);return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback_to(mark);return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;if self.host.is_none(){self.undo.clear();}self.clear_journal_keys();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }
@@ -1327,6 +1337,9 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
             )
             .unwrap();
             argv.push(format!("a{i}"));
+        }
+        if let Some(guard)=p.contracts.precondition_checks.get(&f.name){
+            writeln!(out,"if !self.function_{}({}){{return Err(\"contract precondition failed\".into());}}",ident(guard),argv.iter().map(|n|format!("{n}.clone()")).collect::<Vec<_>>().join(",")).unwrap();
         }
         writeln!(
             out,
