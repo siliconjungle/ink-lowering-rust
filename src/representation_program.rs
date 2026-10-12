@@ -97,11 +97,21 @@ impl Emit<'_> {
                 }
                 Type::Named(n) if p.records.contains_key(n) => {
                     let fs=&p.records[n];
-                    let args=fs.iter().map(|(name,t)| {
+                    let reads=fs.iter().map(|(name,t)| {
                         let read=self.codec(t,"read",&format!("xs.get({name:?}).unwrap()",),"d+1")?;
-                        Ok(stored(self.sort(t)?, &read))
+                        Ok(read)
                     }).collect::<LangResult<Vec<_>>>()?;
-                    format!("{{let xs=v.as_object().unwrap();D_{}::C0{}}}",data(sort)?,fields(&args))
+                    if let Some(record)=self.checked.projection().recursive_records.get(n) {
+                        let id=&record.datatype;let mut tail=format!("D_{id}::C0");
+                        for ((t,read),field) in fs.iter().map(|(_,t)|t).zip(reads).zip(&record.fields).rev() {
+                            let encoded=field.encode.as_ref().map(|f|format!("f_{f}({})",borrowed(self.sort(t).unwrap(),&read))).unwrap_or(read);
+                            tail=format!("D_{id}::C3(std::sync::Arc::new({encoded}),std::sync::Arc::new({tail}))");
+                        }
+                        format!("{{let xs=v.as_object().unwrap();D_{id}::C4({}u64,std::sync::Arc::new({tail}))}}",record.tag)
+                    } else {
+                        let args=fs.iter().map(|(_,t)|t).zip(reads).map(|(t,x)|Ok(stored(self.sort(t)?,&x))).collect::<LangResult<Vec<_>>>()?;
+                        format!("{{let xs=v.as_object().unwrap();D_{}::C0{}}}",data(sort)?,fields(&args))
+                    }
                 }
                 Type::Option(a) => {
                     let id=data(sort)?;
@@ -148,9 +158,20 @@ impl Emit<'_> {
                 }
                 Type::Named(n) if p.records.contains_key(n) => {
                     let fs=&p.records[n];
-                    let bs=(0..fs.len()).map(|i|format!("b{i}")).collect::<Vec<_>>();
-                    let pairs=fs.iter().enumerate().map(|(i,(name,t))|Ok(format!("{:?}:{}",name,self.codec(t,"write",&format!("&b{i}"),"d+1")?))).collect::<LangResult<Vec<_>>>()?;
-                    format!("{{let D_{}::C0{}=v;json!({{{}}})}}",data(sort)?,fields(&bs),pairs.join(","))
+                    if let Some(record)=self.checked.projection().recursive_records.get(n) {
+                        let id=&record.datatype;let mut prefix=format!("let D_{id}::C4(tag,fields)=v else{{return Err(\"recursive record tag\".into())}};if *tag!={}u64{{return Err(\"recursive record tag\".into())}}let mut cursor=fields.as_ref();",record.tag);
+                        for i in 0..fs.len(){write!(prefix,"let D_{id}::C3(field{i},tail)=cursor else{{return Err(\"recursive record fields\".into())}};cursor=tail.as_ref();").unwrap();}
+                        write!(prefix,"if !matches!(cursor,D_{id}::C0){{return Err(\"recursive record field tail\".into())}}").unwrap();
+                        let pairs=fs.iter().enumerate().map(|(i,(name,t))| {
+                            let x=record.fields[i].decode.as_ref().map(|f|format!("&f_{f}(field{i}.as_ref())")).unwrap_or_else(||format!("field{i}.as_ref()"));
+                            Ok(format!("{name:?}:{}",self.codec(t,"write",&x,"d+1")?))
+                        }).collect::<LangResult<Vec<_>>>()?;
+                        format!("{{{prefix}json!({{{}}})}}",pairs.join(","))
+                    } else {
+                        let bs=(0..fs.len()).map(|i|format!("b{i}")).collect::<Vec<_>>();
+                        let pairs=fs.iter().enumerate().map(|(i,(name,t))|Ok(format!("{:?}:{}",name,self.codec(t,"write",&format!("&b{i}"),"d+1")?))).collect::<LangResult<Vec<_>>>()?;
+                        format!("{{let D_{}::C0{}=v;json!({{{}}})}}",data(sort)?,fields(&bs),pairs.join(","))
+                    }
                 }
                 Type::Option(a) => format!("match v{{D_{}::C0=>json!({{\"None\":null}}),D_{}::C1(x)=>json!({{\"Some\":{}}})}}",data(sort)?,data(sort)?,self.codec(a,"write","x","d+1")?),
                 Type::Result(a,b) => format!("match v{{D_{}::C0(x)=>json!({{\"Ok\":{}}}),D_{}::C1(x)=>json!({{\"Err\":{}}})}}",data(sort)?,self.codec(a,"write","x","d+1")?,data(sort)?,self.codec(b,"write","x","d+1")?),
@@ -239,29 +260,37 @@ impl Emit<'_> {
 /// Emit one already selected representation as an ordinary compiled program.
 /// The private checker witness is consumed only by this compile-time function.
 pub fn lower(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, false, false, false)
+    lower_native(checked, false, false, false,None)
 }
 /// Explicit exact packed storage for scalar columns, lists and local owners.
 pub fn lower_packed(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, false, true, false)
+    lower_native(checked, false, true, false,None)
 }
 
 /// Standalone native host for the C lowering's type-specific borrowed ABI.
 /// C bodies are linked separately. This emits no interpreter or Ink dependency.
 pub fn lower_c_host(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, true, false, false)
+    lower_native(checked, true, false, false,None)
 }
 
 pub fn lower_memo(checked: &CheckedRepresentation) -> LangResult<String> {
-    lower_native(checked, false, false, true)
+    lower_native(checked, false, false, true,None)
+}
+pub fn lower_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
+    let checked=plan.representation().ok_or("planned representation missing")?;
+    let physical=plan.physical();
+    let definitions=physical.map(|p|p.plan().definitions).unwrap_or_default();
+    lower_native(checked,false,definitions==ink_core::physical::Definitions::Packed,definitions==ink_core::physical::Definitions::Memo,physical)
 }
 fn lower_native(
     checked: &CheckedRepresentation,
     foreign: bool,
     packed: bool,
     memo: bool,
+    physical: Option<&ink_core::physical::CheckedPhysicalPlan>,
 ) -> LangResult<String> {
-    let reachable = checked.definition().reachable_executable_declarations()?;
+    let mut reachable = checked.definition().reachable_executable_declarations()?;
+    reachable.extend(checked.projection().codec_declarations()?);
     let types = checked
         .projection()
         .types
@@ -289,7 +318,9 @@ fn lower_native(
             ))
         })
         .collect::<LangResult<BTreeMap<_, _>>>()?;
-    let packed_ids = if packed {
+    let packed_ids = if let Some(physical)=physical {
+        physical.plan().packed_datatypes.iter().cloned().collect()
+    } else if packed {
         checked
             .definition()
             .reachable_executable_declarations()?
@@ -318,10 +349,11 @@ fn lower_native(
     let p = checked.module().program();
     let plan = checked.plan();
     let (mut queries, observers) = ink_core::field_projection::host_observers(checked)?;
-    queries.extend(crate::representation_query::declarations(checked)?);
-    let transitions = crate::representation_transition::declarations(checked)?;
-    queries.extend(transitions.clone());
-    let emission = if foreign {
+    queries.extend(checked.projection().codec_declarations()?);
+    let transitions: BTreeMap<String,Declaration> = BTreeMap::new();
+    let emission = if let Some(physical)=physical {
+        crate::definition_native::lower_typed_planned(checked.definition(),&queries,physical)?
+    } else if foreign {
         crate::definition_native::lower_typed_shared_datatypes(checked.definition(), &queries)?
     } else if memo {
         crate::definition_native::lower_typed_memo(checked.definition(), &queries)?
@@ -345,7 +377,7 @@ fn lower_native(
     out.push_str("\nuse serde_json::{Value as Json,json};\nmod portable{\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
-    let layout = ink_core::snapshot::layout(p)?;
+    let layout = ink_core::snapshot::layout(checked.snapshot_module().program())?;
     writeln!(out,"fn snapshot_layout()->portable::Layout{{portable::Layout{{program:{:?},schema:{:?},roots:vec![",layout.program,layout.schema).unwrap();
     for (n, k, v) in &layout.roots {
         writeln!(

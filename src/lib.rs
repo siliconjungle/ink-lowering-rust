@@ -10,15 +10,11 @@ pub mod representation_program;
 
 mod representation_ffi;
 
-/// Compile-time read-only observation projection.
-pub mod representation_query;
 
 
 #[cfg(test)]
 mod packed_spine_tests;
 
-/// Compile-time elimination of private observations with independent next state.
-pub mod representation_transition;
 
 
 #[cfg(test)]

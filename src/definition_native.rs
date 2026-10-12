@@ -69,6 +69,7 @@ struct Lower<'a> {
     typed_only: bool,
     packed_spines: bool,
     identity_memo: bool,
+    physical: Option<&'a ink_core::physical::CheckedPhysicalPlan>,
     linear_step: bool,
     recursive_sites: usize,
     recursive_site: usize,
@@ -125,7 +126,7 @@ impl Lower<'_> {
         }
     }
     fn packed_cell(&self, id: &str) -> LangResult<Option<Sort>> {
-        if !self.packed_spines {
+        if !self.packed_spines || self.physical.is_some_and(|p| !p.plan().packed_datatypes.iter().any(|x|x==id)) {
             return Ok(None);
         }
         let cs = self.constructors(id)?;
@@ -602,8 +603,7 @@ impl Lower<'_> {
         let direct = format!("d_{id}({})", values.join(","));
         if self.identity_memo
             && id != current
-            && recursive.is_some()
-            && contains_self_call(&body)
+            && self.physical.map_or(recursive.is_some() && contains_self_call(&body),|p|p.plan().memo_functions.iter().any(|x|x==id))
             && matches!(result, Sort::U64 | Sort::Bool)
             && expressions.len() <= 5
         {
@@ -841,18 +841,21 @@ pub(crate) fn lower_typed_shared_projected(
 ) -> LangResult<Emission> {
     lower_with_storage(checked, true, true, true, extras)
 }
+pub(crate) fn lower_typed_planned(checked: &ink_core::definition::CheckedDefinition, extras: &BTreeMap<String, Declaration>, physical: &ink_core::physical::CheckedPhysicalPlan) -> LangResult<Emission> {
+    lower_with_storage_mode(checked,true,true,true,physical.plan().definitions==ink_core::physical::Definitions::Packed,physical.plan().definitions==ink_core::physical::Definitions::Memo,extras,Some(physical))
+}
 /// Exact chunked scalar spines, selected explicitly by the standalone target.
 pub(crate) fn lower_typed_packed(
     checked: &ink_core::definition::CheckedDefinition,
     extras: &BTreeMap<String, Declaration>,
 ) -> LangResult<Emission> {
-    lower_with_storage_mode(checked, true, true, true, true, false, extras)
+    lower_with_storage_mode(checked, true, true, true, true, false, extras, None)
 }
 pub(crate) fn lower_typed_memo(
     checked: &ink_core::definition::CheckedDefinition,
     extras: &BTreeMap<String, Declaration>,
 ) -> LangResult<Emission> {
-    lower_with_storage_mode(checked, true, true, true, false, true, extras)
+    lower_with_storage_mode(checked, true, true, true, false, true, extras, None)
 }
 /// Typed immutable storage for literal foreign functions. The generated C ABI
 /// borrows these objects directly; it never serialises physical state.
@@ -869,7 +872,7 @@ fn lower_with_storage(
     functions: bool,
     extras: &BTreeMap<String, Declaration>,
 ) -> LangResult<Emission> {
-    lower_with_storage_mode(checked, shared, typed_only, functions, false, false, extras)
+    lower_with_storage_mode(checked, shared, typed_only, functions, false, false, extras, None)
 }
 fn lower_with_storage_mode(
     checked: &ink_core::definition::CheckedDefinition,
@@ -879,6 +882,7 @@ fn lower_with_storage_mode(
     packed_spines: bool,
     identity_memo: bool,
     extras: &BTreeMap<String, Declaration>,
+    physical: Option<&ink_core::physical::CheckedPhysicalPlan>,
 ) -> LangResult<Emission> {
     if packed_spines && (!shared || !typed_only) {
         return Err("packed spines require typed immutable storage".into());
@@ -887,7 +891,7 @@ fn lower_with_storage_mode(
     let exports = checked
         .exports()
         .iter()
-        .chain(extras.keys())
+        .chain(extras.iter().filter_map(|(id,d)| matches!(d,Declaration::Function{..}).then_some(id)))
         .cloned()
         .collect::<Vec<_>>();
     let choices = checked.choices();
@@ -923,6 +927,7 @@ fn lower_with_storage_mode(
         typed_only,
         packed_spines,
         identity_memo,
+        physical,
         linear_step: false,
         recursive_sites: 0,
         recursive_site: 0,
@@ -1090,7 +1095,7 @@ fn lower_with_storage_mode(
         executable_closure: selected,
         selections: exports.iter().map(|id| (id.clone(), choices.get(id).unwrap_or(id).clone())).collect(),
         selection_package_sha256: checked.selection_sha256().map(str::to_owned),
-        scope: format!("checked first-order definitions with compiler demand projections; trusted Rust lowering, codecs and Rust/LLVM backend; {} storage; {}; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound",if packed_spines{"immutable scalar and shared-data chunks; checked u32 narrowing with exact u64 promotion; Boolean bitsets"}else if shared{"immutable shared Arc"}else{"boxed"},if typed_only{"typed entry points without a ground dispatcher"}else{"ground transport dispatcher"}),
+        scope: format!("checked first-order definitions and admitted observer choices; trusted Rust lowering, codecs and Rust/LLVM backend; {} storage; {}; no stateful source admission, physical storage refinement, host-failure preservation or execution-cost bound",if packed_spines{"immutable scalar and shared-data chunks; checked u32 narrowing with exact u64 promotion; Boolean bitsets"}else if shared{"immutable shared Arc"}else{"boxed"},if typed_only{"typed entry points without a ground dispatcher"}else{"ground transport dispatcher"}),
     };
     Ok(Emission { source, receipt })
 }
