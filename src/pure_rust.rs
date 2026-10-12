@@ -766,7 +766,7 @@ impl Emitter<'_> {
                         let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
                         if n=="map"&&self.infer(xs_receiver(e),env,None)?==t&&crate::columns::names(&output).is_some()&&self.borrowed_place(xs_receiver(e),env).is_none()&&!self.reservation.as_ref().is_some_and(|(site,_)|ink_core::registry::identity(e).is_ok_and(|id|id==*site)){
                             let mask=self.column_mask(e,&output);format!("({xs}).map_rows(|{}|{{{body}}},{mask})",vs[0])
-                        }else n == "filter" {
+                        }else if n == "filter" {
                             self.collect(e,format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}})",vs[0]),&collection)?
                         } else if n == "map_indexed" {
                             self.collect(e,format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}})",vs[1],vs[0]),&collection)?
