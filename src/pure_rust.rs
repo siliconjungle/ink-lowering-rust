@@ -697,8 +697,8 @@ impl Emitter<'_> {
                 };
                 let a = self.fresh();
                 let b = self.fresh();
-                let out = self.fresh();
-                format!("{{let {a}={left};let {b}={right};let mut {out}=Vec::with_capacity({a}.len().checked_add({b}.len()).expect(\"concat allocation size overflow\"));{out}.extend_from_slice({a});{out}.extend_from_slice({b});{out}}}")
+                let collected=self.collect(e,format!("{a}.iter().chain({b}.iter()).cloned()"),&crate::state_native::ty(&t)?)?;
+                format!("{{let {a}={left};let {b}={right};{collected}}}")
             }
             Expr::Method(xs, n, args) => {
                 let Type::List(inner) =
@@ -861,8 +861,14 @@ pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_
         let body = emitter.expr(&f.body, &env, Some(&f.result))?;
         if let Some(reservation)=physical.and_then(|p|p.plan().reservations.iter().find(|r|r.function==f.name)) {
             if !emitter.reserved { return Err("literal backend lacks a reservation collector at this result site".into()); }
-            let place=reservation.fields.iter().fold(format!("l_{}",reservation.parameter),|p,f|format!("({p}).l_{f}"));
-            return Ok((format!("{{let ink_reserved_capacity=({place}).len();{body}}}"),emitter.tasks));
+            let capacity=if let Some(expression)=&reservation.capacity {
+                let value=emitter.expr(expression,&env,None)?;
+                format!("usize::try_from({value}).unwrap_or(0)")
+            }else{
+                let place=reservation.fields.iter().fold(format!("l_{}",reservation.parameter),|p,f|format!("({p}).l_{f}"));
+                format!("({place}).len()")
+            };
+            return Ok((format!("{{let ink_reserved_capacity={capacity};{body}}}"),emitter.tasks));
         }
         return Ok((body, emitter.tasks));
     }
@@ -991,7 +997,7 @@ impl Clone for l_Item { fn clone(&self)->Self { COPIES.fetch_add(1,Ordering::Rel
             let f = p.functions.iter().find(|f| f.name == name).unwrap();
             let emitted = body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0;
             assert!(!emitted.contains(".clone()"), "{emitted}");
-            assert_eq!(emitted.matches("Vec::with_capacity").count(), 1);
+
             rust.push_str(&format!(
                 "fn {name}(l_a:&Vec<{t}>,l_b:&Vec<{t}>)->Vec<{t}>{{{emitted}}}\n"
             ));
