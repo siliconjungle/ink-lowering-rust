@@ -9,6 +9,7 @@ fn references(e: &Expr, name: &str) -> bool {
 struct Emitter<'a> {
     p: &'a Program,
     physical: Option<&'a ink_core::physical::CheckedPhysicalPlan>,
+    last_uses: ink_core::last_use::LastUses,
     next: usize,
     prefix: String,
     tasks: Vec<(String, String)>,
@@ -168,7 +169,7 @@ impl Emitter<'_> {
             Expr::Var(n) if n == "None" => "None".into(),
             Expr::Var(n) => {
                 let v = &env.get(n).ok_or("missing binding")?.0;
-                if ink_core::local_collections::owned(&t, self.p) {
+                if ink_core::local_collections::owned(&t, self.p) || self.last_uses.contains(e) {
                     v.clone()
                 } else {
                     format!("{v}.clone()")
@@ -830,6 +831,7 @@ pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_
     let mut emitter = Emitter {
         p,
         physical,
+        last_uses: ink_core::last_use::analyse(&f.body, f.params.iter().map(|(n, _)| n.as_str())),
         next: 0,
         prefix: f.name.clone(),
         tasks: Vec::new(),
