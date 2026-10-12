@@ -28,6 +28,8 @@ pub fn schema_code(s: &Schema) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        Schema::Bind(n,t)=>format!("portable::Schema::Bind({n:?}.into(),Box::new({}))",schema_code(t)),
+        Schema::Ref(n)=>format!("portable::Schema::Ref({n:?}.into())"),
         Schema::Enum(v) => format!(
             "portable::Schema::Enum(vec![{}])",
             v.iter()
