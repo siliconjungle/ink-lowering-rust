@@ -125,7 +125,7 @@ impl Lower<'_> {
             _ => Err("definition is not a datatype".into()),
         }
     }
-    fn packed_cell(&self, id: &str) -> LangResult<Option<Sort>> {
+    fn packed_cell(&self, id: &str) -> LangResult<Option<Vec<Sort>>> {
         if !self.packed_spines || self.physical.is_some_and(|p| !p.plan().packed_datatypes.iter().any(|x|x==id)) {
             return Ok(None);
         }
@@ -133,11 +133,11 @@ impl Lower<'_> {
         Ok(
             if cs.len() == 2
                 && cs[0].fields.is_empty()
-                && cs[1].fields.len() == 2
-                && cs[1].fields[1] == Sort::SelfType
-                && matches!(cs[1].fields[0], Sort::Bool | Sort::U64 | Sort::Data(_))
+                && (2..=17).contains(&cs[1].fields.len())
+                && cs[1].fields.last() == Some(&Sort::SelfType)
+                && cs[1].fields[..cs[1].fields.len()-1].iter().all(|s|matches!(s,Sort::Bool|Sort::U64|Sort::Data(_)))
             {
-                Some(cs[1].fields[0].clone())
+                Some(cs[1].fields[..cs[1].fields.len()-1].to_vec())
             } else {
                 None
             },
@@ -151,6 +151,9 @@ impl Lower<'_> {
             t
         })
     }
+    fn packed_item_type(&self,id:&str,fields:&[Sort])->LangResult<String> {
+        if fields.len()==1 {self.packed_cell_type(&fields[0])} else {Ok(format!("PackedItem_{id}"))}
+    }
     fn is_packed(&self, sort: &Sort) -> LangResult<bool> {
         if let Sort::Data(id) = sort {
             Ok(self.packed_cell(id)?.is_some())
@@ -163,7 +166,7 @@ impl Lower<'_> {
             if let Some(cell) = self.packed_cell(id)? {
                 return Ok(format!(
                     "PackedView<'_,PackedTag_{id},{}>",
-                    self.packed_cell_type(&cell)?
+                    self.packed_item_type(id,&cell)?
                 ));
             }
         }
@@ -384,29 +387,27 @@ impl Lower<'_> {
                 constructor,
                 arguments,
             } => {
-                if *constructor == 1 && self.packed_cell(datatype)?.is_some() {
-                    let head = self.expression(&arguments[0], env, current, depth + 1)?;
-                    let tail = self.expression(&arguments[1], env, current, depth + 1)?;
-                    return Ok(Expression {
-                        code: format!(
-                            "({}).prepend({})",
-                            tail.owned(),
-                            if matches!(head.sort, Sort::Data(_)) {
-                                if let Some(owner) = &head.shared_owner {
-                                    owner.clone()
-                                } else {
-                                    format!("std::sync::Arc::new({})", head.owned())
-                                }
-                            } else {
-                                head.owned()
-                            }
-                        ),
+                if *constructor==1 {
+                    if let Some(fields)=self.packed_cell(datatype)? {
+                        let mut values=Vec::new();
+                        for argument in &arguments[..fields.len()] {
+                            let head=self.expression(argument,env,current,depth+1)?;
+                            values.push(if matches!(head.sort,Sort::Data(_)) {
+                                head.shared_owner.clone().unwrap_or_else(||format!("std::sync::Arc::new({})",head.owned()))
+                            }else{head.owned()});
+                        }
+                        let cell=if fields.len()==1 {values.remove(0)}else{
+                            format!("PackedItem_{datatype}{{{}}}",values.iter().enumerate().map(|(i,v)|format!("c{i}:{v}")).collect::<Vec<_>>().join(","))
+                        };
+                        let tail=self.expression(&arguments[fields.len()],env,current,depth+1)?;
+                        return Ok(Expression{code:format!("({}).prepend({cell})",tail.owned()),
                         sort: Sort::Data(datatype.clone()),
                         borrowed: false,
                         packed_view: false,
                         shared_owner: None,
                         shared_argument: None,
-                    });
+                        });
+                    }
                 }
                 let cs = self.constructors(datatype)?;
                 let c = cs.get(*constructor).ok_or("invalid lowered constructor")?;
@@ -475,8 +476,8 @@ impl Lower<'_> {
                 for (i, (branch, constructor)) in branches.iter().zip(cs).enumerate() {
                     let mut local = env.clone();
                     let mut fields = Vec::new();
-                    for (field_index, (name, s)) in
-                        branch.bindings.iter().zip(constructor.fields).enumerate()
+                    for (name, s) in
+                        branch.bindings.iter().zip(constructor.fields)
                     {
                         let binder = self.fresh();
                         let sort = field_sort(&s, id);
@@ -484,7 +485,7 @@ impl Lower<'_> {
                         local.insert(
                             name.clone(),
                             Expression {
-                                code: if packed && data && field_index == 1 {binder.clone()}
+                                code: if packed && data && s == Sort::SelfType {binder.clone()}
                                 else if packed && data {format!("{binder}.as_ref()")}
                                 else if packed {binder.clone()}
                                 else if data {if detachable && s==Sort::SelfType{format!("{binder}.as_deref().expect(\"live recursive edge\")")}else{format!("{binder}.as_ref()")}
@@ -493,10 +494,10 @@ impl Lower<'_> {
                                 },
                                 sort,
                                 borrowed: data,
-                                packed_view: packed && data && field_index == 1,
+                                packed_view: packed && data && s == Sort::SelfType,
                                 shared_owner: if data
                                     && self.shared
-                                    && (!packed || field_index == 0)
+                                    && (!packed || s != Sort::SelfType)
                                 {
                                     Some(format!("std::sync::Arc::clone({})",if packed {format!("&{binder}")} else if detachable && s==Sort::SelfType {format!("{binder}.as_ref().expect(\"live recursive edge\")")}else{binder.clone()}))
                                 } else {
@@ -518,7 +519,9 @@ impl Lower<'_> {
                             if i == 0 {
                                 "None".into()
                             } else {
-                                format!("Some(({}))", fields.join(","))
+                                if fields.len()==2 {format!("Some(({}))",fields.join(","))}else{
+                                    format!("Some((PackedItem_{id}{{{}}},{}))",fields[..fields.len()-1].iter().enumerate().map(|(i,v)|format!("c{i}:{v}")).collect::<Vec<_>>().join(","),fields.last().unwrap())
+                                }
                             },
                             b.owned()
                         )
@@ -647,8 +650,20 @@ impl Lower<'_> {
         Ok((direct, result))
     }
     fn datatype(&self, id: &str, cs: &[Constructor]) -> LangResult<String> {
-        if let Some(cell) = self.packed_cell(id)? {
-            return Ok(format!("#[derive(Debug)]pub struct PackedTag_{id};\npub type D_{id}=PackedSpine<PackedTag_{id},{}>;\n",self.packed_cell_type(&cell)?));
+        if let Some(cell)=self.packed_cell(id)? {
+            let mut out=String::new();
+            if cell.len()>1 {
+                let types=cell.iter().map(|s|self.packed_cell_type(s)).collect::<LangResult<Vec<_>>>()?;
+                let fields=types.iter().enumerate().map(|(i,t)|format!("c{i}:{t}")).collect::<Vec<_>>().join(",");
+                let mut blocks="()".to_string();let mut empty="()".to_string();
+                for t in types.iter().rev(){blocks=format!("(<{t} as PackedCell>::Block,{blocks})");empty=format!("(<{t} as PackedCell>::empty(),{empty})");}
+                let at=types.iter().enumerate().map(|(i,t)|format!("c{i}:<{t} as PackedCell>::at(&block.{}0,index)","1.".repeat(i))).collect::<Vec<_>>().join(",");
+                let truncate=types.iter().enumerate().map(|(i,t)|format!("<{t} as PackedCell>::truncate(&mut block.{}0,length);","1.".repeat(i))).collect::<String>();
+                let push=types.iter().enumerate().map(|(i,t)|format!("<{t} as PackedCell>::push(&mut block.{}0,index,value.c{i});","1.".repeat(i))).collect::<String>();
+                let capacity=format!("{{let mut capacity=usize::MAX;{}capacity}}",types.iter().map(|t|format!("if capacity > <{t} as PackedCell>::CAPACITY {{capacity=<{t} as PackedCell>::CAPACITY;}}")).collect::<String>());
+                out.push_str(&format!("#[derive(Clone,Debug,PartialEq,Eq)]pub struct PackedItem_{id}{{{fields}}}\nimpl PackedCell for PackedItem_{id}{{type Block={blocks};const CAPACITY:usize={capacity};fn empty()->Self::Block{{{empty}}}fn at(block:&Self::Block,index:usize)->Self{{Self{{{at}}}}}fn truncate(block:&mut Self::Block,length:usize){{{truncate}}}fn push(block:&mut Self::Block,index:usize,value:Self){{{push}}}}}\n"));
+            }
+            out.push_str(&format!("#[derive(Debug)]pub struct PackedTag_{id};\npub type D_{id}=PackedSpine<PackedTag_{id},{}>;\n",self.packed_item_type(id,&cell)?));return Ok(out);
         }
         let detachable = self.typed_only && detachable_spine(cs);
         let mut variants = Vec::new();
