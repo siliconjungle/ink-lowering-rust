@@ -13,8 +13,17 @@ struct Emitter<'a> {
     next: usize,
     prefix: String,
     tasks: Vec<(String, String)>,
+    reservation: Option<(String,String)>,
+    reserved: bool,
 }
 impl Emitter<'_> {
+    fn collect(&mut self, e: &Expr, iterator: String) -> LangResult<String> {
+        if self.reservation.as_ref().is_some_and(|(site,_)|ink_core::registry::identity(e).is_ok_and(|id|id==*site)) {
+            self.reserved=true;
+            let capacity=&self.reservation.as_ref().unwrap().1;
+            Ok(format!("{{let mut ink_reserved=Vec::with_capacity({capacity});ink_reserved.extend({iterator});ink_reserved}}"))
+        } else { Ok(format!("({iterator}).collect::<Vec<_>>()")) }
+    }
     fn fresh(&mut self) -> String {
         let n = format!("ink_local_{}", self.next);
         self.next += 1;
@@ -749,11 +758,11 @@ impl Emitter<'_> {
                         };
                         let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
                         if n == "filter" {
-                            format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}}).collect::<Vec<_>>()",vs[0])
+                            self.collect(e,format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}})",vs[0]))?
                         } else if n == "map_indexed" {
-                            format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}}).collect::<Vec<_>>()",vs[1],vs[0])
+                            self.collect(e,format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}})",vs[1],vs[0]))?
                         } else {
-                            format!("({iterator}).map(|{}|{body}).collect::<Vec<_>>()", vs[0])
+                            self.collect(e,format!("({iterator}).map(|{}|{body})", vs[0]))?
                         }
                     }
                     "zip" => {
@@ -768,7 +777,7 @@ impl Emitter<'_> {
                         let (vs, body) = self.lambda(&args[1], env, &[*inner, *other], out)?;
                         let a = self.fresh();
                         let b = self.fresh();
-                        format!("{{let {a}={iterator};let {b}={right_iterator};{a}.zip({b}).map(|({},{})|{body}).collect::<Vec<_>>()}}",vs[0],vs[1])
+                        format!("{{let {a}={iterator};let {b}={right_iterator};{}}}",self.collect(e,format!("{a}.zip({b}).map(|({},{})|{body})",vs[0],vs[1]))?)
                     }
                     _ => return Err(format!("unsupported pure method {n}")),
                 }
@@ -835,11 +844,19 @@ pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_
         next: 0,
         prefix: f.name.clone(),
         tasks: Vec::new(),
+        reservation: physical.and_then(|p|p.plan().reservations.iter().find(|r|r.function==f.name)).map(|_|Ok::<_,String>((ink_core::registry::identity(&f.body)?,"ink_reserved_capacity".into()))).transpose()?,
+        reserved: false,
     };
     if !ink_core::recursion::recursive(f) {
         let body = emitter.expr(&f.body, &env, Some(&f.result))?;
+        if let Some(reservation)=physical.and_then(|p|p.plan().reservations.iter().find(|r|r.function==f.name)) {
+            if !emitter.reserved { return Err("literal backend lacks a reservation collector at this result site".into()); }
+            let place=reservation.fields.iter().fold(format!("l_{}",reservation.parameter),|p,f|format!("({p}).l_{f}"));
+            return Ok((format!("{{let ink_reserved_capacity=({place}).len();{body}}}"),emitter.tasks));
+        }
         return Ok((body, emitter.tasks));
     }
+    if emitter.reservation.is_some() { return Err("recursive reservation collector unsupported".into()); }
     let binds = f
         .params
         .iter()
@@ -872,7 +889,7 @@ fn selected(r:Outer)->List<Item>{return r.nested.first;}
         let mut sites=std::collections::BTreeSet::new();
         for f in &p.functions {let env=ink_core::check::params_env(&f.params).unwrap();ink_core::analysis::walk(&f.body,|e|if matches!(e,Expr::Var(_)|Expr::Field(..))&&ink_core::check::infer(e,&env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());});}
         sites.insert(ink_core::registry::identity(&Expr::Field(Box::new(Expr::Var("x".into())),"key".into())).unwrap());
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![]}).unwrap();
 
         let mut source = String::from(
             r#"
@@ -942,7 +959,7 @@ let a=selected(&r);assert_eq!(a.len(),3);assert_eq!(COPIES.swap(0,Ordering::Rela
         check::check(&p).unwrap();
         let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
         let mut sites=vec![ink_core::registry::identity(&Expr::Var("a".into())).unwrap(),ink_core::registry::identity(&Expr::Var("b".into())).unwrap()];sites.sort();
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![]}).unwrap();
 
         let mut rust = String::from(
             r#"

@@ -6,7 +6,7 @@ publish = false
 [dependencies]
 ink-native-support = { git = "https://github.com/siliconjungle/ink-native-support", rev = "c5613fc7c28134fd5242240b8776137b387ec9ce" }
 ink-abi = { git = "https://github.com/siliconjungle/ink-abi", rev = "c800d60a4f49790dced13fc930b84ba7815d60a0" }
-ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "c0db2b5eca4adc3d82192399d2ee31c41e55d656" }
+ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "f82d3bb7126cb3e0f851367fd5d7b27ebab7dbba" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
