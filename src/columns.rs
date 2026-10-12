@@ -61,6 +61,8 @@ pub(crate) fn emit(p: &Program, physical: Option<&CheckedPhysicalPlan>) -> LangR
         let mut append = vec![];
         let mut payload = vec![];
         let mut fields = vec![];
+        let mut prepare_push = vec![];
+        let mut prepare_append = vec![];
         for (i, (f, t)) in schema.fields.iter().enumerate() {
             let field = format!("c{i}");
             let rust = crate::state_native::ty(t)?;
@@ -88,6 +90,13 @@ pub(crate) fn emit(p: &Program, physical: Option<&CheckedPhysicalPlan>) -> LangR
             capacities.push(format!("{field}:<{storage}>::with_capacity(n)"));
             truncates.push(format!("self.{field}.truncate(n);"));
             if packed.is_some() {
+                let v = if *t == Type::Bool {
+                    value.clone()
+                } else {
+                    format!("{value} as u64")
+                };
+                prepare_push.push(format!("self.{field}.prepare_push({v});"));
+                prepare_append.push(format!("self.{field}.prepare_append(&other.{field});"));
                 let cast = if *t == Type::Bool {
                     String::new()
                 } else {
@@ -106,6 +115,8 @@ pub(crate) fn emit(p: &Program, physical: Option<&CheckedPhysicalPlan>) -> LangR
                 payload.push(format!("self.{field}.payload_bytes()"));
                 append.push(format!("for i in 0..other.count{{self.{field}.push(unsafe{{other.{field}.get_unchecked(i)}});}}other.{field}.truncate(0);"));
             } else {
+                prepare_push.push(format!("self.{field}.reserve(1);"));
+                prepare_append.push(format!("self.{field}.reserve(other.count);"));
                 gets.push(format!("(*self.{field}.get_unchecked(i)).clone()"));
                 pushes.push(format!("self.{field}.push({value});"));
                 sets.push(format!(
@@ -140,12 +151,12 @@ impl {name}{{
  pub fn with_capacity(n:usize)->Self{{Self{{count:0,{capacities}}}}}
  pub fn get(&self,i:usize)->Option<{row}>{{if i<self.count{{Some(unsafe{{self.get_unchecked(i)}})}}else{{None}}}}
  pub unsafe fn get_unchecked(&self,i:usize)->{row}{{{assemble}}}
- pub fn push(&mut self,row:{row}){{{pushes}self.count=self.count.checked_add(1).expect("column length overflow");}}
+ pub fn push(&mut self,row:{row}){{let count=self.count.checked_add(1).expect("column length overflow");{prepare_push}{pushes}self.count=count;}}
  pub fn set(&mut self,i:usize,row:{row}){{assert!(i<self.count);unsafe{{self.set_masked(i,row,0);}}}}
  unsafe fn set_masked(&mut self,i:usize,row:{row},mask:u16){{{sets}}}
  pub fn map_rows(mut self,mut f:impl FnMut({row})->{row},mask:u16)->Self{{for i in 0..self.count{{let row=f(unsafe{{self.get_unchecked(i)}});unsafe{{self.set_masked(i,row,mask);}}}}self}}
  pub fn truncate(&mut self,n:usize){{let n=n.min(self.count);{truncates}self.count=n;}}
- pub fn append(&mut self,other:&mut Self){{let n=self.count.checked_add(other.count).expect("column length overflow");{append}self.count=n;other.count=0;}}
+ pub fn append(&mut self,other:&mut Self){{let n=self.count.checked_add(other.count).expect("column length overflow");{prepare_append}{append}self.count=n;other.count=0;}}
  pub fn iter(&self)->impl DoubleEndedIterator<Item={row}>+ExactSizeIterator+'_{{(0..self.count).map(move|i|unsafe{{self.get_unchecked(i)}})}}
  pub fn into_rows(self)->Vec<{row}>{{self.into_iter().collect()}}
  pub fn drain<R:std::ops::RangeBounds<usize>>(&mut self,range:R)->std::vec::IntoIter<{row}>{{let mut rows=std::mem::take(self).into_rows();let removed=rows.drain(range).collect::<Vec<_>>();*self=rows.into();removed.into_iter()}}
@@ -186,7 +197,7 @@ impl {owner}{{
 }}
 impl Wire for {owner}{{fn from_json(_: &Json)->Result<Self,String>{{Err("temporary storage is internal to a pure invocation".into())}}fn to_json(&self)->Json{{Json::Null}}}}
 impl InkDataEq for {owner}{{fn ink_data_eq(&self,_:&Self)->bool{{panic!("temporary storage has no value equality")}}}}
-"#,storage=if layout.packing.contains_key(&schema.fields[0].0){"self.c0.storage_identity()"}else{"self.c0.as_ptr()as usize"},capacities=capacities.join(","),fields=fields.join(","),defaults=defaults.join(","),payload=payload.join("+"),pushes=pushes.join(""),sets=sets.join(""),truncates=truncates.join(""),append=append.join(""),compare=if scalar{"a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)".into()}else{schema.fields.iter().map(|(f,_)|format!("let order=a.l_{f}.partial_cmp(&b.l_{f}).unwrap_or(std::cmp::Ordering::Equal);if order!=std::cmp::Ordering::Equal{{return order;}}" )).collect::<String>()+"std::cmp::Ordering::Equal"}).unwrap();
+"#,storage=if layout.packing.contains_key(&schema.fields[0].0){"self.c0.storage_identity()"}else{"self.c0.as_ptr()as usize"},prepare_push=prepare_push.join(""),prepare_append=prepare_append.join(""),capacities=capacities.join(","),fields=fields.join(","),defaults=defaults.join(","),payload=payload.join("+"),pushes=pushes.join(""),sets=sets.join(""),truncates=truncates.join(""),append=append.join(""),compare=if scalar{"a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)".into()}else{schema.fields.iter().map(|(f,_)|format!("let order=a.l_{f}.partial_cmp(&b.l_{f}).unwrap_or(std::cmp::Ordering::Equal);if order!=std::cmp::Ordering::Equal{{return order;}}" )).collect::<String>()+"std::cmp::Ordering::Equal"}).unwrap();
         if schema.fields.iter().all(|(_, t)| *t != Type::F32) {
             writeln!(out, "impl Eq for {name}{{}} ").unwrap();
         }
