@@ -10,6 +10,7 @@ struct Emitter<'a> {
     p: &'a Program,
     physical: Option<&'a ink_core::physical::CheckedPhysicalPlan>,
     last_uses: ink_core::last_use::LastUses,
+    borrowed_bindings: std::collections::BTreeSet<String>,
     paths: BTreeMap<usize,Vec<usize>>,
     next: usize,
     prefix: String,
@@ -70,11 +71,15 @@ impl Emitter<'_> {
     // vector. Computed receivers still finish eagerly and are consumed once.
     fn borrowed_place(&self, e: &Expr, env: &Env) -> Option<String> {
         if !self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_read(&id))) {return None;}
+        self.lexical_place(e, env)
+    }
+    // Field projection copies the field value, not its containing record.
+    // This is literal access to a checked place; it retains no borrowed value
+    // and does not choose borrowed collection traversal or parameter ownership.
+    fn lexical_place(&self, e:&Expr, env:&Env)->Option<String> {
         let (root, fields) = ink_core::collection_facts::lexical_projection(e)?;
         let mut place = env.get(root)?.0.clone();
-        for field in fields {
-            place = format!("({place}).l_{field}");
-        }
+        for field in fields {place=format!("({place}).l_{field}");}
         Some(place)
     }
 
@@ -87,13 +92,12 @@ impl Emitter<'_> {
             format!("({value}).into_iter()")
         })
     }
-    fn lambda(
-        &mut self,
-        e: &Expr,
-        env: &Env,
-        params: &[Type],
-        result: &Type,
-    ) -> LangResult<(Vec<String>, String)> {
+    fn lambda(&mut self,e:&Expr,env:&Env,params:&[Type],result:&Type)->LangResult<(Vec<String>,String)> {
+        self.lambda_mode(e,env,params,result,false)
+    }
+    fn lambda_mode(
+        &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:bool,
+    ) -> LangResult<(Vec<String>,String)> {
         let mut local = env.clone();
         let mut vars = vec![];
         let mut body = e;
@@ -106,7 +110,23 @@ impl Emitter<'_> {
             vars.push(v);
             body = b;
         }
-        Ok((vars, self.expr(body, &local, Some(result))?))
+        // The primitive invokes the flattened callback once per item. Its
+        // formal parameters are owned within that invocation; outer captures
+        // remain absent from these facts and therefore cannot move.
+        let mut formal = Vec::new();
+        let mut current = e;
+        for _ in params {
+            let Expr::Lambda(name, nested) = current else {unreachable!()};
+            formal.push(name.as_str());current=nested;
+        }
+        let facts=ink_core::last_use::analyse(body,formal);
+        let outer=std::mem::replace(&mut self.last_uses,facts);
+        let previous_borrows=self.borrowed_bindings.clone();
+        if borrowed {self.borrowed_bindings.extend(vars.iter().cloned());}
+        let emitted=self.expr(body,&local,Some(result));
+        self.borrowed_bindings=previous_borrows;
+        self.last_uses=outer;
+        Ok((vars,emitted?))
     }
     fn parallel(
         &mut self,
@@ -188,7 +208,7 @@ impl Emitter<'_> {
             Expr::Var(n) if n == "None" => "None".into(),
             Expr::Var(n) => {
                 let v = &env.get(n).ok_or("missing binding")?.0;
-                if ink_core::local_collections::owned(&t, self.p) || self.last_uses.contains(e) {
+                if !self.borrowed_bindings.contains(v) && (ink_core::local_collections::owned(&t, self.p) || self.last_uses.contains(e)) {
                     v.clone()
                 } else {
                     format!("{v}.clone()")
@@ -209,13 +229,25 @@ impl Emitter<'_> {
             }
             Expr::Let(n, annotation, a, b) => {
                 let at = self.infer(a, env, annotation.as_deref())?;
-                let a = self.expr(a, env, Some(&at))?;
+                // An immutable lexical argument has already been evaluated.
+                // Keep a local alias and copy only when its value is observed.
+                // Exclude owned handles and any body that could separately move
+                // the containing root; large bodies retain the copying path.
+                let alias = if !ink_core::local_collections::owned(&at,self.p)
+                    && matches!(&at,Type::Named(_)|Type::List(_))
+                    && ink_core::analysis::node_count(b,256).is_some() {
+                    ink_core::collection_facts::lexical_projection(a).and_then(|(root,_)|
+                        if root!=n && !ink_core::analysis::references_free(b,root){self.lexical_place(a,env)}else{None})
+                } else {None};
+                let initial = match &alias {Some(place)=>format!("&({place})"),None=>self.expr(a,env,Some(&at))?};
                 let v = self.fresh();
                 let mut local = env.clone();
-                let annotation = crate::state_native::ty(&at)?;
+                let annotation = format!("{}{}",if alias.is_some(){"&"}else{""},crate::state_native::ty(&at)?);
                 local.insert(n.clone(), (v.clone(), at));
-                let b = self.expr(b, &local, Some(&t))?;
-                format!("{{let {v}:{annotation}={a};{b}}}")
+                if alias.is_some(){self.borrowed_bindings.insert(v.clone());}
+                let body=self.expr(b,&local,Some(&t));
+                self.borrowed_bindings.remove(&v);
+                format!("{{let {v}:{annotation}={initial};{}}}",body?)
             }
             Expr::Record(n, fields) => {
                 // Evaluate in source order, even when declaration order differs.
@@ -247,7 +279,7 @@ impl Emitter<'_> {
                 }
                 let xt = self.infer(x, env, None)?;
                 if let Type::Named(owner) = &xt {
-                    if let Some(place) = self.borrowed_place(e, env) {
+                    if let Some(place) = self.lexical_place(e, env) {
                         let ft = &self.p.records[owner]
                             .iter()
                             .find(|(field, _)| field == n)
@@ -568,18 +600,16 @@ impl Emitter<'_> {
                 };
                 let xs = self.expr(&args[0], env, None)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
-                let (stopvars, stop) = self.lambda(
-                    &args[2],
-                    env,
-                    &[inner.as_ref().clone(), t.clone()],
-                    &Type::Bool,
-                )?;
+                let read_only = !ink_core::local_collections::owned(&inner,self.p) && !ink_core::local_collections::owned(&t,self.p);
+                let (stopvars, stop) = self.lambda_mode(&args[2],env,&[inner.as_ref().clone(),t.clone()],&Type::Bool,read_only)?;
                 let (vs, body) = self.lambda(&args[3], env, &[*inner, t.clone()], &t)?;
                 let list = self.fresh();
                 let acc = self.fresh();
                 let item = self.fresh();
                 let flag = self.fresh();
-                format!("{{let {list}={xs};let mut {acc}={initial};for {item} in {list}.into_iter() {{let {}={item}.clone();let {}={acc}.clone();let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
+                let observed_item=if read_only{format!("&{item}")}else{format!("{item}.clone()")};
+                let observed_acc=if read_only{format!("&{acc}")}else{format!("{acc}.clone()")};
+                format!("{{let {list}={xs};let mut {acc}={initial};for {item} in {list}.into_iter() {{let {}={observed_item};let {}={observed_acc};let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
             }
             Expr::Call(n, args) if n == "foldr" || n == "foldl" => {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
@@ -851,6 +881,7 @@ pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_
         physical,
         paths:ink_core::analysis::paths(&f.body),
         last_uses: ink_core::last_use::analyse(&f.body, f.params.iter().map(|(n, _)| n.as_str())),
+        borrowed_bindings: Default::default(),
         next: 0,
         prefix: f.name.clone(),
         tasks: Vec::new(),
@@ -1115,3 +1146,57 @@ fn main(){
 }
 
 fn xs_receiver(e:&Expr)->&Expr {if let Expr::Method(xs,_,_)=e{xs}else{unreachable!()}}
+
+#[cfg(test)]
+mod callback_ownership_tests {
+    use super::*;
+    #[test]
+    fn curried_formals_move_once_read_only_stop_borrows_and_captures_survive() {
+        let program=parse(r#"module Copies;
+record Row{key:u32,label:String,}
+fn total(xs:List<Row>)->u32{return foldr(xs,0,fn(x)=>fn(acc)=>x.key+acc);}
+fn until(xs:List<Row>,cut:u32)->u32{return fold_until(xs,0,fn(x)=>fn(acc)=>x.key>=cut,fn(x)=>fn(acc)=>x.key+acc);}
+fn whole(xs:List<Row>,seed:Row)->Row{return foldr(xs,seed,fn(x)=>fn(acc)=>choose(x.key>0,x,acc));}
+fn captured(xs:List<Row>,seed:Row)->List<Row>{return xs.map(fn(x)=>choose(x.key>0,seed,x));}
+fn repeated(row:Row)->u32{return row.key+row.key;}
+fn escaping(row:Row)->Row{return row;}
+fn moving(row:Row)->Row{return row;}
+"#).unwrap();
+        let mut program=program;
+        let row_ty=Some(Box::new(Type::Named("Row".into())));
+        let value=||Box::new(Expr::Var("row".into()));
+        program.functions.iter_mut().find(|f|f.name=="repeated").unwrap().body=Expr::Binary("+".into(),Box::new(Expr::Let("alias".into(),row_ty.clone(),value(),Box::new(Expr::Field(Box::new(Expr::Var("alias".into())),"key".into())))),Box::new(Expr::Field(value(),"key".into())));
+        program.functions.iter_mut().find(|f|f.name=="escaping").unwrap().body=Expr::Let("alias".into(),row_ty.clone(),value(),Box::new(Expr::Var("alias".into())));
+        program.functions.iter_mut().find(|f|f.name=="moving").unwrap().body=Expr::Let("alias".into(),row_ty.clone(),value(),Box::new(Expr::Let("gone".into(),row_ty,value(),Box::new(Expr::Var("alias".into())))));
+        check::check(&program).unwrap();
+        let mut code=String::from(r#"
+#![allow(non_camel_case_types,unused_variables,unused_parens)]
+use std::sync::atomic::{AtomicUsize,Ordering};
+static COPIES:AtomicUsize=AtomicUsize::new(0);
+#[derive(Debug,PartialEq)]struct l_Row{l_key:u32,l_label:String}
+impl Clone for l_Row{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed);Self{l_key:self.l_key,l_label:self.l_label.clone()}}}
+"#);
+        for f in &program.functions {
+            let params=f.params.iter().map(|(n,t)|format!("l_{n}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
+            code.push_str(&format!("fn {}({params})->{}{{{}}}\n",f.name,crate::state_native::ty(&f.result).unwrap(),body(&program,f).unwrap()));
+        }
+        code.push_str(r#"
+fn row(key:u32)->l_Row{l_Row{l_key:key,l_label:format!("row-{key}")}}
+fn main(){
+assert_eq!(total(vec![row(1),row(2),row(3)]),6);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(until(vec![row(1),row(2),row(3)],2),3);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(whole(vec![row(1),row(2)],row(99)),row(1));assert_eq!(COPIES.load(Ordering::Relaxed),0);
+let xs=captured(vec![row(1),row(2),row(0)],row(77));assert_eq!(xs,vec![row(77),row(77),row(0)]);assert_eq!(COPIES.load(Ordering::Relaxed),2);
+COPIES.store(0,Ordering::Relaxed);assert_eq!(repeated(row(7)),14);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(escaping(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),1);
+assert_eq!(moving(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),2);
+}
+"#);
+        let dir=std::env::temp_dir().join(format!("ink-callback-ownership-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();std::fs::write(dir.join("main.rs"),code).unwrap();
+        let output=std::process::Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs")).arg("-o").arg(dir.join("run")).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let output=std::process::Command::new(dir.join("run")).output().unwrap();std::fs::remove_dir_all(dir).unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+}
