@@ -10,6 +10,7 @@ struct Emitter<'a> {
     p: &'a Program,
     physical: Option<&'a ink_core::physical::CheckedPhysicalPlan>,
     last_uses: ink_core::last_use::LastUses,
+    paths: BTreeMap<usize,Vec<usize>>,
     next: usize,
     prefix: String,
     tasks: Vec<(String, String)>,
@@ -71,7 +72,7 @@ impl Emitter<'_> {
         Ok(if let Some(place) = self.borrowed_place(e, env) {
             // Lexical record projections have no evaluation side effects.
             // Borrow only for this traversal; subsequent source uses survive.
-            format!("({place}).iter().cloned()")
+            if matches!(self.infer(e,env,None)?,Type::List(ref t)if crate::columns::names(t).is_some()){format!("({place}).iter()")}else{format!("({place}).iter().cloned()")}
         } else {
             format!("({value}).into_iter()")
         })
@@ -148,9 +149,17 @@ impl Emitter<'_> {
         let wasm=format!("if temporary::ink_parallel_nested()||xs.len()<2||xs.len()/(grain.max(1) as usize)<2{{{native}}}else{{let result=__ink_parallel_host(json!({{\"callback\":{name:?},\"items\":xs.iter().map(Wire::to_json).collect::<Vec<_>>(),\"captures\":[{captured}],\"grain\":grain}})).expect(\"parallel host failed\");result.as_array().expect(\"parallel result array\").iter().map(<{} as Wire>::from_json).collect::<Result<Vec<_>,_>>().expect(\"parallel result value\")}}",crate::state_native::ty(output)?);
         let native_block = format!("#[cfg(not(target_arch=\"wasm32\"))]{{{native}}}");
         let wasm_block = format!("#[cfg(target_arch=\"wasm32\")]{{{wasm}}}");
-        Ok(format!(
-            "{{let xs={xs};let grain={grain};{native_block}{wasm_block}}}"
-        ))
+        let xs=if crate::columns::names(input).is_some(){format!("({xs}).into_rows()")}else{xs};
+        let convert=if crate::columns::names(output).is_some(){".into()"}else{""};
+        Ok(format!("({{let xs={xs};let grain={grain};{native_block}{wasm_block}}}){convert}"))
+    }
+    fn source_path(&self,e:&Expr)->Option<&[usize]>{self.paths.get(&(e as *const Expr as usize)).map(Vec::as_slice)}
+    fn unchecked(&self,e:&Expr)->bool{self.physical.is_some_and(|p|self.source_path(e).is_some_and(|path|p.bounds().allows(&self.prefix,path)))}
+    fn column_mask(&self,e:&Expr,element:&Type)->u16{
+        let Some(p)=self.physical else{return 0};let Some(path)=self.source_path(e)else{return 0};
+        let record=match element{Type::Named(n)=>n.clone(),Type::U32=>"@U32".into(),Type::U64=>"@U64".into(),Type::Bool=>"@Bool".into(),_=>return 0};
+        let Ok(schema)=ink_core::column_codec::schema(self.p,&record)else{return 0};
+        schema.fields.iter().enumerate().filter(|(_, (n,_))|p.column_maps().fields(&self.prefix,path).contains(n)).fold(0,|mask,(i,_)|mask|(1<<i))
     }
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<String> {
         let t = self.infer(e, env, want)?;
@@ -319,17 +328,10 @@ impl Emitter<'_> {
                 self.expr(&args[1], env, Some(&t))?,
                 self.expr(&args[2], env, Some(&t))?
             ),
-            Expr::Call(n, args) if n == "list" => {
-                let Type::List(inner) = &t else {
-                    return Err("list type".into());
-                };
-                format!(
-                    "vec![{}]",
-                    args.iter()
-                        .map(|e| self.expr(e, env, Some(inner)))
-                        .collect::<LangResult<Vec<_>>>()?
-                        .join(",")
-                )
+            Expr::Call(n,args)if n=="list"=>{
+                let Type::List(inner)=&t else{return Err("list type".into())};
+                let items=args.iter().map(|e|self.expr(e,env,Some(inner))).collect::<LangResult<Vec<_>>>()?.join(",");
+                if crate::columns::names(inner).is_some(){format!("vec![{items}].into()")}else{format!("vec![{items}]")}
             }
             Expr::Call(n, args) if ink_core::word::primitive(n) => {
                 let ts = ink_core::word::arguments(n, &t);
@@ -416,15 +418,15 @@ impl Emitter<'_> {
                 };
                 if n == "buffer" {
                     format!(
-                        "OwnedBuffer::new({})",
-                        self.expr(&args[0], env, Some(&Type::List(inner.clone())))?
+                        "<{}>::new({})",
+                        crate::state_native::ty(&t)?,self.expr(&args[0], env, Some(&Type::List(inner.clone())))?
                     )
                 } else {
                     let len = self.expr(&args[0], env, Some(&Type::U32))?;
                     let value = self.expr(&args[1], env, Some(inner))?;
                     let lv = self.fresh();
                     let vv = self.fresh();
-                    format!("{{let {lv}={len};let {vv}={value};OwnedBuffer::new(vec![{vv};{lv} as usize])}}")
+                    format!("{{let {lv}={len};let {vv}={value};<{}>::new(vec![{vv};{lv} as usize].into())}}",crate::state_native::ty(&t)?)
                 }
             }
             Expr::Method(x, n, args) if matches!(x.as_ref(),Expr::Var(v) if v=="Buffer" || v=="Map") =>
@@ -432,12 +434,12 @@ impl Emitter<'_> {
                 format!(
                     "{}::new({})",
                     if matches!(t, Type::Buffer(_)) {
-                        "OwnedBuffer"
+                        format!("<{}>",crate::state_native::ty(&t)?)
                     } else {
-                        "OwnedMap"
+                        "OwnedMap".into()
                     },
                     if matches!(t, Type::Buffer(_)) {
-                        "vec![]"
+                        "Default::default()"
                     } else {
                         ""
                     }
@@ -462,7 +464,7 @@ impl Emitter<'_> {
                         };
                         let (vs, body) = self.lambda(&args[0], env, &params, value)?;
                         if n == "map" {
-                            format!("({xv}).map_inplace(|{}|{{{body}}})", vs[0])
+                            if crate::columns::names(value).is_some(){let mask=self.column_mask(e,value);format!("({xv}).map_masked(|{}|{{{body}}},{mask})",vs[0])}else{format!("({xv}).map_inplace(|{}|{{{body}}})", vs[0])}
                         } else {
                             format!(
                                 "({xv}).map_indexed_inplace(|{},{}|{{{body}}})",
@@ -493,7 +495,7 @@ impl Emitter<'_> {
                             value,
                             true,
                         )?;
-                        format!("OwnedBuffer::new({mapped})")
+                        format!("<{}>::new({mapped})",crate::state_native::ty(&xt)?)
                     }
                     "split_at" => {
                         let at = self.expr(&args[0], env, Some(&Type::U32))?;
@@ -502,14 +504,13 @@ impl Emitter<'_> {
                         format!("{{let ({},{})=({xv}).split({at});{body}}}", vs[0], vs[1])
                     }
                     "append" => format!("({xv}).append({})", self.expr(&args[0], env, Some(&xt))?),
-                    "len" | "pop" | "freeze" | "keys" | "values" => format!("({xv}).{n}()"),
+                    "len" | "pop" | "freeze" => format!("({xv}).{n}()"),
+                    "keys"|"values" => format!("({xv}).{n}().into()"),
                     "at_or" | "get_or" => {
                         let k = self.expr(&args[0], env, Some(&key))?;
                         let fallback = self.expr(&args[1], env, Some(value))?;
-                        format!(
-                            "({xv}).get({}{k}).unwrap_or_else(||{fallback})",
-                            if matches!(xt, Type::Map(..)) { "&" } else { "" }
-                        )
+                        if matches!(xt,Type::Buffer(_)) && self.unchecked(e) {format!("unsafe{{({xv}).get_unchecked({k})}}")}
+                        else {format!("({xv}).get({}{k}).unwrap_or_else(||{fallback})",if matches!(xt,Type::Map(..)){"&"}else{""})}
                     }
                     "set" => {
                         let k = self.expr(&args[0], env, Some(&key))?;
@@ -668,6 +669,10 @@ impl Emitter<'_> {
                 }
             }
             Expr::Method(xs, n, args) if n == "concat" => {
+                if matches!(&t,Type::List(inner)if crate::columns::names(inner).is_some()){
+                    let left=self.expr(xs,env,Some(&t))?;let right=self.expr(&args[0],env,Some(&t))?;
+                    let a=self.fresh();let b=self.fresh();return Ok(format!("{{let mut {a}={left};let mut {b}={right};{a}.append(&mut {b});{a}}}"));
+                }
                 // Borrow variable operands directly. Computed operands are evaluated
                 // once and their temporaries live through the two result copies.
                 let left = if let Some(place) = self.borrowed_place(xs, env) {
@@ -694,6 +699,7 @@ impl Emitter<'_> {
                 let receiver = xs.as_ref();
                 let xs = self.expr(receiver, env, None)?;
                 let iterator = self.read_iterator(receiver, &xs, env)?;
+                let collection=crate::state_native::ty(&t)?;
                 match n.as_str() {
                     "at_or" => {
                         let index = self.expr(&args[0], env, Some(&Type::U32))?;
@@ -709,7 +715,7 @@ impl Emitter<'_> {
                         } else {
                             xs
                         };
-                        format!("{{let {list}={xs};let {i}={index};match {list}.get({i} as usize){{Some(v)=>v.clone(),None=>{fallback}}}}}")
+                        if self.unchecked(e){format!("{{let {list}={xs};let {i}={index};unsafe{{{list}.get_unchecked({i} as usize).clone()}}}}") }else{format!("{{let {list}={xs};let {i}={index};match {list}.get({i} as usize){{Some(v)=>v.clone(),None=>{fallback}}}}}")}
                     }
                     "drop" | "take" => {
                         let k = self.expr(&args[0], env, Some(&Type::U32))?;
@@ -730,7 +736,7 @@ impl Emitter<'_> {
                         let acc = self.fresh();
                         let item = self.fresh();
                         {
-                            format!("{{let mut {acc}={};({iterator}).map(|{item}|{{{acc}={};{acc}}}).collect::<Vec<_>>()}}",Self::zero(&inner),Self::arithmetic("+",&acc,&item,&inner))
+                            format!("{{let mut {acc}={};({iterator}).map(|{item}|{{{acc}={};{acc}}}).collect::<{collection}>()}}",Self::zero(&inner),Self::arithmetic("+",&acc,&item,&inner))
                         }
                     }
                     "map" | "filter" | "map_indexed" => {
@@ -748,12 +754,14 @@ impl Emitter<'_> {
                             vec![*inner]
                         };
                         let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
-                        if n == "filter" {
-                            format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}}).collect::<Vec<_>>()",vs[0])
+                        if n=="map"&&self.infer(xs_receiver(e),env,None)?==t&&crate::columns::names(&output).is_some()&&self.borrowed_place(xs_receiver(e),env).is_none(){
+                            let mask=self.column_mask(e,&output);format!("({xs}).map_rows(|{}|{{{body}}},{mask})",vs[0])
+                        }else if n == "filter" {
+                            format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}}).collect::<{collection}>()",vs[0])
                         } else if n == "map_indexed" {
-                            format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}}).collect::<Vec<_>>()",vs[1],vs[0])
+                            format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}}).collect::<{collection}>()",vs[1],vs[0])
                         } else {
-                            format!("({iterator}).map(|{}|{body}).collect::<Vec<_>>()", vs[0])
+                            format!("({iterator}).map(|{}|{body}).collect::<{collection}>()", vs[0])
                         }
                     }
                     "zip" => {
@@ -768,7 +776,7 @@ impl Emitter<'_> {
                         let (vs, body) = self.lambda(&args[1], env, &[*inner, *other], out)?;
                         let a = self.fresh();
                         let b = self.fresh();
-                        format!("{{let {a}={iterator};let {b}={right_iterator};{a}.zip({b}).map(|({},{})|{body}).collect::<Vec<_>>()}}",vs[0],vs[1])
+                        format!("{{let {a}={iterator};let {b}={right_iterator};{a}.zip({b}).map(|({},{})|{body}).collect::<{collection}>()}}",vs[0],vs[1])
                     }
                     _ => return Err(format!("unsupported pure method {n}")),
                 }
@@ -831,6 +839,7 @@ pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_
     let mut emitter = Emitter {
         p,
         physical,
+        paths:ink_core::analysis::paths(&f.body),
         last_uses: ink_core::last_use::analyse(&f.body, f.params.iter().map(|(n, _)| n.as_str())),
         next: 0,
         prefix: f.name.clone(),
@@ -872,7 +881,7 @@ fn selected(r:Outer)->List<Item>{return r.nested.first;}
         let mut sites=std::collections::BTreeSet::new();
         for f in &p.functions {let env=ink_core::check::params_env(&f.params).unwrap();ink_core::analysis::walk(&f.body,|e|if matches!(e,Expr::Var(_)|Expr::Field(..))&&ink_core::check::infer(e,&env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());});}
         sites.insert(ink_core::registry::identity(&Expr::Field(Box::new(Expr::Var("x".into())),"key".into())).unwrap());
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],column_maps:None,borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
 
         let mut source = String::from(
             r#"
@@ -942,7 +951,7 @@ let a=selected(&r);assert_eq!(a.len(),3);assert_eq!(COPIES.swap(0,Ordering::Rela
         check::check(&p).unwrap();
         let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
         let mut sites=vec![ink_core::registry::identity(&Expr::Var("a".into())).unwrap(),ink_core::registry::identity(&Expr::Var("b".into())).unwrap()];sites.sort();
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],column_maps:None,borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![]}).unwrap();
 
         let mut rust = String::from(
             r#"
@@ -1080,3 +1089,5 @@ fn main(){
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+fn xs_receiver(e:&Expr)->&Expr {if let Expr::Method(xs,_,_)=e{xs}else{unreachable!()}}

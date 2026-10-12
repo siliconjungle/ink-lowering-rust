@@ -21,8 +21,8 @@ pub(crate) fn ty(t: &Type) -> LangResult<String> {
         Type::Bool => "bool".into(),
         Type::Named(n) if n == "ArithmeticError" => "InkArithmeticError".into(),
         Type::Named(n) => ident(n),
-        Type::List(a) => format!("Vec<{}>", ty(a)?),
-        Type::Buffer(a) => format!("OwnedBuffer<{}>", ty(a)?),
+        Type::List(a) => crate::columns::names(a).map(|n|n.0).unwrap_or(format!("Vec<{}>", ty(a)?)),
+        Type::Buffer(a) => crate::columns::names(a).map(|n|n.1).unwrap_or(format!("OwnedBuffer<{}>", ty(a)?)),
         Type::Map(k, v) => format!("OwnedMap<{},{}>", ty(k)?, ty(v)?),
         Type::Option(a) => format!("Option<{}>", ty(a)?),
         Type::Result(a, b) => format!("Result<{},{}>", ty(a)?, ty(b)?),
@@ -337,7 +337,7 @@ impl Emitter<'_> {
                         .iter()
                         .map(|e| self.expr(e, env, Some(inner)).map(|(s, _)| s))
                         .collect::<LangResult<Vec<_>>>()?;
-                    (format!("vec![{}]", values.join(",")), t.clone())
+                    (format!("vec![{}]{}",values.join(","),if crate::columns::names(inner).is_some(){".into()"}else{""}),t.clone())
                 }
                 "vec2" | "vec3" | "vec4" => {
                     let t = resolved.as_ref().or(want).ok_or("vector type")?;
@@ -441,7 +441,8 @@ impl Emitter<'_> {
                     if n=="shared_keys" {
                         let Expr::Var(other)=&args[0] else{return Err("shared_keys root".into());};
                         let other=ident(other);
-                        return Ok((format!("{{if self.{field}.len()<=self.{other}.len(){{self.{field}.keys().filter(|key|self.{other}.contains_key(*key)).cloned().collect::<Vec<_>>()}}else{{self.{other}.keys().filter(|key|self.{field}.contains_key(*key)).cloned().collect::<Vec<_>>()}}}}"),T::List(k.clone())));
+                        let collection=ty(&T::List(k.clone()))?;
+                        return Ok((format!("{{if self.{field}.len()<=self.{other}.len(){{self.{field}.keys().filter(|key|self.{other}.contains_key(*key)).cloned().collect::<{collection}>()}}else{{self.{other}.keys().filter(|key|self.{field}.contains_key(*key)).cloned().collect::<{collection}>()}}}}"),T::List(k.clone())));
                     }
                     if n=="sum_by" || n=="count_where" {
                         let Expr::Lambda(parameter,body)=&args[0] else {return Err("scan lambda".into());};
@@ -456,13 +457,13 @@ impl Emitter<'_> {
                     }
                     if n == "values" || n == "keys" {
                         (
-                            format!("self.{field}.{}().cloned().collect::<Vec<_>>()", n),
+                            format!("self.{field}.{}().cloned().collect::<{}>()",n,ty(&T::List(if n=="keys"{k.clone()}else{v.clone()}))?),
                             T::List(if n == "keys" { k.clone() } else { v.clone() }),
                         )
                     } else if ["intersect_keys", "put_many", "remove_many"].contains(&n.as_str()) {
                         let keys = self.expr(&args[0], env, Some(&T::List(k.clone())))?.0;
                         match n.as_str() {
-                            "intersect_keys" => (format!("{{let selected=({keys}).into_iter().collect::<std::collections::BTreeSet<_>>();self.{field}.keys().filter(|key|selected.contains(*key)).cloned().collect::<Vec<_>>()}}"), T::List(k.clone())),
+                            "intersect_keys" => (format!("{{let selected=({keys}).into_iter().collect::<std::collections::BTreeSet<_>>();self.{field}.keys().filter(|key|selected.contains(*key)).cloned().collect::<{}>()}}",ty(&T::List(k.clone()))?), T::List(k.clone())),
                             "remove_many" => (format!("{{let keys={keys};for key in keys{{self.set_{field}(key,None,false);}}}}"), T::Unit),
                             _ => {
                                 let values = self.expr(&args[1], env, Some(&T::List(v.clone())))?.0;
@@ -634,6 +635,8 @@ impl Emitter<'_> {
                                 } else {
                                     format!("{s}.map(|{}|{{{code}}}).collect::<Vec<_>>()", ident(v))
                                 };
+                                let output=if n=="filter"{T::List(t.clone())}else{T::List(Box::new(out.clone()))};
+                                let mapped=mapped.replace("collect::<Vec<_>>()",&format!("collect::<{}>()",ty(&output)?));
                                 (
                                     mapped,
                                     if n == "filter" {
@@ -917,6 +920,7 @@ pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String
     emit_with_layout(plan.module().program(),&layout,storage,plan.physical())
 }
 fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>) -> LangResult<String> {
+    let _column_scope=crate::columns::scope(physical)?;
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
     let execution = action_ir.execution()?;
@@ -959,9 +963,10 @@ fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage:
         TableStorage::IndexedSlots => out.push_str(ink_native_support::INDEXED_TABLE_RUST_SOURCE),
         TableStorage::Ordered => out.push_str("pub type InkTable<K,V> = std::collections::BTreeMap<K,V>; pub trait TableCapacity {fn reserve(&mut self,additional:usize);} impl<K,V> TableCapacity for InkTable<K,V>{fn reserve(&mut self,_:usize){}}"),
     }
-    out.push_str(
-        "\n}\nuse temporary::{OwnedBuffer,OwnedMap,InkTable,ink_parallel_map,ink_parallel_update};\n",
-    );
+    out.push_str("\n}\nuse temporary::{OwnedMap,InkTable,ink_parallel_map,ink_parallel_update};\n");
+    out.push_str(if physical.is_some_and(|p|p.plan().buffers==ink_core::physical::Buffers::Direct) {
+        "use temporary::DirectBuffer as OwnedBuffer;\n"
+    }else{"use temporary::OwnedBuffer;\n"});
     if storage==TableStorage::Ordered {out.push_str("use temporary::TableCapacity;\n");}
     out.push_str(r#"
 impl<T:Clone> Wire for OwnedBuffer<T>{fn from_json(_: &Json)->Result<Self,String>{Err("temporary storage is internal to a pure invocation".into())}fn to_json(&self)->Json{Json::Null}}
@@ -970,6 +975,7 @@ impl<T:Clone> InkDataEq for OwnedBuffer<T>{fn ink_data_eq(&self,_:&Self)->bool{p
 impl<K:Ord+Clone+'static,V:Clone+'static> InkDataEq for OwnedMap<K,V>{fn ink_data_eq(&self,_:&Self)->bool{panic!("temporary storage has no value equality")}}
 "#);
 
+    out.push_str(&crate::columns::emit(p,physical)?);
     out.push_str("\nmod transaction {\n");
     out.push_str(ink_core::TRANSACTION_RUST_SOURCE);
     out.push_str("\n}\n");

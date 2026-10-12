@@ -19,3 +19,5 @@ mod packed_spine_tests;
 
 #[cfg(test)]
 mod identity_memo_tests;
+
+mod columns;
