@@ -200,15 +200,22 @@ impl Emit<'_> {
                 self.sort(&model.key_type)?,
                 &self.codec(&model.key_type, "read", "key", "0")?,
             );
-            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}=D_{id}::C1({key_read},{read},Some(std::sync::Arc::new(root{i})));}}").unwrap();
+            let prepend=if self.packed_ids.contains(id){format!("root{i}.prepend(PackedItem_{id}{{c0:{key_read},c1:{read}}})")}else{format!("D_{id}::C1({key_read},{read},Some(std::sync::Arc::new(root{i})))")};
+            writeln!(out,"let rows=&tables[{position}];let mut root{i}=D_{id}::C0;for (key,row) in rows.iter().rev(){{root{i}={prepend};}}").unwrap();
             roots.push(format!("std::sync::Arc::new(root{i})"));
         }
         writeln!(out,"Ok(D_{}::C0{})}}\nfn logical_tables(state:&D_{})->Result<Vec<Vec<(Json,Json)>>,String>{{let D_{}::C0{}=state;",projection.state,fields(&roots),projection.state,projection.state,fields(&(0..roots.len()).map(|i|format!("r{i}")).collect::<Vec<_>>())).unwrap();
         for (i, model) in projection.tables.iter().enumerate() {
             let id = &model.datatype;
-            let write = self.codec(&model.value_type, "write", "value", "0")?;
-            let key_write = self.codec(&model.key_type, "write", "key", "0")?;
-            writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push(({key_write},{write}));cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}").unwrap();
+            if self.packed_ids.contains(id){
+                let write=self.codec(&model.value_type,"write","&value","0")?;
+                let key_write=self.codec(&model.key_type,"write","&key","0")?;
+                writeln!(out,"let mut rows{i}=vec![];for PackedItem_{id}{{c0:key,c1:value}} in r{i}.cells(){{rows{i}.push(({key_write},{write}));}}").unwrap();
+            }else{
+                let write = self.codec(&model.value_type, "write", "value", "0")?;
+                let key_write = self.codec(&model.key_type, "write", "key", "0")?;
+                writeln!(out,"let mut rows{i}=vec![];let mut cursor=r{i}.as_ref();loop{{match cursor{{D_{id}::C0=>break,D_{id}::C1(key,value,tail)=>{{rows{i}.push(({key_write},{write}));cursor=tail.as_deref().expect(\"live recursive edge\");}}}}}}").unwrap();
+            }
         }
         let ordered = order
             .iter()
@@ -279,8 +286,9 @@ pub fn lower_memo(checked: &CheckedRepresentation) -> LangResult<String> {
 pub fn lower_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
     let checked=plan.representation().ok_or("planned representation missing")?;
     let physical=plan.physical();
-    let definitions=physical.map(|p|p.plan().definitions).unwrap_or_default();
-    lower_native(checked,false,definitions==ink_core::physical::Definitions::Packed,definitions==ink_core::physical::Definitions::Memo,physical)
+    let packed=physical.is_some_and(|p|!p.plan().packed_datatypes.is_empty());
+    let memo=physical.is_some_and(|p|!p.plan().memo_functions.is_empty());
+    lower_native(checked,false,packed,memo,physical)
 }
 fn lower_native(
     checked: &CheckedRepresentation,
