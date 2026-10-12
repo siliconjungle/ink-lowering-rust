@@ -234,6 +234,7 @@ impl Emitter<'_> {
                 // Exclude owned handles and any body that could separately move
                 // the containing root; large bodies retain the copying path.
                 let alias = if !ink_core::local_collections::owned(&at,self.p)
+                    && !(matches!(a.as_ref(),Expr::Var(_)) && self.last_uses.contains(a))
                     && matches!(&at,Type::Named(_)|Type::List(_))
                     && ink_core::analysis::node_count(b,256).is_some() {
                     ink_core::collection_facts::lexical_projection(a).and_then(|(root,_)|
@@ -1188,8 +1189,8 @@ assert_eq!(until(vec![row(1),row(2),row(3)],2),3);assert_eq!(COPIES.load(Orderin
 assert_eq!(whole(vec![row(1),row(2)],row(99)),row(1));assert_eq!(COPIES.load(Ordering::Relaxed),0);
 let xs=captured(vec![row(1),row(2),row(0)],row(77));assert_eq!(xs,vec![row(77),row(77),row(0)]);assert_eq!(COPIES.load(Ordering::Relaxed),2);
 COPIES.store(0,Ordering::Relaxed);assert_eq!(repeated(row(7)),14);assert_eq!(COPIES.load(Ordering::Relaxed),0);
-assert_eq!(escaping(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),1);
-assert_eq!(moving(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),2);
+assert_eq!(escaping(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(moving(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),1);
 }
 "#);
         let dir=std::env::temp_dir().join(format!("ink-callback-ownership-{}",std::process::id()));
