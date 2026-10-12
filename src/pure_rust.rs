@@ -518,6 +518,16 @@ impl Emitter<'_> {
                         let b = self.expr(&args[1], env, Some(&Type::U32))?;
                         format!("({xv}).swap({a},{b})")
                     }
+                    "fill_range" | "copy_within" => {
+                        let a = self.expr(&args[0], env, Some(&Type::U32))?;
+                        let b = self.expr(&args[1], env, Some(&Type::U32))?;
+                        let c = self.expr(
+                            &args[2],
+                            env,
+                            Some(if n == "fill_range" { value } else { &Type::U32 }),
+                        )?;
+                        format!("({xv}).{n}({a},{b},{c})")
+                    }
                     "push" => format!("({xv}).push({})", self.expr(&args[0], env, Some(value))?),
                     "truncate" => format!(
                         "({xv}).truncate({})",
