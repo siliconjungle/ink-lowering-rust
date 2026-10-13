@@ -320,6 +320,10 @@ impl Lower<'_> {
                             format!("ink_def_f32_word(({a}) {operator} ({b}))"),
                             Sort::U64,
                         ),
+                        "sqrt"=> (format!("ink_def_f32_word(({a}).sqrt())"),Sort::U64),
+                        "div"=> (format!("ink_def_f32_word(({a})/({b}))"),Sort::U64),
+                        "floor"|"ceil"|"trunc"|"round_ties_even"=> (format!("ink_def_f32_word(({a}).{operator}())"),Sort::U64),
+                        "is_nan"|"is_finite"=> (format!("({a}).{operator}()"),Sort::Bool),
                         "==" | "!=" | "<" | "<=" | ">" | ">=" => {
                             (format!("(({a}) {operator} ({b}))"), Sort::Bool)
                         }
