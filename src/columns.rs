@@ -170,6 +170,7 @@ impl DoubleEndedIterator for Into_{name}{{fn next_back(&mut self)->Option<{row}>
 impl ExactSizeIterator for Into_{name}{{}}
 impl IntoIterator for {name}{{type Item={row};type IntoIter=Into_{name};fn into_iter(self)->Self::IntoIter{{let back=self.count;Into_{name}{{data:self,front:0,back}}}}}}
 impl Wire for {name}{{fn from_json(v:&Json)->Result<Self,String>{{<Vec<{row}> as Wire>::from_json(v).map(Into::into)}}fn to_json(&self)->Json{{Json::Array(self.iter().map(|v|v.to_json()).collect())}}}}
+impl BinaryValue for {name}{{fn from_binary(v:value_wire::Validated<'_>)->Result<Self,String>{{v.require_kind("list")?;v.items()?.map(|x|<{row} as BinaryValue>::from_binary(x?)).collect::<Result<Vec<_>,_>>().map(Into::into)}}fn write_binary(&self,w:&mut value_wire::Encoder)->Result<(),String>{{w.frame(|w|{{w.word(self.len().try_into().map_err(|_|"wire sequence size")?)?;for row in self.iter(){{row.write_binary(w)?;}}Ok(())}})}}}}
 impl InkDataEq for {name}{{fn ink_data_eq(&self,r:&Self)->bool{{self.len()==r.len()&&self.iter().zip(r.iter()).all(|(a,b)|a.ink_data_eq(&b))}}}}
 impl PartialEq for {name}{{fn eq(&self,r:&Self)->bool{{self.ink_data_eq(r)}}}}
 #[derive(Clone,Debug)]pub struct {owner}({name});

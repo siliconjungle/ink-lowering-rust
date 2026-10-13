@@ -1381,6 +1381,52 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     out.push_str(ink_abi::VALUE_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use value_wire::Limits as ValueWireLimits;\n");
     out.push_str(ink_native_support::BINARY_VALUES_RUST_SOURCE);
-    out.push_str("impl State{fn binary_call_value(&mut self,name:&str,args:&Json)->Result<Json,String>{self.call_json(name,args)}}\n");
+    out.push_str(ink_native_support::DIRECT_VALUES_RUST_SOURCE);
+    out.push_str(&emit_binary_values(p)?);
+    Ok(out)
+}
+
+/// Type-directed codec emission; representation strategy still comes from plans.
+fn emit_binary_values(p: &Program) -> LangResult<String> {
+    let mut out = String::new();
+    let describe = |t: &Type| ink_abi::describe(t, &p.records, &p.enums, &p.ids);
+    let named = p.records.keys().map(|n| Ok((n.clone(), describe(&Type::Named(n.clone()))?))).collect::<LangResult<BTreeMap<_,_>>>()?;
+    for n in &p.ids {
+        let id = ident(n);
+        writeln!(out, "impl BinaryValue for {id}{{fn from_binary(v:value_wire::Validated<'_>)->Result<Self,String>{{v.require_kind(\"id\")?;v.require_name({n:?})?;Ok(Self(u128::from_str_radix(v.text()?,16).map_err(|_|\"wire ID\")?))}}fn write_binary(&self,w:&mut value_wire::Encoder)->Result<(),String>{{w.frame(|w|w.bytes(format!(\"{{:032x}}\",self.0).as_bytes()))}}}}").unwrap();
+    }
+    for (n,fs) in &p.records {
+        if ink_abi::value_wire::Schema::new(describe(&Type::Named(n.clone()))?, named.clone()).is_err() { continue; }
+        let id = ident(n);
+        writeln!(out, "impl BinaryValue for {id}{{fn from_binary(v:value_wire::Validated<'_>)->Result<Self,String>{{v.require_kind(\"record\")?;v.require_name({n:?})?;let mut fields=v.fields()?;Ok(Self{{").unwrap();
+        for (f,t) in fs { writeln!(out,"{}:<{} as BinaryValue>::from_binary(fields.next().ok_or(\"wire record field\")??)?,",ident(f),field_ty(n,t,p)?).unwrap(); }
+        out.push_str("})}fn write_binary(&self,w:&mut value_wire::Encoder)->Result<(),String>{w.frame(|w|{");
+        for (f,_) in fs { writeln!(out,"self.{}.write_binary(w)?;",ident(f)).unwrap(); }
+        out.push_str("Ok(())})}}\n");
+    }
+    for (n,variants) in &p.enums {
+        let id = ident(n);
+        writeln!(out,"impl BinaryValue for {id}{{fn from_binary(v:value_wire::Validated<'_>)->Result<Self,String>{{v.require_kind(\"enum\")?;v.require_name({n:?})?;match v.text()?{{").unwrap();
+        for v in variants { writeln!(out,"{:?}=>Ok(Self::{}),",format!("{n}.{v}"),ident(v)).unwrap(); }
+        out.push_str("_=>Err(\"wire enum variant\".into())}}fn write_binary(&self,w:&mut value_wire::Encoder)->Result<(),String>{w.frame(|w|w.bytes(match self{");
+        for v in variants { writeln!(out,"Self::{}=>{:?}.as_bytes(),",ident(v),format!("{n}.{v}")).unwrap(); }
+        out.push_str("}))}}\n");
+    }
+    let contract = ink_abi::wire_contract::source_contract(p)?;
+    out.push_str("impl State{fn binary_call_frame(&mut self,name:&str,record:value_wire::Validated<'_>,output:&value_wire::Schema,limits:ValueWireLimits)->Result<Vec<u8>,String>{match name{\n");
+    for f in &p.functions {
+        if contract["functions"][&f.name].get("unsupported").is_some() { continue; }
+        writeln!(out,"{:?}=>{{let mut fields=record.fields()?;",f.name).unwrap();
+        let mut args = vec![];
+        for (i,(_,t)) in f.params.iter().enumerate() {
+            writeln!(out,"let a{i}=<{} as BinaryValue>::from_binary(fields.next().ok_or(\"wire argument\")??)?;",ty(t)?).unwrap();
+            args.push(format!("a{i}"));
+        }
+        if let Some(guard) = p.contracts.precondition_checks.get(&f.name) {
+            writeln!(out,"if !self.function_{}({}){{return Err(\"contract precondition failed\".into());}}",ident(guard),args.iter().map(|a|format!("{a}.clone()")).collect::<Vec<_>>().join(",")).unwrap();
+        }
+        writeln!(out,"let result=self.function_{}({});output.encode_with(limits,|w|result.write_binary(w))}},",ident(&f.name),args.join(",")).unwrap();
+    }
+    out.push_str("_=>Err(\"unsupported binary function\".into())}}}\n");
     Ok(out)
 }
