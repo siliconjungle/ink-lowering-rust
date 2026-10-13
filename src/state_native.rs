@@ -921,6 +921,7 @@ pub fn emit_with_table_storage(p: &Program, storage: TableStorage) -> LangResult
     emit_with_layout(p,&layout,storage,None)
 }
 pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
+    plan.require_record_elision_capability(false)?;
     plan.require_source_storage_capability(false,false)?;
     let layout=crate::snapshot::layout(plan.original().program())?;
     let storage=match plan.physical().map(|p|p.plan().tables).unwrap_or_default() {

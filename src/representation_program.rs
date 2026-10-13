@@ -285,6 +285,7 @@ pub fn lower_memo(checked: &CheckedRepresentation) -> LangResult<String> {
 }
 pub fn lower_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
     let checked=plan.representation().ok_or("planned representation missing")?;
+    plan.require_record_elision_capability(false)?;
     let physical=plan.physical();
     let packed=physical.is_some_and(|p|!p.plan().packed_datatypes.is_empty());
     let memo=physical.is_some_and(|p|!p.plan().memo_functions.is_empty());
