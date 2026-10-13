@@ -959,6 +959,7 @@ fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage:
         ink_abi::VALUE_ABI
     )
     .unwrap();
+    writeln!(out,"pub const INK_WIRE_CONTRACT:&str={:?};",ink_abi::wire_contract::source_contract(p)?.to_string()).unwrap();
     out.push_str(ink_native_support::TYPED_VALUES_RUST_SOURCE);
     out.push_str("\nmod temporary {\n");
     out.push_str(ink_native_support::OWNED_VALUES_RUST_SOURCE);
@@ -1375,5 +1376,10 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         .unwrap();
     }
     out.push_str("_=>Err(\"unknown action\".into())}}}\n");
+    out.push_str("\nmod value_wire {\n");
+    out.push_str(ink_abi::VALUE_WIRE_RUST_SOURCE);
+    out.push_str("\n}\npub use value_wire::Limits as ValueWireLimits;\n");
+    out.push_str(ink_native_support::BINARY_VALUES_RUST_SOURCE);
+    out.push_str("impl State{fn binary_call_value(&mut self,name:&str,args:&Json)->Result<Json,String>{self.call_json(name,args)}}\n");
     Ok(out)
 }
