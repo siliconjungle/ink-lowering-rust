@@ -309,6 +309,12 @@ impl Emitter<'_> {
                 (s, if arithmetic { at } else { T::Bool })
             }
             Expr::Call(n, args) => match n.as_str() {
+                n if ink_core::primitives::primitive(n) => {
+                    let first=args.first().and_then(|a|self.execution.type_of(a));
+                    let (params,result)=ink_core::primitives::signature(n,first)?;
+                    let values=args.iter().zip(params).map(|(a,t)|self.expr(a,env,Some(&t)).map(|x|x.0)).collect::<LangResult<Vec<_>>>()?;
+                    (crate::primitive_emit::expression(n,&values)?,result)
+                }
                 name if ink_core::word::primitive(name) => {
                     let t = want
                         .cloned()
@@ -962,6 +968,7 @@ fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage:
     .unwrap();
     writeln!(out,"pub const INK_WIRE_CONTRACT:&str={:?};",ink_abi::wire_contract::source_contract(p)?.to_string()).unwrap();
     out.push_str(ink_native_support::TYPED_VALUES_RUST_SOURCE);
+    out.push_str(ink_native_support::NUMERIC_INT_RUST_SOURCE);
     out.push_str("\nmod temporary {\n");
     out.push_str(ink_native_support::OWNED_VALUES_RUST_SOURCE);
     match storage {
