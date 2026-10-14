@@ -70,8 +70,54 @@ impl Emitter<'_> {
     // Read-only traversals borrow a lexical list instead of cloning the entire
     // vector. Computed receivers still finish eagerly and are consumed once.
     fn borrowed_place(&self, e: &Expr, env: &Env) -> Option<String> {
-        if !self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_read(&id))) {return None;}
+        // Without a physical plan every lexical read site borrows (the core's
+        // borrow-site eligibility is purely lexical and typed). A final read
+        // of a whole local is moved instead. A checked plan decides per site.
+        match self.physical {
+            Some(plan) => if !ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_read(&id)) {return None;},
+            None => if matches!(e, Expr::Var(_)) && self.last_uses.contains(e) {return None;},
+        }
         self.lexical_place(e, env)
+    }
+    fn reserved(&self, e: &Expr) -> bool {
+        self.reservation.as_ref().is_some_and(|(site,_)|ink_core::registry::identity(e).is_ok_and(|id|id==*site))
+    }
+    /// An iterator over a list expression and whether it yields `&T`.
+    /// Lexical places are borrowed; map/filter stages feeding another
+    /// traversal stay lazy instead of materialising an intermediate vector.
+    /// Pure callbacks cannot observe the interleaving.
+    fn iterate(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, bool)> {
+        let t = self.infer(e, env, want)?;
+        let Type::List(inner) = &t else { return Err("list receiver".into()) };
+        let plain = |me: &Self, item: &Type| crate::columns::names(item).is_none() && !ink_core::local_collections::owned(item, me.p);
+        if let Some(place) = self.borrowed_place(e, env) {
+            return Ok(if crate::columns::names(inner).is_some() {
+                (format!("({place}).iter()"), false)
+            } else if !plain(self, inner) {
+                (format!("({place}).iter().cloned()"), false)
+            } else {
+                (format!("({place}).iter()"), true)
+            });
+        }
+        if let Expr::Method(receiver, n, args) = e {
+            if matches!(n.as_str(), "map" | "filter") && !self.reserved(e) && plain(self, inner) {
+                let rt = self.infer(receiver, env, if n == "filter" { Some(&t) } else { None })?;
+                if let Type::List(rin) = rt {
+                    if plain(self, &rin) {
+                        let (it, borrowed) = self.iterate(receiver, env, if n == "filter" { Some(&t) } else { None })?;
+                        if n == "map" {
+                            let (vs, body) = self.lambda_mode(&args[0], env, &[*rin], inner, &[borrowed])?;
+                            return Ok((format!("({it}).map(|{}|{{{body}}})", vs[0]), false));
+                        }
+                        let (vs, body) = self.lambda_mode(&args[0], env, &[*rin], &Type::Bool, &[true])?;
+                        let bind = if borrowed { "*ink_ref" } else { "ink_ref" };
+                        return Ok((format!("({it}).filter(|ink_ref|{{let {}={bind};{body}}})", vs[0]), borrowed));
+                    }
+                }
+            }
+        }
+        let value = self.expr(e, env, want)?;
+        Ok((format!("({value}).into_iter()"), false))
     }
     // Field projection copies the field value, not its containing record.
     // This is literal access to a checked place; it retains no borrowed value
@@ -83,20 +129,13 @@ impl Emitter<'_> {
         Some(place)
     }
 
-    fn read_iterator(&self, e: &Expr, value: &str, env: &Env) -> LangResult<String> {
-        Ok(if let Some(place) = self.borrowed_place(e, env) {
-            // Lexical record projections have no evaluation side effects.
-            // Borrow only for this traversal; subsequent source uses survive.
-            if matches!(self.infer(e,env,None)?,Type::List(ref t)if crate::columns::names(t).is_some()){format!("({place}).iter()")}else{format!("({place}).iter().cloned()")}
-        } else {
-            format!("({value}).into_iter()")
-        })
-    }
     fn lambda(&mut self,e:&Expr,env:&Env,params:&[Type],result:&Type)->LangResult<(Vec<String>,String)> {
-        self.lambda_mode(e,env,params,result,false)
+        self.lambda_mode(e,env,params,result,&[])
     }
+    /// `borrowed[i]` binds parameter `i` to a shared reference: every use
+    /// copies the observed value, so it is never moved out of its owner.
     fn lambda_mode(
-        &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:bool,
+        &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:&[bool],
     ) -> LangResult<(Vec<String>,String)> {
         let mut local = env.clone();
         let mut vars = vec![];
@@ -122,7 +161,7 @@ impl Emitter<'_> {
         let facts=ink_core::last_use::analyse(body,formal);
         let outer=std::mem::replace(&mut self.last_uses,facts);
         let previous_borrows=self.borrowed_bindings.clone();
-        if borrowed {self.borrowed_bindings.extend(vars.iter().cloned());}
+        self.borrowed_bindings.extend(vars.iter().zip(borrowed).filter(|(_,b)|**b).map(|(v,_)|v.clone()));
         let emitted=self.expr(body,&local,Some(result));
         self.borrowed_bindings=previous_borrows;
         self.last_uses=outer;
@@ -614,7 +653,7 @@ impl Emitter<'_> {
                 let xs = self.expr(&args[0], env, None)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 let read_only = !ink_core::local_collections::owned(&inner,self.p) && !ink_core::local_collections::owned(&t,self.p);
-                let (stopvars, stop) = self.lambda_mode(&args[2],env,&[inner.as_ref().clone(),t.clone()],&Type::Bool,read_only)?;
+                let (stopvars, stop) = self.lambda_mode(&args[2],env,&[inner.as_ref().clone(),t.clone()],&Type::Bool,&[read_only,read_only])?;
                 let (vs, body) = self.lambda(&args[3], env, &[*inner, t.clone()], &t)?;
                 let list = self.fresh();
                 let acc = self.fresh();
@@ -628,10 +667,9 @@ impl Emitter<'_> {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
                     return Err("fold input".into());
                 };
-                let xs = self.expr(&args[0], env, None)?;
-                let iterator = self.read_iterator(&args[0], &xs, env)?;
+                let (iterator, borrowed) = self.iterate(&args[0], env, None)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
-                let (vs, body) = self.lambda(&args[2], env, &[*inner, t.clone()], &t)?;
+                let (vs, body) = self.lambda_mode(&args[2], env, &[*inner, t.clone()], &t, &[borrowed, false])?;
                 let acc = self.fresh();
                 let list = self.fresh();
                 let direction = if n == "foldr" { ".rev()" } else { "" };
@@ -643,27 +681,28 @@ impl Emitter<'_> {
                 } else {
                     None
                 };
-                let xs = self.expr(&args[0], env, context.as_ref())?;
-                if n == "count" {
-                    let value = if let Expr::Var(n) = &args[0] {
-                        env.get(n).ok_or("list binding")?.0.clone()
-                    } else {
-                        xs
-                    };
-                    if t == Type::Int {
-                        format!("BigInt::from(({value}).len())")
-                    } else {
-                        format!("({value}).len() as u64")
-                    }
-                } else {
-                    let iterator = self.read_iterator(&args[0], &xs, env)?;
+                if n == "sum" {
+                    let (iterator, borrowed) = self.iterate(&args[0], env, context.as_ref())?;
+                    let iterator = if borrowed { format!("({iterator}).cloned()") } else { iterator };
                     let acc = self.fresh();
                     let item = self.fresh();
-                    format!(
+                    return Ok(format!(
                         "({iterator}).fold({},|{acc},{item}|{})",
                         Self::zero(&t),
                         Self::arithmetic("+", &acc, &item, &t)
-                    )
+                    ));
+                }
+                // count: a lexical list has its length; a computed list
+                // is counted without being materialised.
+                let length = if let Expr::Var(n) = &args[0] {
+                    format!("({}).len()", env.get(n).ok_or("list binding")?.0)
+                } else {
+                    format!("({}).count()", self.iterate(&args[0], env, context.as_ref())?.0)
+                };
+                if t == Type::Int {
+                    format!("BigInt::from({length})")
+                } else {
+                    format!("{length} as u64")
                 }
             }
             Expr::Call(n, args) => {
@@ -750,11 +789,10 @@ impl Emitter<'_> {
                     return Err("list receiver".into());
                 };
                 let receiver = xs.as_ref();
-                let xs = self.expr(receiver, env, None)?;
-                let iterator = self.read_iterator(receiver, &xs, env)?;
                 let collection=crate::state_native::ty(&t)?;
                 match n.as_str() {
                     "at_or" => {
+                        let xs = self.expr(receiver, env, None)?;
                         let index = self.expr(&args[0], env, Some(&Type::U32))?;
                         let fallback = self.expr(&args[1], env, Some(&t))?;
                         let list = self.fresh();
@@ -771,6 +809,7 @@ impl Emitter<'_> {
                         if self.unchecked(e){format!("{{let {list}={xs};let {i}={index};unsafe{{{list}.get_unchecked({i} as usize).clone()}}}}") }else{format!("{{let {list}={xs};let {i}={index};match {list}.get({i} as usize){{Some(v)=>v.clone(),None=>{fallback}}}}}")}
                     }
                     "drop" | "take" => {
+                        let xs = self.expr(receiver, env, None)?;
                         let k = self.expr(&args[0], env, Some(&Type::U32))?;
                         let list = self.fresh();
                         let count = self.fresh();
@@ -782,10 +821,13 @@ impl Emitter<'_> {
                         format!("{{let mut {list}={xs};let {count}=({k} as usize).min({list}.len());{edit}{list}}}")
                     }
                     "sort" => {
+                        let xs = self.expr(receiver, env, None)?;
                         let list = self.fresh();
                         format!("{{let mut {list}={xs};{list}.sort();{list}}}")
                     }
                     "scan" => {
+                        let (iterator, borrowed) = self.iterate(receiver, env, None)?;
+                        let iterator = if borrowed { format!("({iterator}).cloned()") } else { iterator };
                         let acc = self.fresh();
                         let item = self.fresh();
                         {
@@ -806,26 +848,39 @@ impl Emitter<'_> {
                         } else {
                             vec![*inner]
                         };
-                        let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
-                        if n=="map"&&self.infer(xs_receiver(e),env,None)?==t&&crate::columns::names(&output).is_some()&&self.borrowed_place(xs_receiver(e),env).is_none()&&!self.reservation.as_ref().is_some_and(|(site,_)|ink_core::registry::identity(e).is_ok_and(|id|id==*site)){
+                        if n=="map"&&self.infer(xs_receiver(e),env,None)?==t&&crate::columns::names(&output).is_some()&&self.borrowed_place(xs_receiver(e),env).is_none()&&!self.reserved(e){
+                            let xs = self.expr(receiver, env, None)?;
+                            let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
                             let mask=self.column_mask(e,&output);format!("({xs}).map_rows(|{}|{{{body}}},{mask})",vs[0])
                         }else if n=="map" && self.infer(xs_receiver(e),env,None)?==t
                             && matches!(&output,Type::Named(name) if self.p.records.get(name).is_some_and(|fields| fields.iter().all(|(_,ty)| matches!(ty,Type::U32|Type::U64|Type::I32|Type::F32|Type::Bool|Type::Unit))))
                             && self.borrowed_place(xs_receiver(e),env).is_none()
-                            && !self.reservation.as_ref().is_some_and(|(site,_)|ink_core::registry::identity(e).is_ok_and(|id|id==*site)) {
+                            && !self.reserved(e) {
                             // Fixed scalar records have no ownership-bearing fields.
                             // Preserve ordered callback evaluation while making the
                             // already-owned input allocation explicit to the host
                             // optimizer. Captured source lists retain their normal
                             // lexical copies; only this private receiver is mutated.
+                            let xs = self.expr(receiver, env, None)?;
+                            let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
                             let values=self.fresh();let slot=self.fresh();
                             format!("{{let mut {values}={xs};for {slot} in &mut {values}{{let {}=({slot}).clone();*{slot}={body};}}{values}}}",vs[0])
-                        }else if n == "filter" {
-                            self.collect(e,format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}})",vs[0]),&collection)?
-                        } else if n == "map_indexed" {
-                            self.collect(e,format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}})",vs[1],vs[0]),&collection)?
-                        } else {
-                            self.collect(e,format!("({iterator}).map(|{}|{body})", vs[0]),&collection)?
+                        }else {
+                            let (iterator, borrowed) = self.iterate(receiver, env, if n == "filter" { Some(&t) } else { None })?;
+                            if n == "filter" {
+                                // The predicate reads each item by reference; only
+                                // retained items are copied into the result.
+                                let (vs, body) = self.lambda_mode(&args[0], env, &params, &output, &[true])?;
+                                let bind = if borrowed { "*ink_ref" } else { "ink_ref" };
+                                let retained = if borrowed { ".cloned()" } else { "" };
+                                self.collect(e,format!("({iterator}).filter(|ink_ref|{{let {}={bind};{body}}}){retained}",vs[0]),&collection)?
+                            } else if n == "map_indexed" {
+                                let (vs, body) = self.lambda_mode(&args[0], env, &params, &output, &[false, borrowed])?;
+                                self.collect(e,format!("({iterator}).enumerate().map(|(ink_i,{})|{{let {}=ink_i as u32;{body}}})",vs[1],vs[0]),&collection)?
+                            } else {
+                                let (vs, body) = self.lambda_mode(&args[0], env, &params, &output, &[borrowed])?;
+                                self.collect(e,format!("({iterator}).map(|{}|{body})", vs[0]),&collection)?
+                            }
                         }
                     }
                     "zip" => {
@@ -835,12 +890,12 @@ impl Emitter<'_> {
                         let Type::List(out) = &t else {
                             return Err("zip output".into());
                         };
-                        let ys = self.expr(&args[0], env, None)?;
-                        let right_iterator = self.read_iterator(&args[0], &ys, env)?;
-                        let (vs, body) = self.lambda(&args[1], env, &[*inner, *other], out)?;
+                        let (left, left_borrowed) = self.iterate(receiver, env, None)?;
+                        let (right, right_borrowed) = self.iterate(&args[0], env, None)?;
+                        let (vs, body) = self.lambda_mode(&args[1], env, &[*inner, *other], out, &[left_borrowed, right_borrowed])?;
                         let a = self.fresh();
                         let b = self.fresh();
-                        format!("{{let {a}={iterator};let {b}={right_iterator};{}}}",self.collect(e,format!("{a}.zip({b}).map(|({},{})|{body})",vs[0],vs[1]),&collection)?)
+                        format!("{{let {a}={left};let {b}={right};{}}}",self.collect(e,format!("{a}.zip({b}).map(|({},{})|{body})",vs[0],vs[1]),&collection)?)
                     }
                     _ => return Err(format!("unsupported pure method {n}")),
                 }
@@ -989,7 +1044,8 @@ impl Clone for l_Item{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed
 fn main(){
 let r=l_Outer{l_nested:l_Inner{l_first:vec![l_Item{l_key:0},l_Item{l_key:u32::MAX},l_Item{l_key:9}],l_second:(0..1000).map(|i|l_Item{l_key:i}).collect(),l_id:17}};
 assert_eq!(key(&r),17);assert_eq!(COPIES.load(Ordering::Relaxed),0);
-assert_eq!(mapped(&r),vec![1,0,10]);assert_eq!(COPIES.swap(0,Ordering::Relaxed),3);
+// The callback reads one field through a borrow; no element is copied.
+assert_eq!(mapped(&r),vec![1,0,10]);assert_eq!(COPIES.swap(0,Ordering::Relaxed),0);
 let mut a=joined(&r);assert_eq!(a.len(),6);assert_eq!(COPIES.swap(0,Ordering::Relaxed),6);
 a[0].l_key=42;assert_eq!(r.l_nested.l_first[0].l_key,0);
 let a=selected(&r);assert_eq!(a.len(),3);assert_eq!(COPIES.swap(0,Ordering::Relaxed),3);assert_eq!(r.l_nested.l_second.len(),1000);

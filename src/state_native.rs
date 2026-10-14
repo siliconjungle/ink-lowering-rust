@@ -88,6 +88,11 @@ struct Emitter<'a> {
     borrowed: BTreeSet<String>,
     /// Field snapshots taken when a borrowed row had to be released.
     aliases: BTreeMap<(String, String), String>,
+    /// Set by an aggregate for its immediate list argument: a map/filter stage
+    /// may then return an iterator instead of a collected vector.
+    lazy: bool,
+    /// Reports that the stage honoured `lazy`.
+    lazy_done: bool,
 }
 
 /// Conservative range analysis for one exact sum of an unsigned row field.
@@ -127,6 +132,7 @@ impl Emitter<'_> {
         format!("tmp_{}", self.serial)
     }
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, Type)> {
+        let lazy = std::mem::take(&mut self.lazy);
         let resolved = self.execution.type_of(e).cloned();
         let want = want.or(resolved.as_ref());
         use Type as T;
@@ -385,12 +391,17 @@ impl Emitter<'_> {
                     )
                 }
                 "sum" | "count" => {
-                    let (s, t) = self.expr(&args[0], env, None)?;
+                    self.lazy = self.probe == 0;
+                    let emitted = self.expr(&args[0], env, None);
+                    self.lazy = false;
+                    let streamed = std::mem::take(&mut self.lazy_done);
+                    let (s, t) = emitted?;
                     let T::List(t) = t else {
                         return Err("native aggregate requires list".into());
                     };
+                    let s = if streamed { s } else { format!("({s}).into_iter()") };
                     if n == "count" {
-                        (format!("BigInt::from(({s}).len())"), T::Int)
+                        (format!("BigInt::from(({s}).count())"), T::Int)
                     } else {
                         let zero = if *t == T::Int {
                             "BigInt::from(0u8)".into()
@@ -404,7 +415,7 @@ impl Emitter<'_> {
                         } else {
                             "a.wrapping_add(b)"
                         };
-                        (format!("({s}).into_iter().fold({zero},|a,b|{add})"), *t)
+                        (format!("({s}).fold({zero},|a,b|{add})"), *t)
                     }
                 }
                 _ => {
@@ -520,7 +531,10 @@ impl Emitter<'_> {
                     let closure_borrows_self = args
                         .iter()
                         .any(|arg| ownership::expr_mutates_state(self.p, arg));
-                    if self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_row(&id))) {
+                    // Without a physical plan, eligible stored-row stages borrow
+                    // (the core's row-site eligibility is purely syntactic); a
+                    // checked plan decides per site.
+                    if self.physical.map_or(true, |plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_row(&id))) {
                     if let Expr::Method(r, m, margs) = base.as_ref() {
                         if let Expr::Var(root) = r.as_ref() {
                             if let Some(state) = self.p.states.iter().find(|s| &s.name == root) {
@@ -643,6 +657,13 @@ impl Emitter<'_> {
                                     )
                                 } else {
                                     format!("{s}.map(|{}|{{{code}}}).collect::<Vec<_>>()", ident(v))
+                                };
+                                // An aggregate consumes the stage directly.
+                                let mapped = if lazy {
+                                    self.lazy_done = true;
+                                    mapped.strip_suffix(".collect::<Vec<_>>()").ok_or("lazy list stage")?.to_owned()
+                                } else {
+                                    mapped
                                 };
                                 let output=if n=="filter"{T::List(t.clone())}else{T::List(Box::new(out.clone()))};
                                 let mapped=mapped.replace("collect::<Vec<_>>()",&format!("collect::<{}>()",ty(&output)?));
@@ -945,6 +966,8 @@ fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage:
         probe: 0,
         borrowed: BTreeSet::new(),
         aliases: BTreeMap::new(),
+        lazy: false,
+        lazy_done: false,
     };
     let mut out = String::from(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
