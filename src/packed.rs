@@ -55,6 +55,10 @@ pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
     }
     let mut out = crate::state_native::emit(p)?;
     out.push_str(include_str!("packed-runtime.rs.txt"));
+    // A packed fallback has no JSON worker import. Re-enter its checked callback
+    // in the existing nested-worker scope so recursive parallel calls execute
+    // locally with the same ordered value semantics.
+    out.push_str("#[cfg(target_arch=\"wasm32\")] fn __ink_parallel_host(mut task:Json)->Result<Json,String>{task[\"start\"]=json!(0u32);State::new().parallel_worker(&task)}\n");
     out.push_str("unsafe fn ink_packed_result(function:u32,data:*const *const std::ffi::c_void,lengths:*const usize)->Vec<u32>{match function{\n");
     for (i, f) in p.functions.iter().enumerate() {
         out.push_str(&format!("{i}=>{{"));
