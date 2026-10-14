@@ -429,8 +429,8 @@ impl Emitter<'_> {
                 format!("{{let {av}={a};let {bv}={b};if {bv}==0 {overflow} {{{fallback}}} else {{{av} {} {bv}}}}}",if n=="quot_or"{"/"}else{"%"})
             }
             Expr::Call(n, args) if n == "length" => {
-                let xs = if let Expr::Var(n) = &args[0] {
-                    env.get(n).ok_or("list binding")?.0.clone()
+                let xs = if let Some(place) = self.lexical_place(&args[0], env) {
+                    place
                 } else {
                     self.expr(&args[0], env, None)?
                 };
@@ -759,15 +759,16 @@ impl Emitter<'_> {
                         let fallback = self.expr(&args[1], env, Some(&t))?;
                         let list = self.fresh();
                         let i = self.fresh();
-                        let xs = if let Expr::Method(input, _, _) = e {
-                            if let Expr::Var(n) = input.as_ref() {
-                                format!("&{}", env.get(n).ok_or("list binding")?.0)
-                            } else {
-                                xs
-                            }
-                        } else {
-                            xs
-                        };
+                        // A lexical projection has no evaluation effects. Read
+                        // one element without copying its containing list. If
+                        // another argument uses the root, retain the ordinary
+                        // owned receiver: that argument may consume the root at
+                        // its final use while this lookup still needs the list.
+                        let xs = if let Some((root, _)) = ink_core::collection_facts::lexical_projection(receiver) {
+                            if args.iter().all(|arg| !references(arg, root)) {
+                                self.lexical_place(receiver, env).map(|place| format!("&({place})")).unwrap_or(xs)
+                            } else { xs }
+                        } else { xs };
                         if self.unchecked(e){format!("{{let {list}={xs};let {i}={index};unsafe{{{list}.get_unchecked({i} as usize).clone()}}}}") }else{format!("{{let {list}={xs};let {i}={index};match {list}.get({i} as usize){{Some(v)=>v.clone(),None=>{fallback}}}}}")}
                     }
                     "drop" | "take" => {
@@ -1170,6 +1171,78 @@ fn main(){
 }
 
 fn xs_receiver(e:&Expr)->&Expr {if let Expr::Method(xs,_,_)=e{xs}else{unreachable!()}}
+
+#[cfg(test)]
+mod projected_list_read_tests {
+    use super::*;
+
+    #[test]
+    fn nested_reads_copy_only_the_selected_value_and_preserve_consuming_arguments() {
+        let p=parse(r#"module projected_reads;
+record Item { value:u32, }
+record Inner { items:List<Item>, }
+record Outer { inner:Inner, }
+fn size(r:Outer)->u32{return length(r.inner.items);}
+fn pick(r:Outer,i:u32)->Item{return r.inner.items.at_or(i,fallback());}
+fn captured(r:Outer)->List<u32>{let ids:List<u32>=[0,1,2];return ids.map(fn(i)=>r.inner.items.at_or(i,Item{value:99}).value+length(r.inner.items));}
+fn consume(r:Outer)->u32{return length(r.inner.items)-1;}
+fn index_consumes(r:Outer)->Item{return r.inner.items.at_or(consume(r),fallback());}
+fn fallback_consumes(r:Outer)->Item{return r.inner.items.at_or(99,Item{value:consume(r)});}
+fn consume_list(xs:List<Item>)->u32{return length(xs)-1;}
+fn plain_index_consumes(xs:List<Item>)->Item{return xs.at_or(consume_list(xs),fallback());}
+fn identity(r:Outer)->Outer{return r;}
+fn computed(r:Outer)->Item{return identity(r).inner.items.at_or(1,fallback());}
+fn fallback()->Item{return Item{value:99};}
+"#).unwrap();
+        check::check(&p).unwrap();
+        let mut code=String::from(r#"
+#![allow(non_camel_case_types,unused_variables,unused_parens)]
+use std::sync::atomic::{AtomicUsize,Ordering};
+static COPIES:AtomicUsize=AtomicUsize::new(0);
+static FALLBACKS:AtomicUsize=AtomicUsize::new(0);
+static COMPUTED:AtomicUsize=AtomicUsize::new(0);
+#[derive(Debug,PartialEq)]struct l_Item{l_value:u32}
+impl Clone for l_Item{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed);Self{l_value:self.l_value}}}
+#[derive(Clone)]struct l_Inner{l_items:Vec<l_Item>}
+#[derive(Clone)]struct l_Outer{l_inner:l_Inner}
+struct State;
+impl State {
+fn function_l_fallback(&self)->l_Item{FALLBACKS.fetch_add(1,Ordering::Relaxed);l_Item{l_value:99}}
+fn function_l_identity(&self,r:l_Outer)->l_Outer{COMPUTED.fetch_add(1,Ordering::Relaxed);r}
+"#);
+        for f in &p.functions {
+            if ["fallback","identity"].contains(&f.name.as_str()){continue;}
+            let params=f.params.iter().map(|(n,t)|format!("l_{n}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
+            code.push_str(&format!("fn function_l_{}(&self,{params})->{}{{{}}}\n",f.name,crate::state_native::ty(&f.result).unwrap(),body(&p,f).unwrap()));
+        }
+        code.push_str(r#"
+}
+fn record(n:u32)->l_Outer{l_Outer{l_inner:l_Inner{l_items:(0..n).map(|v|l_Item{l_value:v+10}).collect()}}}
+fn main(){
+let state=State;
+assert_eq!(state.function_l_size(record(4096)),4096);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(state.function_l_size(record(0)),0);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(state.function_l_pick(record(4096),17).l_value,27);assert_eq!(COPIES.load(Ordering::Relaxed),1);
+assert_eq!(FALLBACKS.load(Ordering::Relaxed),0);
+assert_eq!(state.function_l_pick(record(0),0).l_value,99);assert_eq!(FALLBACKS.load(Ordering::Relaxed),1);
+assert_eq!(state.function_l_pick(record(4),u32::MAX).l_value,99);assert_eq!(FALLBACKS.load(Ordering::Relaxed),2);
+COPIES.store(0,Ordering::Relaxed);
+assert_eq!(state.function_l_captured(record(2)),vec![12,13,101]);assert_eq!(COPIES.load(Ordering::Relaxed),2);
+assert_eq!(state.function_l_index_consumes(record(3)).l_value,12);
+assert_eq!(state.function_l_fallback_consumes(record(3)).l_value,2);
+assert_eq!(state.function_l_plain_index_consumes(record(3).l_inner.l_items).l_value,12);
+assert_eq!(state.function_l_computed(record(3)).l_value,11);assert_eq!(COMPUTED.load(Ordering::Relaxed),1);
+assert_eq!(FALLBACKS.load(Ordering::Relaxed),2);
+}
+"#);
+        let dir=std::env::temp_dir().join(format!("ink-projected-list-reads-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();std::fs::write(dir.join("main.rs"),code).unwrap();
+        let output=std::process::Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs")).arg("-o").arg(dir.join("run")).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let output=std::process::Command::new(dir.join("run")).output().unwrap();std::fs::remove_dir_all(dir).unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+}
 
 #[cfg(test)]
 mod callback_ownership_tests {
