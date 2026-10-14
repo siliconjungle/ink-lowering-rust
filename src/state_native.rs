@@ -88,8 +88,86 @@ struct Emitter<'a> {
     borrowed: BTreeSet<String>,
     /// Field snapshots taken when a borrowed row had to be released.
     aliases: BTreeMap<(String, String), String>,
+    /// Set by an aggregate for its immediate list argument: a map/filter stage
+    /// may then return an iterator instead of a collected vector.
+    lazy: bool,
+    /// Reports that the stage honoured `lazy`.
+    lazy_done: bool,
 }
 
+
+/// Retained derived values: scalar keeps and parameterless scalar queries keep
+/// their last result until a table they can observe is written. Reads are
+/// deterministic functions of the tables, so a retained value is the value a
+/// fresh evaluation would produce. Rollback and restore discard every result.
+struct Retained {
+    /// (cache field, roots it observes)
+    caches: Vec<(String, BTreeSet<String>)>,
+    keeps: BTreeSet<String>,
+    queries: BTreeSet<String>,
+}
+fn retainable(t: &Type) -> bool {
+    matches!(t, Type::U32 | Type::U64 | Type::I32 | Type::F32 | Type::Bool | Type::Unit | Type::Int)
+}
+fn statement_expressions<'a>(s: &'a Statement, out: &mut Vec<&'a Expr>) {
+    match s {
+        Statement::Let(_, _, e) | Statement::Return(e) | Statement::Emit(_, e) | Statement::Expr(e) => out.push(e),
+        Statement::If(c, a, b) => {
+            out.push(c);
+            for s in a.iter().chain(b) {
+                statement_expressions(s, out);
+            }
+        }
+    }
+}
+/// Every table a keep or action can observe, following keeps and nested
+/// action calls. Pure functions cannot read state.
+fn observed_roots(p: &Program, start: Vec<&Expr>) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = start;
+    while let Some(e) = pending.pop() {
+        let mut found = vec![];
+        ink_core::analysis::walk(e, |x| match x {
+            Expr::Var(n) | Expr::Call(n, _) => found.push(n.clone()),
+            _ => {}
+        });
+        for n in found {
+            if p.states.iter().any(|s| s.name == n) {
+                roots.insert(n);
+            } else if !seen.insert(n.clone()) {
+                continue;
+            } else if let Some(k) = p.keeps.iter().find(|k| k.name == n) {
+                pending.push(&k.value);
+            } else if let Some(a) = p.actions.iter().find(|a| a.name == n) {
+                for s in &a.body {
+                    statement_expressions(s, &mut pending);
+                }
+            }
+        }
+    }
+    roots
+}
+fn retained(p: &Program) -> Retained {
+    let mut r = Retained { caches: vec![], keeps: BTreeSet::new(), queries: BTreeSet::new() };
+    for k in &p.keeps {
+        if retainable(&k.ty) {
+            r.caches.push((format!("retained_keep_{}", ident(&k.name)), observed_roots(p, vec![&k.value])));
+            r.keeps.insert(k.name.clone());
+        }
+    }
+    for a in &p.actions {
+        if a.kind == ActionKind::Query && a.params.is_empty() && a.emits.is_empty() && retainable(&a.result) && !p.contracts.precondition_checks.contains_key(&a.name) {
+            let mut start = vec![];
+            for s in &a.body {
+                statement_expressions(s, &mut start);
+            }
+            r.caches.push((format!("retained_query_{}", ident(&a.name)), observed_roots(p, start)));
+            r.queries.insert(a.name.clone());
+        }
+    }
+    r
+}
 /// Conservative range analysis for one exact sum of an unsigned row field.
 /// Full key-domain cardinality is used, not an observed size or host RAM bound.
 
@@ -127,6 +205,7 @@ impl Emitter<'_> {
         format!("tmp_{}", self.serial)
     }
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, Type)> {
+        let lazy = std::mem::take(&mut self.lazy);
         let resolved = self.execution.type_of(e).cloned();
         let want = want.or(resolved.as_ref());
         use Type as T;
@@ -385,12 +464,17 @@ impl Emitter<'_> {
                     )
                 }
                 "sum" | "count" => {
-                    let (s, t) = self.expr(&args[0], env, None)?;
+                    self.lazy = self.probe == 0;
+                    let emitted = self.expr(&args[0], env, None);
+                    self.lazy = false;
+                    let streamed = std::mem::take(&mut self.lazy_done);
+                    let (s, t) = emitted?;
                     let T::List(t) = t else {
                         return Err("native aggregate requires list".into());
                     };
+                    let s = if streamed { s } else { format!("({s}).into_iter()") };
                     if n == "count" {
-                        (format!("BigInt::from(({s}).len())"), T::Int)
+                        (format!("BigInt::from(({s}).count())"), T::Int)
                     } else {
                         let zero = if *t == T::Int {
                             "BigInt::from(0u8)".into()
@@ -404,7 +488,7 @@ impl Emitter<'_> {
                         } else {
                             "a.wrapping_add(b)"
                         };
-                        (format!("({s}).into_iter().fold({zero},|a,b|{add})"), *t)
+                        (format!("({s}).fold({zero},|a,b|{add})"), *t)
                     }
                 }
                 _ => {
@@ -469,7 +553,10 @@ impl Emitter<'_> {
                     } else if ["intersect_keys", "put_many", "remove_many"].contains(&n.as_str()) {
                         let keys = self.expr(&args[0], env, Some(&T::List(k.clone())))?.0;
                         match n.as_str() {
-                            "intersect_keys" => (format!("{{let selected=({keys}).into_iter().collect::<std::collections::BTreeSet<_>>();self.{field}.keys().filter(|key|selected.contains(*key)).cloned().collect::<{}>()}}",ty(&T::List(k.clone()))?), T::List(k.clone())),
+                            // Fewer requested keys than rows: look each one up
+                            // (k log n) instead of scanning the table; the
+                            // result keeps table (ascending key) order.
+                            "intersect_keys" => (format!("{{let requested=({keys});if requested.len()<self.{field}.len(){{let mut found=requested.into_iter().filter(|key|self.{field}.contains_key(key)).collect::<Vec<_>>();found.sort();found.dedup();found.into_iter().collect::<{list}>()}}else{{let selected=requested.into_iter().collect::<std::collections::BTreeSet<_>>();self.{field}.keys().filter(|key|selected.contains(*key)).cloned().collect::<{list}>()}}}}",list=ty(&T::List(k.clone()))?), T::List(k.clone())),
                             "remove_many" => (format!("{{let keys={keys};for key in keys{{self.set_{field}(key,None,false);}}}}"), T::Unit),
                             _ => {
                                 let values = self.expr(&args[1], env, Some(&T::List(v.clone())))?.0;
@@ -520,7 +607,10 @@ impl Emitter<'_> {
                     let closure_borrows_self = args
                         .iter()
                         .any(|arg| ownership::expr_mutates_state(self.p, arg));
-                    if self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_row(&id))) {
+                    // Without a physical plan, eligible stored-row stages borrow
+                    // (the core's row-site eligibility is purely syntactic); a
+                    // checked plan decides per site.
+                    if self.physical.map_or(true, |plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_row(&id))) {
                     if let Expr::Method(r, m, margs) = base.as_ref() {
                         if let Expr::Var(root) = r.as_ref() {
                             if let Some(state) = self.p.states.iter().find(|s| &s.name == root) {
@@ -643,6 +733,13 @@ impl Emitter<'_> {
                                     )
                                 } else {
                                     format!("{s}.map(|{}|{{{code}}}).collect::<Vec<_>>()", ident(v))
+                                };
+                                // An aggregate consumes the stage directly.
+                                let mapped = if lazy {
+                                    self.lazy_done = true;
+                                    mapped.strip_suffix(".collect::<Vec<_>>()").ok_or("lazy list stage")?.to_owned()
+                                } else {
+                                    mapped
                                 };
                                 let output=if n=="filter"{T::List(t.clone())}else{T::List(Box::new(out.clone()))};
                                 let mapped=mapped.replace("collect::<Vec<_>>()",&format!("collect::<{}>()",ty(&output)?));
@@ -889,7 +986,7 @@ pub fn emit_selected(selected: &ink_core::optimisation::CheckedSelection) -> Lan
 }
 pub fn emit_selected_with_table_storage(selected:&ink_core::optimisation::CheckedSelection,storage:TableStorage)->LangResult<String>{
     let layout=crate::snapshot::selected_layout(selected)?;
-    emit_with_layout(selected.module().program(),&layout,storage,None)
+    emit_with_layout(selected.module().program(),&layout,storage,None,None)
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
@@ -909,7 +1006,7 @@ fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
 }
 pub fn emit(p: &Program) -> LangResult<String> {
     let layout = crate::snapshot::layout(p)?;
-    emit_with_layout(p, &layout, TableStorage::Ordered,None)
+    emit_with_layout(p, &layout, TableStorage::Ordered,None,None)
 }
 /// Operational implementations of the same fixed finite-map primitive.
 /// This choice grants no mathematical rewrite authority. The ordered baseline
@@ -918,19 +1015,25 @@ pub fn emit(p: &Program) -> LangResult<String> {
 pub enum TableStorage { Ordered, IndexedSlots }
 pub fn emit_with_table_storage(p: &Program, storage: TableStorage) -> LangResult<String> {
     let layout=crate::snapshot::layout(p)?;
-    emit_with_layout(p,&layout,storage,None)
+    emit_with_layout(p,&layout,storage,None,None)
 }
 pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
     plan.require_record_elision_capability(false)?;
-    plan.require_source_storage_capability(false,false)?;
+    if plan.protocol().is_some() {
+        return Err("target does not support selected state protocol".into());
+    }
+    // Maintained group folds are supported; dense prefixes are not.
+    plan.require_source_storage_capability(true,false)?;
     let layout=crate::snapshot::layout(plan.original().program())?;
     let storage=match plan.physical().map(|p|p.plan().tables).unwrap_or_default() {
         ink_core::physical::Tables::Ordered=>TableStorage::Ordered,
         ink_core::physical::Tables::IndexedSlots=>TableStorage::IndexedSlots,
     };
-    emit_with_layout(plan.module().program(),&layout,storage,plan.physical())
+    let views=plan.maintained().map(|v|crate::maintained_native::views(plan.module(),v)).transpose()?;
+    emit_with_layout(plan.module().program(),&layout,storage,plan.physical(),views.as_ref())
 }
-fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>) -> LangResult<String> {
+fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>, maintained: Option<&crate::maintained_native::Views>) -> LangResult<String> {
+    let views: &[crate::maintained_native::View] = maintained.map(|v| v.0.as_slice()).unwrap_or(&[]);
     let _column_scope=crate::columns::scope(physical)?;
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
@@ -945,6 +1048,8 @@ fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage:
         probe: 0,
         borrowed: BTreeSet::new(),
         aliases: BTreeMap::new(),
+        lazy: false,
+        lazy_done: false,
     };
     let mut out = String::from(
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
@@ -1123,6 +1228,14 @@ impl Wire for {id} {{
 
         out.push_str("},\n");
     }
+    for (i, v) in views.iter().enumerate() {
+        if v.extremum.is_some() {
+            // (contribution, whether one copy was removed)
+            writeln!(out, "Maintained{i}(u64,bool),").unwrap();
+        } else {
+            writeln!(out, "Maintained{i}({}),", v.ty).unwrap();
+        }
+    }
     out.push_str("}\n");
     out.push_str(
         "struct HostTransaction {version:u64,removed:Vec<Event>}\npub struct State {version:u64,staged:Vec<EventData>,outbox:Vec<Event>,undo:Vec<Undo>,host:Option<HostTransaction>,\n",
@@ -1141,6 +1254,26 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
+    let mut retained = retained(p);
+    // A maintained keep is already constant time; it is not retained.
+    for v in views {
+        retained.keeps.remove(&v.keep);
+        let cache = format!("retained_keep_{}", ident(&v.keep));
+        retained.caches.retain(|(c, _)| *c != cache);
+    }
+    for (i, v) in views.iter().enumerate() {
+        if v.extremum.is_some() {
+            writeln!(out, "maintained_{i}:std::collections::BTreeMap<u64,u64>,").unwrap();
+        } else {
+            writeln!(out, "maintained_{i}:{},", v.ty).unwrap();
+        }
+    }
+    for k in p.keeps.iter().filter(|k| retained.keeps.contains(&k.name)) {
+        writeln!(out, "retained_keep_{}:Option<{}>,", ident(&k.name), ty(&k.ty)?).unwrap();
+    }
+    for a in p.actions.iter().filter(|a| retained.queries.contains(&a.name)) {
+        writeln!(out, "retained_query_{}:Option<{}>,", ident(&a.name), ty(&a.result)?).unwrap();
+    }
     out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],host:None,\n");
     for s in &p.states {
         let constructor = "InkTable::new()";
@@ -1153,7 +1286,35 @@ impl Wire for {id} {{
         .unwrap();
     }
 
+    for (cache, _) in &retained.caches {
+        writeln!(out, "{cache}:None,").unwrap();
+    }
+    for (i, v) in views.iter().enumerate() {
+        if v.extremum.is_some() {
+            writeln!(out, "maintained_{i}:std::collections::BTreeMap::new(),").unwrap();
+        } else {
+            writeln!(out, "maintained_{i}:{},", v.zero).unwrap();
+        }
+    }
     out.push_str("}}\n");
+    for v in views {
+        out.push_str(&v.methods);
+    }
+    if views.iter().any(|v| v.extremum.is_some()) {
+        // The fixed multiset controller for word extremum views.
+        out.push_str("fn multiset_add(m:&mut std::collections::BTreeMap<u64,u64>,c:u64){*m.entry(c).or_insert(0)+=1;}\nfn multiset_remove(m:&mut std::collections::BTreeMap<u64,u64>,c:u64){if let std::collections::btree_map::Entry::Occupied(mut e)=m.entry(c){if *e.get()>1{*e.get_mut()-=1;}else{e.remove();}}}\n");
+    }
+    if !views.is_empty() {
+        out.push_str("fn rebuild_maintained(&mut self){");
+        for (i, v) in views.iter().enumerate() {
+            if v.extremum.is_some() {
+                writeln!(out, "self.maintained_{i}.clear();for(key,row)in self.{}.iter(){{Self::multiset_add(&mut self.maintained_{i},Self::maintained_{i}_contribution(key,row));}}", ident(&v.table)).unwrap();
+            } else {
+                writeln!(out, "self.maintained_{i}=self.{}.iter().fold({},|total,(key,row)|Self::maintained_{i}_insert(total,key,row));", ident(&v.table), v.zero).unwrap();
+            }
+        }
+        out.push_str("}\n");
+    }
     out.push_str("pub fn begin_transaction(&mut self)->Result<bool,String>{if self.host.is_some()||!self.undo.is_empty()||!self.staged.is_empty(){return Err(\"transaction already in progress\".into())}self.host=Some(HostTransaction{version:self.version,removed:vec![]});Ok(true)}\n pub fn commit_transaction(&mut self){self.host=None;self.undo.clear();self.clear_journal_keys();}\n pub fn rollback_transaction(&mut self){if let Some(host)=self.host.take(){self.rollback();self.version=host.version;self.outbox.retain(|e|e.commit<=host.version);let mut restored=host.removed;restored.append(&mut self.outbox);self.outbox=restored;}}\n");
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox(&self)->&[Event]{&self.outbox}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){let old=std::mem::take(&mut self.outbox);for e in old{if(e.commit,e.position)>(commit,position){self.outbox.push(e)}else if let Some(host)=&mut self.host{host.removed.push(e)}}}\n");
     out.push_str("pub fn checkpoint(&self)->Result<Vec<u8>,String>{self.checkpoint_with_limits(SnapshotLimits::default())}\npub fn checkpoint_with_limits(&self,limits:SnapshotLimits)->Result<Vec<u8>,String>{if (self.host.is_none()&&!self.undo.is_empty())||!self.staged.is_empty(){return Err(\"checkpoint requires transaction boundary\".into())}let layout=snapshot_layout();let tables=vec![");
@@ -1177,6 +1338,10 @@ impl Wire for {id} {{
             unreachable!()
         };
         writeln!(out,"for(k,v)in tables.next().unwrap(){{state.{}.insert(<{} as Wire>::from_json(&k)?,<{} as Wire>::from_json(&v)?);}}",ident(n),ty(k)?,ty(v)?).unwrap();
+    }
+    // Auxiliary folds are rebuilt from validated rows, never read from bytes.
+    if !views.is_empty() {
+        out.push_str("state.rebuild_maintained();");
     }
     out.push_str("state.outbox=logical.outbox.into_iter().map(|e|{let data=match e.channel{");
     for (i, (n, _)) in layout.events.iter().enumerate() {
@@ -1212,7 +1377,36 @@ impl Wire for {id} {{
         )
         .unwrap();
 
+        let on_table: Vec<usize> = views.iter().enumerate().filter(|(_, v)| v.table == s.name).map(|(i, _)| i).collect();
+        if !on_table.is_empty() {
+            // Each maintained fold moves by the cell's old and new rows before
+            // the table changes; rollback restores the previous totals.
+            out.push_str("let next={let prior=self.");
+            out.push_str(&field);
+            out.push_str(".get(&key);(");
+            for i in &on_table {
+                if views[*i].extremum.is_some() {
+                    write!(out, "(prior.map(|old|Self::maintained_{i}_contribution(&key,old)),value.as_ref().map(|row|Self::maintained_{i}_contribution(&key,row))),").unwrap();
+                } else {
+                    write!(out, "match(prior,value.as_ref()){{(None,Some(row))=>Self::maintained_{i}_insert(self.maintained_{i},&key,row),(Some(old),Some(row))=>Self::maintained_{i}_replace(self.maintained_{i},&key,old,row),(Some(old),None)=>Self::maintained_{i}_remove(self.maintained_{i},&key,old),(None,None)=>self.maintained_{i}}},").unwrap();
+                }
+            }
+            out.push_str(")};");
+            for (n, i) in on_table.iter().enumerate() {
+                if views[*i].extremum.is_some() {
+                    write!(out, "if next.{n}.0!=next.{n}.1{{if let Some(c)=next.{n}.0{{Self::multiset_remove(&mut self.maintained_{i},c);self.undo.push(Undo::Maintained{i}(c,true));}}if let Some(c)=next.{n}.1{{Self::multiset_add(&mut self.maintained_{i},c);self.undo.push(Undo::Maintained{i}(c,false));}}}}").unwrap();
+                } else {
+                    write!(out, "self.undo.push(Undo::Maintained{i}(self.maintained_{i}));self.maintained_{i}=next.{n};").unwrap();
+                }
+            }
+            out.push('\n');
+        }
         writeln!(out,"let old=match value{{Some(v)=>self.{field}.insert(key.clone(),v),None=>self.{field}.remove(&key)}};").unwrap();
+        for (cache, roots) in &retained.caches {
+            if roots.contains(&s.name) {
+                writeln!(out, "self.{cache}=None;").unwrap();
+            }
+        }
 
         write!(
             out,
@@ -1233,8 +1427,19 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
 
         out.push_str("},\n");
     }
+    for (i, v) in views.iter().enumerate() {
+        if v.extremum.is_some() {
+            writeln!(out, "Undo::Maintained{i}(c,removed)=>{{if removed{{Self::multiset_add(&mut self.maintained_{i},c);}}else{{Self::multiset_remove(&mut self.maintained_{i},c);}}}},").unwrap();
+        } else {
+            writeln!(out, "Undo::Maintained{i}(old)=>{{self.maintained_{i}=old;}},").unwrap();
+        }
+    }
+    out.push_str("}}");
+    for (cache, _) in &retained.caches {
+        write!(out, "self.{cache}=None;").unwrap();
+    }
     out.push_str(
-        "}}self.clear_journal_keys();self.staged.clear();}\nfn clear_journal_keys(&mut self){",
+        "self.clear_journal_keys();self.staged.clear();}\nfn clear_journal_keys(&mut self){",
     );
     for s in &p.states {
         writeln!(out, "self.journal_keys_{}.clear();", ident(&s.name)).unwrap();
@@ -1242,13 +1447,19 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     out.push_str("}\n");
     for k in execution.keeps() {
         let body = emitter.expr(&k.value, &Env::new(), Some(&k.ty))?.0;
-        writeln!(
-            out,
-            "fn keep_{}(&mut self)->{}{{{body}}}",
-            ident(&k.name),
-            ty(&k.ty)?
-        )
-        .unwrap();
+        let id = ident(&k.name);
+        let t = ty(&k.ty)?;
+        if let Some(i) = views.iter().position(|v| v.keep == k.name) {
+            match views[i].extremum {
+                Some(ink_core::maintained::Order::Max) => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}.keys().next_back().copied().unwrap_or({})}}", views[i].zero).unwrap(),
+                Some(ink_core::maintained::Order::Min) => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}.keys().next().copied().unwrap_or({})}}", views[i].zero).unwrap(),
+                None => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}}}").unwrap(),
+            }
+        } else if retained.keeps.contains(&k.name) {
+            writeln!(out, "fn keep_{id}(&mut self)->{t}{{if let Some(v)=&self.retained_keep_{id}{{return v.clone();}}let v:{t}={{{body}}};self.retained_keep_{id}=Some(v.clone());v}}").unwrap();
+        } else {
+            writeln!(out, "fn keep_{id}(&mut self)->{t}{{{body}}}").unwrap();
+        }
     }
     let mut parallel_tasks = Vec::new();
     for f in &p.functions {
@@ -1308,7 +1519,12 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         emitter.reset_ownership(&a.params, &a.body);
         let body = emitter.block(&a.body, &mut a.params.iter().cloned().collect(), &a.result)?;
         emitter.clear_ownership();
-        writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}\npub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{").unwrap();
+        if retained.queries.contains(&a.name) {
+            writeln!(out,"fn retained_eval_{id}(&mut self)->{result}{{{body}}}\nfn action_{id}(&mut self)->{result}{{if let Some(v)=&self.retained_query_{id}{{return v.clone();}}let v=self.retained_eval_{id}();self.retained_query_{id}=Some(v.clone());v}}").unwrap();
+        } else {
+            writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}").unwrap();
+        }
+        writeln!(out,"pub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{").unwrap();
         if let Some(guard)=p.contracts.precondition_checks.get(&a.name){
             let copied=a.params.iter().map(|(n,_)|format!("{}.clone()",ident(n))).collect::<Vec<_>>().join(",");
             writeln!(out,"if !self.action_{}({copied}){{return Err(\"contract precondition failed\".into());}}",ident(guard)).unwrap();
