@@ -23,3 +23,5 @@ mod packed_spine_tests;
 mod identity_memo_tests;
 
 mod columns;
+
+mod typed_snapshot;

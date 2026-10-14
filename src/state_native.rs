@@ -60,6 +60,8 @@ fn field_ty(owner: &str, t: &Type, p: &Program) -> LangResult<String> {
 type Env = BTreeMap<String, Type>;
 pub(crate) fn word_expression(name: &str, args: &[String]) -> String {
     match name {
+        "word_widen_u32_to_u64" => format!("u64::from({})", args[0]),
+        "word_narrow_u64_to_u32" => format!("({}) as u32", args[0]),
         "word_not" => format!("!({})", args[0]),
         "word_and" | "word_or" | "word_xor" => format!(
             "(({}) {} ({}))",
@@ -181,11 +183,29 @@ impl Emitter<'_> {
         if self.probe > 0 {
             return false;
         }
+        if let Some(left) = self.uses.whole.get_mut(n) {
+            *left = left.saturating_sub(1);
+        }
         let Some(left) = self.uses.var.get_mut(n) else {
             return false;
         };
         *left = left.saturating_sub(1);
         *left == 0 && self.movable(n)
+    }
+    /// Disjoint fields can finish independently. A later whole-record read,
+    /// shadowed binding, callback capture or stored-row loan retains copying.
+    fn read_field(&mut self, n: &str, field: &str) -> bool {
+        if self.probe > 0 {
+            return false;
+        }
+        if let Some(left) = self.uses.var.get_mut(n) {
+            *left = left.saturating_sub(1);
+        }
+        let Some(left) = self.uses.field.get_mut(&(n.to_owned(), field.to_owned())) else {
+            return false;
+        };
+        *left = left.saturating_sub(1);
+        *left == 0 && self.uses.whole.get(n).copied().unwrap_or(0) == 0 && self.movable(n)
     }
     fn reset_ownership(&mut self, params: &[(String, Type)], body: &[Statement]) {
         self.uses = Uses::of_block(self.p, body);
@@ -289,7 +309,7 @@ impl Emitter<'_> {
                                 if let Expr::Var(v) = &**base {
                                     // The final read of an owned record may move
                                     // the field out (a partial move).
-                                    let code = if self.read(v) {
+                                    let code = if self.read_field(v, f) {
                                         format!("{}.{}", ident(v), ident(f))
                                     } else {
                                         format!("{}.{}.clone()", ident(v), ident(f))
@@ -653,7 +673,7 @@ impl Emitter<'_> {
                     };
                     if n == "concat" {
                         let (right, _) = self.expr(&args[0], env, Some(&t))?;
-                        (format!("{{let mut left={s};let right={right};left.extend(right);left}}"), t)
+                        (format!("{{let mut left={s};let mut right={right};left.append(&mut right);left}}"), t)
                     } else if n == "fold" {
                         let (a, b, tag_a, tag_b) = match &t {
                             T::Option(a) => (a.as_ref().clone(), T::Unit, "Some", "None"),
@@ -1101,6 +1121,7 @@ impl<K:Ord+Clone+'static,V:Clone+'static> InkDataEq for OwnedMap<K,V>{fn ink_dat
     out.push_str("\nmod portable {\n");
     out.push_str(ink_core::SNAPSHOT_WIRE_RUST_SOURCE);
     out.push_str("\n}\npub use portable::Limits as SnapshotLimits;\n");
+    out.push_str(ink_native_support::TYPED_SNAPSHOT_RUST_SOURCE);
     writeln!(out,"fn snapshot_layout()->portable::Layout{{portable::Layout{{program:{:?},schema:{:?},roots:vec![",layout.program,layout.schema).unwrap();
     for (n, k, v) in &layout.roots {
         writeln!(
@@ -1110,6 +1131,7 @@ impl<K:Ord+Clone+'static,V:Clone+'static> InkDataEq for OwnedMap<K,V>{fn ink_dat
             crate::snapshot_code::schema_code(v)
         )
         .unwrap();
+
     }
     out.push_str("],events:vec![");
     for (n, t) in &layout.events {
@@ -1317,6 +1339,10 @@ impl Wire for {id} {{
     }
     out.push_str("pub fn begin_transaction(&mut self)->Result<bool,String>{if self.host.is_some()||!self.undo.is_empty()||!self.staged.is_empty(){return Err(\"transaction already in progress\".into())}self.host=Some(HostTransaction{version:self.version,removed:vec![]});Ok(true)}\n pub fn commit_transaction(&mut self){self.host=None;self.undo.clear();self.clear_journal_keys();}\n pub fn rollback_transaction(&mut self){if let Some(host)=self.host.take(){self.rollback();self.version=host.version;self.outbox.retain(|e|e.commit<=host.version);let mut restored=host.removed;restored.append(&mut self.outbox);self.outbox=restored;}}\n");
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox(&self)->&[Event]{&self.outbox}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){let old=std::mem::take(&mut self.outbox);for e in old{if(e.commit,e.position)>(commit,position){self.outbox.push(e)}else if let Some(host)=&mut self.host{host.removed.push(e)}}}\n");
+    if let Some(typed)=crate::typed_snapshot::checkpoint(p,layout){
+        out.push_str("pub fn checkpoint(&self)->Result<Vec<u8>,String>{self.checkpoint_with_limits(SnapshotLimits::default())}\npub fn checkpoint_with_limits(&self,limits:SnapshotLimits)->Result<Vec<u8>,String>{if (self.host.is_none()&&!self.undo.is_empty())||!self.staged.is_empty(){return Err(\"checkpoint requires transaction boundary\".into())}let layout=snapshot_layout();");
+        out.push_str(&typed);out.push_str("}\n");
+    }else{
     out.push_str("pub fn checkpoint(&self)->Result<Vec<u8>,String>{self.checkpoint_with_limits(SnapshotLimits::default())}\npub fn checkpoint_with_limits(&self,limits:SnapshotLimits)->Result<Vec<u8>,String>{if (self.host.is_none()&&!self.undo.is_empty())||!self.staged.is_empty(){return Err(\"checkpoint requires transaction boundary\".into())}let layout=snapshot_layout();let tables=vec![");
     for (n, _, _) in &layout.roots {
         writeln!(
@@ -1331,6 +1357,11 @@ impl Wire for {id} {{
         writeln!(out, "EventData::{}(ref v)=>({i},v.to_json()),", ident(n)).unwrap();
     }
     out.push_str("};portable::Event{commit:e.commit,position:e.position,channel,value}}).collect();portable::encode(&layout,&portable::Logical{version:self.version,tables,outbox},limits)}\n");
+    }
+    if let Some(typed)=crate::typed_snapshot::restore(p,layout){
+        out.push_str("pub fn restore(bytes:&[u8])->Result<Self,String>{Self::restore_with_limits(bytes,SnapshotLimits::default())}\npub fn restore_with_limits(bytes:&[u8],limits:SnapshotLimits)->Result<Self,String>{let layout=snapshot_layout();");
+        out.push_str(&typed);
+    }else{
     out.push_str("pub fn restore(bytes:&[u8])->Result<Self,String>{Self::restore_with_limits(bytes,SnapshotLimits::default())}\npub fn restore_with_limits(bytes:&[u8],limits:SnapshotLimits)->Result<Self,String>{let layout=snapshot_layout();let logical=portable::decode(&layout,bytes,limits)?;let mut state=Self::new();state.version=logical.version;let mut tables=logical.tables.into_iter();");
     for (n, _, _) in &layout.roots {
         let s = p.states.iter().find(|s| &s.name == n).unwrap();
@@ -1355,6 +1386,7 @@ impl Wire for {id} {{
     }
     out.push_str("_=>return Err(\"unknown event channel\".into())};Ok(Event{commit:e.commit,position:e.position,data})}).collect::<Result<Vec<_>,String>>()?;");
 
+    }
     for name in &p.contracts.invariant_checks {
         writeln!(out, "if !state.action_{}(){{return Err(\"snapshot violates state invariant\".into());}}", ident(name)).unwrap();
     }
@@ -1463,6 +1495,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     }
     let mut parallel_tasks = Vec::new();
     for f in &p.functions {
+        let inline_hint=if physical.is_some_and(|plan|plan.inlines_function(&f.name)){"#[inline(always)]\n"}else{""};
         let (body, tasks) = crate::pure_rust::body_with_tasks_planned(p, f, physical)?;
         parallel_tasks.extend(tasks);
         let params = f
@@ -1473,7 +1506,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
             .join(",");
         writeln!(
             out,
-            "{}fn function_{}(&self,{params})->{}{{{body}}}",
+            "{inline_hint}{}fn function_{}(&self,{params})->{}{{{body}}}",
             if ink_core::local_collections::owned(&f.result, p)
                 || f.params
                     .iter()
@@ -1487,6 +1520,15 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
             ty(&f.result)?
         )
         .unwrap();
+        let loans=crate::pure_rust::parameter_loans(p,f,physical);
+        if loans.iter().any(|b|*b){
+            let (body,tasks)=crate::pure_rust::body_with_tasks_loans(p,f,physical,&loans)?;
+            parallel_tasks.extend(tasks);
+            let params=f.params.iter().zip(&loans).map(|((n,t),loan)|Ok(format!("{}:{}{}",ident(n),if *loan{"&"}else{""},ty(t)?))).collect::<LangResult<Vec<_>>>()?.join(",");
+            let public=!ink_core::local_collections::owned(&f.result,p)
+                && !f.params.iter().any(|(_,t)|ink_core::local_collections::owned(t,p));
+            writeln!(out,"{inline_hint}{}fn ink_borrowed_function_{}(&self,{params})->{}{{{body}}}",if public{"pub "}else{""},ident(&f.name),ty(&f.result)?).unwrap();
+        }
     }
     for (_, method) in &parallel_tasks {
         out.push_str(method);

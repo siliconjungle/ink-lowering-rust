@@ -11,9 +11,11 @@ struct Emitter<'a> {
     physical: Option<&'a ink_core::physical::CheckedPhysicalPlan>,
     last_uses: ink_core::last_use::LastUses,
     borrowed_bindings: std::collections::BTreeSet<String>,
+    live_loans: std::collections::BTreeSet<String>,
     paths: BTreeMap<usize,Vec<usize>>,
     next: usize,
     prefix: String,
+    task_prefix: String,
     tasks: Vec<(String, String)>,
     reservation: Option<(String,String)>,
     reserved: bool,
@@ -70,13 +72,16 @@ impl Emitter<'_> {
     // Read-only traversals borrow a lexical list instead of cloning the entire
     // vector. Computed receivers still finish eagerly and are consumed once.
     fn borrowed_place(&self, e: &Expr, env: &Env) -> Option<String> {
-        // Without a physical plan every lexical read site borrows (the core's
-        // borrow-site eligibility is purely lexical and typed). A final read
-        // of a whole local is moved instead. A checked plan decides per site.
-        match self.physical {
-            Some(plan) => if !ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_read(&id)) {return None;},
-            None => if matches!(e, Expr::Var(_)) && self.last_uses.contains(e) {return None;},
-        }
+        // A checked borrowed binding already has an immutable lifetime. Its
+        // read-only field observations need no second, globally named marker.
+        let borrowed=ink_core::collection_facts::lexical_projection(e).is_some_and(|(root,_)|
+            env.get(root).is_some_and(|(binding,_)|self.borrowed_bindings.contains(binding)));
+        let mut root=e;while let Expr::Field(parent,_)=root{root=parent;}
+        let final_move=matches!(root,Expr::Var(name)if env.get(name).is_some_and(|(binding,_)|!self.borrowed_bindings.contains(binding)&&!self.live_loans.contains(binding)))
+            && (self.last_uses.contains(root)||self.last_uses.contains_field(e));
+        if self.physical.is_none() && !borrowed && final_move {return None;}
+        if !borrowed && self.physical.is_some() && !self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_read(&id))
+            || (!final_move&&ink_core::physical::expression_read_site(&self.prefix,e).is_ok_and(|id|plan.borrows_read(&id)))) {return None;}
         self.lexical_place(e, env)
     }
     fn reserved(&self, e: &Expr) -> bool {
@@ -129,14 +134,65 @@ impl Emitter<'_> {
         Some(place)
     }
 
+    // Computed arguments already produce an owning value. A lexical argument
+    // can transfer ownership only at a checked final use outside active loans.
+    fn final_owned_argument(&self,e:&Expr,env:&Env)->bool{
+        let mut root=e;while let Expr::Field(parent,_)=root{root=parent;}
+        let Expr::Var(name)=root else{return true;};
+        env.get(name).is_some_and(|(binding,_)|
+            !self.borrowed_bindings.contains(binding)&&!self.live_loans.contains(binding))
+            &&(self.last_uses.contains(root)||self.last_uses.contains_field(e))
+    }
+
+    // Observe a field of a lookup without first cloning the containing row.
+    // Finish the short storage borrow before evaluating a missing-row fallback:
+    // that fallback may write another scoped range of the same allocation.
+    fn projected_item(&mut self,e:&Expr,env:&Env)->LangResult<Option<String>>{
+        let Expr::Field(lookup,field)=e else{return Ok(None);};
+        let Expr::Method(receiver,method,args)=lookup.as_ref()else{return Ok(None);};
+        if method!="at_or"||args.len()!=2{return Ok(None);}
+        let container=self.infer(receiver,env,None)?;
+        let (Type::List(row)|Type::Buffer(row))=&container else{return Ok(None);};
+        let Type::Named(owner)=row.as_ref()else{return Ok(None);};
+        if ink_core::local_collections::owned(row,self.p)||crate::columns::names(row).is_some(){return Ok(None);}
+        let Some((_,field_ty))=self.p.records.get(owner).and_then(|fs|fs.iter().find(|(name,_)|name==field))else{return Ok(None);};
+        let field_ty=field_ty.clone();
+        // Moving the receiver's root while computing the index needs an owning
+        // snapshot; leave that case on the established literal path.
+        if ink_core::collection_facts::lexical_projection(receiver).is_some_and(|(root,_)|references(&args[0],root)){return Ok(None);}
+        let receiver_value=if let Some(place)=self.lexical_place(receiver,env){format!("&({place})")}else{self.expr(receiver,env,Some(&container))?};
+        let index=self.expr(&args[0],env,Some(&Type::U32))?;
+        let fallback=self.expr(&args[1],env,Some(row))?;
+        let storage=self.fresh();let position=self.fresh();let selected=self.fresh();let missing=self.fresh();
+        let boxed=crate::state_native::boxed_field(owner,&field_ty,self.p);
+        let value=if boxed{format!("(*v.l_{field}).clone()")}else{format!("v.l_{field}.clone()")};
+        let read=if matches!(container,Type::List(_)){format!("{storage}.get({position} as usize).map(|v|{value})")}else{format!("{storage}.with_item({position},|item|item.map(|v|{value}))")};
+        let absent=if boxed{format!("*{missing}.l_{field}")}else{format!("{missing}.l_{field}")};
+        Ok(Some(format!("{{let {selected}={{let {storage}={receiver_value};let {position}={index};{read}}};match {selected}{{Some(value)=>value,None=>{{let {missing}={fallback};{absent}}}}}}}")))
+    }
+
     fn lambda(&mut self,e:&Expr,env:&Env,params:&[Type],result:&Type)->LangResult<(Vec<String>,String)> {
-        self.lambda_mode(e,env,params,result,&[])
+        self.lambda_borrows(e,env,params,result,&vec![false;params.len()])
     }
     /// `borrowed[i]` binds parameter `i` to a shared reference: every use
     /// copies the observed value, so it is never moved out of its owner.
     fn lambda_mode(
         &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:&[bool],
     ) -> LangResult<(Vec<String>,String)> {
+        self.lambda_borrows(e,env,params,result,borrowed)
+    }
+    fn lambda_borrows(
+        &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:&[bool],
+    ) -> LangResult<(Vec<String>,String)> {
+        self.lambda_ownership(e,env,params,result,borrowed,false)
+    }
+    fn lambda_once(&mut self,e:&Expr,env:&Env,params:&[Type],result:&Type)->LangResult<(Vec<String>,String)>{
+        self.lambda_ownership(e,env,params,result,&vec![false;params.len()],true)
+    }
+    fn lambda_ownership(
+        &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:&[bool],once:bool,
+    )->LangResult<(Vec<String>,String)>{
+        if borrowed.len()!=params.len(){return Err("callback borrow arity".into());}
         let mut local = env.clone();
         let mut vars = vec![];
         let mut body = e;
@@ -150,15 +206,16 @@ impl Emitter<'_> {
             body = b;
         }
         // The primitive invokes the flattened callback once per item. Its
-        // formal parameters are owned within that invocation; outer captures
-        // remain absent from these facts and therefore cannot move.
+        // formal parameters have independent ownership modes. Outer captures
+        // remain absent from final-use facts and therefore cannot move.
         let mut formal = Vec::new();
         let mut current = e;
         for _ in params {
             let Expr::Lambda(name, nested) = current else {unreachable!()};
             formal.push(name.as_str());current=nested;
         }
-        let facts=ink_core::last_use::analyse(body,formal);
+        let mut facts=ink_core::last_use::analyse(body,formal);
+        if once{facts.inherit_once(&self.last_uses);}
         let outer=std::mem::replace(&mut self.last_uses,facts);
         let previous_borrows=self.borrowed_bindings.clone();
         self.borrowed_bindings.extend(vars.iter().zip(borrowed).filter(|(_,b)|**b).map(|(v,_)|v.clone()));
@@ -179,7 +236,7 @@ impl Emitter<'_> {
     ) -> LangResult<String> {
         let (vars, body) = self.lambda(callback, env, &[Type::U32, input.clone()], output)?;
         let fresh = self.fresh();
-        let name = format!("{}_{fresh}", self.prefix);
+        let name = format!("{}_{fresh}", self.task_prefix);
         let captures: Vec<_> = env
             .iter()
             .filter(|(n, (_, t))| {
@@ -247,7 +304,11 @@ impl Emitter<'_> {
             Expr::Var(n) if n == "None" => "None".into(),
             Expr::Var(n) => {
                 let v = &env.get(n).ok_or("missing binding")?.0;
-                if !self.borrowed_bindings.contains(v) && (ink_core::local_collections::owned(&t, self.p) || self.last_uses.contains(e)) {
+                if self.borrowed_bindings.contains(v) {
+                    // Source values remain owned when passed or returned whole.
+                    // Clone the referent, not the Rust reference itself.
+                    format!("(*{v}).clone()")
+                } else if ink_core::local_collections::owned(&t, self.p) || (self.last_uses.contains(e) && !self.live_loans.contains(v)) {
                     v.clone()
                 } else {
                     format!("{v}.clone()")
@@ -273,7 +334,7 @@ impl Emitter<'_> {
                 // Exclude owned handles and any body that could separately move
                 // the containing root; large bodies retain the copying path.
                 let alias = if !ink_core::local_collections::owned(&at,self.p)
-                    && !(matches!(a.as_ref(),Expr::Var(_)) && self.last_uses.contains(a))
+                    && !(matches!(a.as_ref(),Expr::Var(root) if env.get(root).is_some_and(|(v,_)|!self.borrowed_bindings.contains(v) && !self.live_loans.contains(v))) && self.last_uses.contains(a))
                     && matches!(&at,Type::Named(_)|Type::List(_))
                     && ink_core::analysis::node_count(b,256).is_some() {
                     ink_core::collection_facts::lexical_projection(a).and_then(|(root,_)|
@@ -317,6 +378,7 @@ impl Emitter<'_> {
                         return Ok(format!("l_{en}::l_{n}"));
                     }
                 }
+                if let Some(projected)=self.projected_item(e,env)?{return Ok(projected);}
                 let xt = self.infer(x, env, None)?;
                 if let Type::Named(owner) = &xt {
                     if let Some(place) = self.lexical_place(e, env) {
@@ -326,6 +388,18 @@ impl Emitter<'_> {
                             .ok_or("field")?
                             .1;
                         if !ink_core::local_collections::owned(ft, self.p) {
+                            let mut root=e;
+                            while let Expr::Field(parent,_)=root {root=parent;}
+                            let movable=matches!(root,Expr::Var(name)if env.get(name).is_some_and(|(binding,_)|!self.borrowed_bindings.contains(binding) && !self.live_loans.contains(binding)))
+                                && (self.last_uses.contains(root) || self.last_uses.contains_field(e));
+                            // A read capability permits borrowing at an earlier
+                            // observation; it is not a live loan. Final owning
+                            // projections still transfer their field. Borrowed
+                            // parameters, captures and pending call loans are
+                            // excluded by the binding checks above.
+                            if movable {
+                                return Ok(if crate::state_native::boxed_field(owner,ft,self.p){format!("*({place})")}else{place});
+                            }
                             return Ok(if crate::state_native::boxed_field(owner, ft, self.p) {
                                 format!("(*({place})).clone()")
                             } else {
@@ -624,7 +698,8 @@ impl Emitter<'_> {
                             env,
                             Some(if n == "fill_range" { value } else { &Type::U32 }),
                         )?;
-                        format!("({xv}).{n}({a},{b},{c})")
+                        let method=if n=="copy_within" && matches!(value,Type::U32|Type::U64|Type::I32|Type::F32|Type::Bool){"copy_within_copy"}else{n.as_str()};
+                        format!("({xv}).{method}({a},{b},{c})")
                     }
                     "push" => format!("({xv}).push({})", self.expr(&args[0], env, Some(value))?),
                     "truncate" => format!(
@@ -652,22 +727,33 @@ impl Emitter<'_> {
                 };
                 let xs = self.expr(&args[0], env, None)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
-                let read_only = !ink_core::local_collections::owned(&inner,self.p) && !ink_core::local_collections::owned(&t,self.p);
-                let (stopvars, stop) = self.lambda_mode(&args[2],env,&[inner.as_ref().clone(),t.clone()],&Type::Bool,&[read_only,read_only])?;
+                // Each readonly formal can observe the original through a
+                // lexical loan. Consumed affine values retain eager copying.
+                let params=[inner.as_ref().clone(),t.clone()];
+                let types=env.iter().map(|(name,(_,ty))|(name.clone(),ty.clone())).collect();
+                let loans=ink_core::local_collections::callback_parameter_loans(&args[2],&types,self.p,&params,&Type::Bool)?;
+                let (stopvars, stop) = self.lambda_borrows(&args[2],env,&params,&Type::Bool,&loans)?;
                 let (vs, body) = self.lambda(&args[3], env, &[*inner, t.clone()], &t)?;
                 let list = self.fresh();
                 let acc = self.fresh();
                 let item = self.fresh();
                 let flag = self.fresh();
-                let observed_item=if read_only{format!("&{item}")}else{format!("{item}.clone()")};
-                let observed_acc=if read_only{format!("&{acc}")}else{format!("{acc}.clone()")};
+                let observed_item=if loans[0]{format!("&{item}")}else{format!("{item}.clone()")};
+                let observed_acc=if loans[1]{format!("&{acc}")}else{format!("{acc}.clone()")};
                 format!("{{let {list}={xs};let mut {acc}={initial};for {item} in {list}.into_iter() {{let {}={observed_item};let {}={observed_acc};let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
             }
             Expr::Call(n, args) if n == "foldr" || n == "foldl" => {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
                     return Err("fold input".into());
                 };
-                let (iterator, borrowed) = self.iterate(&args[0], env, None)?;
+                // The source takes the input value before evaluating the
+                // accumulator. An owning accumulator may consume that same
+                // root, so preserve a snapshot rather than retaining a loan.
+                let initial_alias=ink_core::collection_facts::lexical_projection(&args[0]).is_some_and(|(root,_)|
+                    references(&args[1],root)&&env.get(root).is_some_and(|(binding,_)|!self.borrowed_bindings.contains(binding)));
+                let (iterator,borrowed)=if initial_alias {
+                    (format!("({}).into_iter()",self.expr(&args[0],env,None)?),false)
+                } else {self.iterate(&args[0],env,None)?};
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 let (vs, body) = self.lambda_mode(&args[2], env, &[*inner, t.clone()], &t, &[borrowed, false])?;
                 let acc = self.fresh();
@@ -715,13 +801,41 @@ impl Emitter<'_> {
                     .clone();
                 let mut bindings = String::new();
                 let mut argv = vec![];
-                for (e, (_, t)) in args.iter().zip(&f.params) {
-                    let e = self.expr(e, env, Some(t))?;
-                    let v = self.fresh();
-                    bindings.push_str(&format!("let {v}={e};"));
-                    argv.push(v)
+                let loans=parameter_loans(self.p,&f,self.physical);
+                // A loan capability is optional. When every eligible argument
+                // can move, keep the owning call so a returned or transferred
+                // aggregate does not get cloned inside the borrowed helper.
+                let use_loans=args.iter().zip(&loans).any(|(arg,loan)|*loan&&!self.final_owned_argument(arg,env));
+                let loan_places:Vec<_>=args.iter().zip(&loans).map(|(e,loan)|{
+                    if !*loan{return None;}
+                    let (root,_)=ink_core::collection_facts::lexical_projection(e)?;
+                    if ink_core::local_collections::owned(&env.get(root)?.1,self.p){return None;}
+                    self.lexical_place(e,env)
+                }).collect();
+                let previous=self.live_loans.clone();
+                if use_loans {
+                    for (e,place)in args.iter().zip(&loan_places){if place.is_some() {
+                        let (root,_)=ink_core::collection_facts::lexical_projection(e).unwrap();
+                        self.live_loans.insert(env[root].0.clone());
+                    }}
                 }
-                format!("{{{bindings}self.function_l_{n}({})}}", argv.join(","))
+                let emitted=(||->LangResult<String>{
+                    for (((e,(_,t)),loan),place)in args.iter().zip(&f.params).zip(&loans).zip(&loan_places){
+                        let value=if use_loans && *loan{
+                            if let Some(place)=place{format!("&({place})")}
+                            else{
+                                // Preserve argument order and keep the owning
+                                // result alive until this synchronous call ends.
+                                let temporary=self.fresh();let computed=self.expr(e,env,Some(t))?;
+                                bindings.push_str(&format!("let {temporary}={computed};"));format!("&{temporary}")
+                            }
+                        }else{self.expr(e,env,Some(t))?};
+                        let v=self.fresh();bindings.push_str(&format!("let {v}={value};"));argv.push(v);
+                    }
+                    Ok(format!("{{{bindings}self.{}function_l_{n}({})}}",if use_loans{"ink_borrowed_"}else{""},argv.join(",")))
+                })();
+                self.live_loans=previous;
+                emitted?
             }
             Expr::Method(xs, n, args)
                 if matches!(
@@ -737,8 +851,8 @@ impl Emitter<'_> {
                         Type::Result(a, b) => (a.as_ref().clone(), b.as_ref().clone(), "Ok", "Err"),
                         _ => unreachable!(),
                     };
-                    let (va, body_a) = self.lambda(&args[0], env, &[a], &t)?;
-                    let (vb, body_b) = self.lambda(&args[1], env, &[b], &t)?;
+                    let (va, body_a) = self.lambda_once(&args[0], env, &[a], &t)?;
+                    let (vb, body_b) = self.lambda_once(&args[1], env, &[b], &t)?;
                     let right = if tag_b == "None" {
                         format!("None=>{{let {}=();{body_b}}}", vb[0])
                     } else {
@@ -966,6 +1080,19 @@ pub fn body_with_tasks(p: &Program, f: &Function) -> LangResult<(String, Vec<(St
     body_with_tasks_planned(p,f,None)
 }
 pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_core::physical::CheckedPhysicalPlan>) -> LangResult<(String, Vec<(String, String)>)> {
+    body_with_tasks_loans(p,f,physical,&vec![false;f.params.len()])
+}
+// Public entry points retain their owning ABI. A private implementation can
+// borrow immutable parameters whose lexical reads were independently admitted.
+// Computed arguments and projections out of affine owners are materialised
+// before borrowing; their owning temporaries live for the complete call.
+pub(crate) fn parameter_loans(p:&Program,f:&Function,physical:Option<&ink_core::physical::CheckedPhysicalPlan>)->Vec<bool>{
+    f.params.iter().map(|(n,t)|!ink_core::recursion::recursive(f) && matches!(t,Type::List(_)|Type::Named(_)) && !ink_core::local_collections::owned(t,p)
+        && physical.is_some_and(|plan|ink_core::physical::parameter_read_site(&f.name,n).is_ok_and(|id|plan.borrows_read(&id))
+            || ink_core::registry::identity(&Expr::Var(n.clone())).is_ok_and(|id|plan.borrows_read(&id)))).collect()
+}
+pub(crate) fn body_with_tasks_loans(p:&Program,f:&Function,physical:Option<&ink_core::physical::CheckedPhysicalPlan>,loans:&[bool])->LangResult<(String,Vec<(String,String)>)>{
+    if loans.len()!=f.params.len(){return Err("function borrow arity".into());}
     let env = f
         .params
         .iter()
@@ -976,9 +1103,11 @@ pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_
         physical,
         paths:ink_core::analysis::paths(&f.body),
         last_uses: ink_core::last_use::analyse(&f.body, f.params.iter().map(|(n, _)| n.as_str())),
-        borrowed_bindings: Default::default(),
+        borrowed_bindings:f.params.iter().zip(loans).filter(|(_,loan)|**loan).map(|((n,_),_)|format!("l_{n}")).collect(),
+        live_loans:Default::default(),
         next: 0,
         prefix: f.name.clone(),
+        task_prefix:if loans.iter().any(|b|*b){format!("__ink_borrowed_{}",f.name)}else{f.name.clone()},
         tasks: Vec::new(),
         reservation: physical.and_then(|p|p.plan().reservations.iter().find(|r|r.function==f.name)).map(|_|Ok::<_,String>((ink_core::registry::identity(&f.body)?,"ink_reserved_capacity".into()))).transpose()?,
         reserved: false,
@@ -1018,6 +1147,148 @@ mod tests {
     };
 
     #[test]
+    fn borrowed_fold_rows_preserve_owned_accumulators_captures_and_escaping_values() {
+        let mut p=parse(r#"module folds;
+record Item{key:u32,payload:List<u32>,}
+record Owner{rows:List<Item>,data:Buffer<u32>,}
+fn observed(xs:List<Item>)->u32{return foldl(xs,0,fn(item,acc)=>acc+item.key);}
+fn aliased(xs:List<Item>)->u32{return foldl(xs,0,fn(item,acc)=>acc+item.key);}
+fn left(xs:List<Item>)->u32{return foldl(xs,0,fn(item,acc)=>acc*10+item.key);}
+fn right(xs:List<Item>)->u32{return foldr(xs,0,fn(item,acc)=>acc*10+item.key);}
+fn collected(xs:List<Item>,offset:u32)->List<u32>{let out:Buffer<u32>=foldl(xs,Buffer.empty(),fn(item,out)=>out.push(item.key+offset));return out.freeze();}
+fn escaped(xs:List<Item>)->List<Item>{let out:Buffer<Item>=foldl(xs,Buffer.empty(),fn(item,out)=>out.push(item));return out.freeze();}
+fn whole(item:Item)->u32{return item.key+length(item.payload);}
+fn called(xs:List<Item>)->u32{return foldl(xs,0,fn(item,acc)=>acc+whole(item));}
+fn captured(xs:List<Item>,offsets:List<u32>)->u32{return foldl(xs,0,fn(item,acc)=>foldl(offsets,acc,fn(offset,total)=>total+offset+item.key));}
+fn two(a:List<Item>,b:List<Item>)->u32{return observed(a)+observed(b);}
+fn repeated(xs:List<Item>)->u32{return two(xs,xs);}
+fn computed()->u32{return observed([Item{key:4,payload:[]}]);}
+fn mixed(rows:List<Item>,owner:Owner)->u32{return observed(rows)+sum(owner.data.freeze());}
+fn from_owner(xs:List<Item>)->u32{let owner=Owner{rows:xs,data:buffer([9])};return mixed(owner.rows,owner);}
+"#).unwrap();
+        // The executable core also admits lexical bindings within callbacks.
+        // Its surface expression grammar does not currently expose a block.
+        let f=p.functions.iter_mut().find(|f|f.name=="aliased").unwrap();
+        let sum=Expr::Binary("+".into(),Box::new(Expr::Var("acc".into())),Box::new(Expr::Field(Box::new(Expr::Var("alias".into())),"key".into())));
+        let binding=Expr::Let("alias".into(),None,Box::new(Expr::Var("item".into())),Box::new(sum));
+        let callback=Expr::Lambda("item".into(),Box::new(Expr::Lambda("acc".into(),Box::new(binding))));
+        f.body=Expr::Call("foldl".into(),vec![Expr::Var("xs".into()),Expr::Num(0),callback]);
+        check::check(&p).unwrap();
+        let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
+        let mut sites=std::collections::BTreeSet::new();
+        for f in &p.functions {
+            ink_core::analysis::typed_walk(&p,f,|e,env|{
+                if ink_core::collection_facts::lexical_projection(e).is_some_and(|(root,_)|matches!(env.get(root),Some(Type::Named(_)|Type::List(_)))) && ink_core::check::infer(e,env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());}
+            }).unwrap();
+        }
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),buffers:Default::default(),bounds:None,columns:vec![],column_maps:None,borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],inline_functions:vec![],record_elisions:vec![],sum_spines:vec![],dense_prefixes:vec![],dictionary_tables:vec![],boundary_readers:vec![]}).unwrap();
+        let mut source=String::from(r#"
+#![allow(non_camel_case_types)]
+use std::sync::atomic::{AtomicUsize,Ordering};
+static COPIES:AtomicUsize=AtomicUsize::new(0);
+struct l_Item{l_key:u32,l_payload:Vec<u32>}
+impl Clone for l_Item{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed);Self{l_key:self.l_key,l_payload:self.l_payload.clone()}}}
+// Intentionally not Clone: a fold must transfer this accumulator by ownership.
+struct OwnedBuffer<T:Clone>(Vec<T>);
+impl<T:Clone> OwnedBuffer<T>{fn new(xs:Vec<T>)->Self{Self(xs)}fn push(mut self,x:T)->Self{self.0.push(x);self}fn freeze(self)->Vec<T>{self.0}}
+struct l_Owner{l_rows:Vec<l_Item>,l_data:OwnedBuffer<u32>}
+struct Test;
+impl Test{
+"#);
+        for (name,params,result)in [
+            ("observed","l_xs:Vec<l_Item>","u32"),("aliased","l_xs:Vec<l_Item>","u32"),
+            ("left","l_xs:Vec<l_Item>","u32"),("right","l_xs:Vec<l_Item>","u32"),
+            ("collected","l_xs:Vec<l_Item>,l_offset:u32","Vec<u32>"),
+            ("escaped","l_xs:Vec<l_Item>","Vec<l_Item>"),
+            ("whole","l_item:l_Item","u32"),("called","l_xs:Vec<l_Item>","u32"),
+            ("captured","l_xs:Vec<l_Item>,l_offsets:Vec<u32>","u32"),
+            ("two","l_a:Vec<l_Item>,l_b:Vec<l_Item>","u32"),("repeated","l_xs:Vec<l_Item>","u32"),
+            ("computed","","u32"),("mixed","l_rows:Vec<l_Item>,l_owner:l_Owner","u32"),("from_owner","l_xs:Vec<l_Item>","u32"),
+        ] {
+            let f=p.functions.iter().find(|f|f.name==name).unwrap();
+            source.push_str(&format!("fn function_l_{name}(&self,{params})->{result}{{{}}}\n",body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0));
+            let loans=parameter_loans(&p,f,Some(&physical));
+            if loans.iter().any(|b|*b){
+                let params=f.params.iter().zip(&loans).map(|((n,t),loan)|format!("l_{n}:{}{}",if *loan{"&"}else{""},crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
+                source.push_str(&format!("fn ink_borrowed_function_l_{name}(&self,{params})->{result}{{{}}}\n",body_with_tasks_loans(&p,f,Some(&physical),&loans).unwrap().0));
+            }
+
+        }
+        source.push_str(r#"}
+fn main(){
+let xs=(1..=3).map(|key|l_Item{l_key:key,l_payload:vec![7;1000]}).collect::<Vec<_>>();let t=Test;
+assert_eq!(t.ink_borrowed_function_l_observed(&xs),6);assert_eq!(t.ink_borrowed_function_l_aliased(&xs),6);
+assert_eq!(t.ink_borrowed_function_l_left(&xs),123);assert_eq!(t.ink_borrowed_function_l_right(&xs),321);
+assert_eq!(t.ink_borrowed_function_l_collected(&xs,9),vec![10,11,12]);
+assert_eq!(t.ink_borrowed_function_l_captured(&xs,&vec![1,2]),21);
+assert_eq!(t.ink_borrowed_function_l_repeated(&xs),12);assert_eq!(t.function_l_computed(),4);
+assert_eq!(COPIES.swap(0,Ordering::Relaxed),0);
+let escaped=t.ink_borrowed_function_l_escaped(&xs);assert_eq!(escaped.iter().map(|x|x.l_key).collect::<Vec<_>>(),vec![1,2,3]);
+assert_eq!(COPIES.swap(0,Ordering::Relaxed),3);
+assert_eq!(t.ink_borrowed_function_l_called(&xs),3006);assert_eq!(COPIES.swap(0,Ordering::Relaxed),0);
+assert_eq!(xs[0].l_payload.len(),1000);
+let fresh=(1..=3).map(|key|l_Item{l_key:key,l_payload:vec![7;1000]}).collect();
+assert_eq!(t.function_l_from_owner(fresh),15);assert_eq!(COPIES.swap(0,Ordering::Relaxed),3);
+}
+"#);
+        let dir=std::env::temp_dir().join(format!("ink-fold-row-read-{}",std::process::id()));
+        fs::create_dir_all(&dir).unwrap();fs::write(dir.join("test.rs"),source).unwrap();
+        let out=Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("test.rs")).arg("-o").arg(dir.join("test")).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        assert!(Command::new(dir.join("test")).status().unwrap().success());fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn record_rebuild_moves_disjoint_vectors_but_repeated_and_captured_fields_copy(){
+        let p=parse(r#"module field_moves;
+record Item{value:u32,}
+record Copies{a:List<Item>,b:List<Item>,}
+record Frame{first:List<Item>,second:List<Item>,storage:Buffer<u32>,marker:u32,}
+fn changed(frame:Frame)->Frame{return Frame{..frame,marker:frame.marker+1};}
+fn repeated(frame:Frame)->Copies{return Copies{a:frame.first,b:frame.first};}
+fn captured(frame:Frame)->List<List<Item>>{return [0,1].map(fn(i)=>frame.first);}
+"#).unwrap();check::check(&p).unwrap();
+        let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
+        let mut sites=std::collections::BTreeSet::new();
+        for f in &p.functions {
+            ink_core::analysis::typed_walk(&p,f,|e,env|{
+                if ink_core::collection_facts::lexical_projection(e).is_some_and(|(root,_)|matches!(env.get(root),Some(Type::Named(_)|Type::List(_)))) && ink_core::check::infer(e,env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());}
+            }).unwrap();
+        }
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(),buffers:Default::default(),bounds:None,columns:vec![],column_maps:None,borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],inline_functions:vec![],record_elisions:vec![],sum_spines:vec![],dense_prefixes:vec![],dictionary_tables:vec![],boundary_readers:vec![]}).unwrap();
+        let mut source=String::from(r#"
+#![allow(non_camel_case_types,dead_code,unused_variables)]
+use std::sync::atomic::{AtomicUsize,Ordering};
+static COPIES:AtomicUsize=AtomicUsize::new(0);
+struct l_Item{l_value:u32}
+impl Clone for l_Item{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed);Self{l_value:self.l_value}}}
+struct OwnedBuffer<T>(Vec<T>);
+struct l_Copies{l_a:Vec<l_Item>,l_b:Vec<l_Item>}
+struct l_Frame{l_first:Vec<l_Item>,l_second:Vec<l_Item>,l_storage:OwnedBuffer<u32>,l_marker:u32}
+struct Test;
+impl Test{
+"#);
+        for (name,result)in [("changed","l_Frame"),("repeated","l_Copies"),("captured","Vec<Vec<l_Item>>")]{
+            let f=p.functions.iter().find(|f|f.name==name).unwrap();
+            source.push_str(&format!("fn function_l_{name}(&self,l_frame:l_Frame)->{result}{{{}}}\n",body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0));
+        }
+        source.push_str(r#"}
+fn fresh()->l_Frame{l_Frame{l_first:(0..3).map(|value|l_Item{l_value:value}).collect(),l_second:(3..6).map(|value|l_Item{l_value:value}).collect(),l_storage:OwnedBuffer(vec![7]),l_marker:8}}
+fn main(){
+ let t=Test;let frame=fresh();let a=frame.l_first.as_ptr();let b=frame.l_second.as_ptr();
+ let changed=t.function_l_changed(frame);assert_eq!(changed.l_first.as_ptr(),a);assert_eq!(changed.l_second.as_ptr(),b);assert_eq!(changed.l_marker,9);
+ assert_eq!(COPIES.swap(0,Ordering::Relaxed),0);
+ let repeated=t.function_l_repeated(fresh());assert_eq!(repeated.l_a.len()+repeated.l_b.len(),6);assert_eq!(COPIES.swap(0,Ordering::Relaxed),3);
+ let captured=t.function_l_captured(fresh());assert_eq!(captured.len(),2);assert_eq!(COPIES.swap(0,Ordering::Relaxed),6);
+}
+"#);
+        let dir=std::env::temp_dir().join(format!("ink-field-move-{}",std::process::id()));fs::create_dir_all(&dir).unwrap();fs::write(dir.join("test.rs"),source).unwrap();
+        let compiled=Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("test.rs")).arg("-o").arg(dir.join("test")).output().unwrap();
+        assert!(compiled.status.success(),"{}",String::from_utf8_lossy(&compiled.stderr));
+        assert!(Command::new(dir.join("test")).status().unwrap().success());fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn nested_record_reads_clone_only_observed_elements() {
         let p=parse(r#"module fields;
 record Item{key:u32,} record Inner{first:List<Item>,second:List<Item>,id:u32,} record Outer{nested:Inner,}
@@ -1025,13 +1296,15 @@ fn key(r:Outer)->u32{return r.nested.id;}
 fn mapped(r:Outer)->List<u32>{return r.nested.first.map(fn(x)=>x.key+1);}
 fn joined(r:Outer)->List<Item>{return r.nested.first.concat(r.nested.first);}
 fn selected(r:Outer)->List<Item>{return r.nested.first;}
+fn observed_length(r:Outer)->u32{return length(r.nested.first);}
+fn item(r:Outer,i:u32)->Item{return r.nested.first.at_or(i,Item{key:99});}
 "#).unwrap();
         check::check(&p).unwrap();
         let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
         let mut sites=std::collections::BTreeSet::new();
-        for f in &p.functions {let env=ink_core::check::params_env(&f.params).unwrap();ink_core::analysis::walk(&f.body,|e|if matches!(e,Expr::Var(_)|Expr::Field(..))&&ink_core::check::infer(e,&env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());});}
+        for f in &p.functions {ink_core::analysis::typed_walk(&p,f,|e,env|if ink_core::collection_facts::lexical_projection(e).is_some_and(|(root,_)|matches!(env.get(root),Some(Type::Named(_)|Type::List(_))))&&ink_core::check::infer(e,env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());}).unwrap();}
         sites.insert(ink_core::registry::identity(&Expr::Field(Box::new(Expr::Var("x".into())),"key".into())).unwrap());
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![],dictionary_tables:vec![],boundary_readers:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![],dictionary_tables:vec![],boundary_readers:vec![],inline_functions:vec![]}).unwrap();
 
         let mut source = String::from(
             r#"
@@ -1049,13 +1322,16 @@ impl Clone for l_Item{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed
             ("mapped", "Vec<u32>"),
             ("joined", "Vec<l_Item>"),
             ("selected", "Vec<l_Item>"),
+            ("observed_length", "u32"),
         ] {
             let f = p.functions.iter().find(|f| f.name == name).unwrap();
             source.push_str(&format!(
                 "fn {name}(l_r:&l_Outer)->{result}{{{}}}\n",
-                body_with_tasks_planned(&p,f,Some(&physical)).unwrap().0
+                body_with_tasks_loans(&p,f,Some(&physical),&[true]).unwrap().0
             ));
         }
+        let f=p.functions.iter().find(|f|f.name=="item").unwrap();
+        source.push_str(&format!("fn item(l_r:&l_Outer,l_i:u32)->l_Item{{{}}}\n",body_with_tasks_loans(&p,f,Some(&physical),&[true,false]).unwrap().0));
         source.push_str(r#"
 fn main(){
 let r=l_Outer{l_nested:l_Inner{l_first:vec![l_Item{l_key:0},l_Item{l_key:u32::MAX},l_Item{l_key:9}],l_second:(0..1000).map(|i|l_Item{l_key:i}).collect(),l_id:17}};
@@ -1102,7 +1378,7 @@ let a=selected(&r);assert_eq!(a.len(),3);assert_eq!(COPIES.swap(0,Ordering::Rela
         check::check(&p).unwrap();
         let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
         let mut sites=vec![ink_core::registry::identity(&Expr::Var("a".into())).unwrap(),ink_core::registry::identity(&Expr::Var("b".into())).unwrap()];sites.sort();
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![],dictionary_tables:vec![],boundary_readers:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![],dictionary_tables:vec![],boundary_readers:vec![],inline_functions:vec![]}).unwrap();
 
         let mut rust = String::from(
             r#"
@@ -1298,7 +1574,8 @@ assert_eq!(FALLBACKS.load(Ordering::Relaxed),0);
 assert_eq!(state.function_l_pick(record(0),0).l_value,99);assert_eq!(FALLBACKS.load(Ordering::Relaxed),1);
 assert_eq!(state.function_l_pick(record(4),u32::MAX).l_value,99);assert_eq!(FALLBACKS.load(Ordering::Relaxed),2);
 COPIES.store(0,Ordering::Relaxed);
-assert_eq!(state.function_l_captured(record(2)),vec![12,13,101]);assert_eq!(COPIES.load(Ordering::Relaxed),2);
+// Read-only callback rows borrow each item; the full output is unchanged.
+assert_eq!(state.function_l_captured(record(2)),vec![12,13,101]);assert_eq!(COPIES.load(Ordering::Relaxed),0);
 assert_eq!(state.function_l_index_consumes(record(3)).l_value,12);
 assert_eq!(state.function_l_fallback_consumes(record(3)).l_value,2);
 assert_eq!(state.function_l_plain_index_consumes(record(3).l_inner.l_items).l_value,12);
@@ -1319,6 +1596,70 @@ assert_eq!(FALLBACKS.load(Ordering::Relaxed),2);
 mod callback_ownership_tests {
     use super::*;
     #[test]
+    fn owned_stop_observations_avoid_copies_and_keep_terminal_step() {
+        let program=parse(r#"module StopLoans;
+record Row{key:u32,label:String,}
+record Inner{rows:Buffer<Row>,done:Bool,}
+record State{inner:Inner,total:u32,}
+fn observed(xs:List<u32>,seed:State)->State{
+ return fold_until(xs,seed,fn(x)=>fn(s)=>s.inner.done,
+  fn(x)=>fn(s)=>State{inner:Inner{rows:s.inner.rows,done:x>=2 && x<=2},total:s.total+x});
+}
+fn consumed(xs:List<u32>,seed:State)->State{
+ return fold_until(xs,seed,fn(x)=>fn(s)=>consume(s),
+  fn(x)=>fn(s)=>State{inner:s.inner,total:s.total+x});
+}
+fn consume(s:State)->Bool{let rows=s.inner.rows.freeze();return length(rows)>0;}
+fn mutated(xs:List<u32>,seed:Buffer<u32>)->Buffer<u32>{
+ return fold_until(xs,seed,fn(x)=>fn(s)=>s.push(99).len()>0,
+  fn(x)=>fn(s)=>s.push(x));
+}
+"#).unwrap();
+        for (name,want) in [("observed",vec![true,true]),("consumed",vec![true,false]),("mutated",vec![true,false])] {
+            let f=program.functions.iter().find(|f|f.name==name).unwrap();
+            let Expr::Call(_,args)=&f.body else{panic!("fold body");};
+            let Type::List(item)=&f.params[0].1 else{panic!("list parameter");};
+            let types=f.params.iter().cloned().collect();
+            assert_eq!(ink_core::local_collections::callback_parameter_loans(&args[2],&types,&program,&[item.as_ref().clone(),f.result.clone()],&Type::Bool).unwrap(),want,"{name}");
+        }
+        assert!(check::check(&program).unwrap_err().contains("borrowed temporary storage"));
+        let mut program=program;
+        program.functions.retain(|f|f.name=="observed");
+        check::check(&program).unwrap();
+        let mut code=String::from(r#"
+#![allow(non_camel_case_types,unused_variables,unused_parens,dead_code)]
+use std::sync::atomic::{AtomicUsize,Ordering};
+static COPIES:AtomicUsize=AtomicUsize::new(0);
+#[derive(Debug,PartialEq)]struct l_Row{l_key:u32,l_label:String}
+impl Clone for l_Row{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed);Self{l_key:self.l_key,l_label:self.l_label.clone()}}}
+#[derive(Clone)]struct l_Inner{l_rows:OwnedBuffer<l_Row>,l_done:bool}
+#[derive(Clone)]struct l_State{l_inner:l_Inner,l_total:u32}
+"#);
+        code.push_str(include_str!("../../../native-support/src/owned-values.rs.txt"));
+        for f in &program.functions {
+            let params=f.params.iter().map(|(n,t)|format!("l_{n}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
+            let emitted=body(&program,f).unwrap().replace("self.function_l_","");
+            code.push_str(&format!("fn {}({params})->{}{{{emitted}}}\n",f.name,crate::state_native::ty(&f.result).unwrap()));
+        }
+        code.push_str(r#"
+fn seed(done:bool)->l_State{l_State{l_inner:l_Inner{l_rows:OwnedBuffer::new(vec![l_Row{l_key:7,l_label:"row".into()}]),l_done:done},l_total:0}}
+fn main(){
+ let result=observed(vec![1,2,3,4],seed(false));
+ assert_eq!(result.l_total,6);assert_eq!(result.l_inner.l_rows.len(),1);
+ assert_eq!(COPIES.load(Ordering::Relaxed),0);
+ assert_eq!(observed(vec![1,2],seed(true)).l_total,1);
+ assert_eq!(observed(vec![],seed(true)).l_total,0);
+ assert_eq!(COPIES.load(Ordering::Relaxed),0);
+}
+"#);
+        let dir=std::env::temp_dir().join(format!("ink-owned-stop-loans-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();std::fs::write(dir.join("main.rs"),code).unwrap();
+        let output=std::process::Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs")).arg("-o").arg(dir.join("run")).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let output=std::process::Command::new(dir.join("run")).output().unwrap();std::fs::remove_dir_all(dir).unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+    #[test]
     fn curried_formals_move_once_read_only_stop_borrows_and_captures_survive() {
         let program=parse(r#"module Copies;
 record Row{key:u32,label:String,}
@@ -1329,6 +1670,11 @@ fn captured(xs:List<Row>,seed:Row)->List<Row>{return xs.map(fn(x)=>choose(x.key>
 fn repeated(row:Row)->u32{return row.key+row.key;}
 fn escaping(row:Row)->Row{return row;}
 fn moving(row:Row)->Row{return row;}
+record Bag{rows:List<Row>,}
+fn projected_field(bag:Bag)->List<Row>{return bag.rows;}
+fn repeated_field(bag:Bag)->List<Row>{let keep=bag.rows;return bag.rows;}
+fn branch(xs:List<Row>,yes:Bool)->List<Row>{return choose(yes,xs,xs);}
+fn branch_followed(xs:List<Row>,yes:Bool)->List<Row>{let temporary=choose(yes,xs,xs);return xs;}
 "#).unwrap();
         let mut program=program;
         let row_ty=Some(Box::new(Type::Named("Row".into())));
@@ -1343,6 +1689,7 @@ use std::sync::atomic::{AtomicUsize,Ordering};
 static COPIES:AtomicUsize=AtomicUsize::new(0);
 #[derive(Debug,PartialEq)]struct l_Row{l_key:u32,l_label:String}
 impl Clone for l_Row{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed);Self{l_key:self.l_key,l_label:self.l_label.clone()}}}
+#[derive(Clone)]struct l_Bag{l_rows:Vec<l_Row>}
 "#);
         for f in &program.functions {
             let params=f.params.iter().map(|(n,t)|format!("l_{n}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
@@ -1358,6 +1705,12 @@ let xs=captured(vec![row(1),row(2),row(0)],row(77));assert_eq!(xs,vec![row(77),r
 COPIES.store(0,Ordering::Relaxed);assert_eq!(repeated(row(7)),14);assert_eq!(COPIES.load(Ordering::Relaxed),0);
 assert_eq!(escaping(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),0);
 assert_eq!(moving(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),1);
+COPIES.store(0,Ordering::Relaxed);assert_eq!(projected_field(l_Bag{l_rows:vec![row(1),row(2)]}),vec![row(1),row(2)]);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+assert_eq!(repeated_field(l_Bag{l_rows:vec![row(1),row(2)]}),vec![row(1),row(2)]);assert_eq!(COPIES.load(Ordering::Relaxed),2);
+for yes in [true,false]{
+ COPIES.store(0,Ordering::Relaxed);assert_eq!(branch(vec![row(1),row(2)],yes),vec![row(1),row(2)]);assert_eq!(COPIES.load(Ordering::Relaxed),0);
+ assert_eq!(branch_followed(vec![row(1),row(2)],yes),vec![row(1),row(2)]);assert_eq!(COPIES.load(Ordering::Relaxed),2);
+}
 }
 "#);
         let dir=std::env::temp_dir().join(format!("ink-callback-ownership-{}",std::process::id()));

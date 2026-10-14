@@ -83,7 +83,10 @@ pub(crate) fn emit(p: &Program, physical: Option<&CheckedPhysicalPlan>) -> LangR
                     )
                 }
             } else {
-                format!("Vec<{rust}>")
+                match layout.page_size {
+                    Some(size) => format!("temporary::PagedColumn<{rust},{size}>"),
+                    None => format!("Vec<{rust}>"),
+                }
             };
             fields.push(format!("{field}:{storage}"));
             defaults.push(format!("{field}:Default::default()"));
@@ -119,9 +122,21 @@ pub(crate) fn emit(p: &Program, physical: Option<&CheckedPhysicalPlan>) -> LangR
                 prepare_append.push(format!("self.{field}.reserve(other.count);"));
                 gets.push(format!("(*self.{field}.get_unchecked(i)).clone()"));
                 pushes.push(format!("self.{field}.push({value});"));
-                sets.push(format!(
-                    "if mask&(1u16<<{i})==0{{*self.{field}.get_unchecked_mut(i)={value};}}"
-                ));
+                if layout.page_size.is_some() {
+                    // A row replacement often changes just one column. Compare
+                    // the actual scalar before detaching a retained page. Float
+                    // equality must preserve signed zero and NaN payload bits.
+                    let equal = if *t == Type::F32 {
+                        "|old,new|old.to_bits()==new.to_bits()"
+                    } else {
+                        "|old,new|old==new"
+                    };
+                    sets.push(format!("if mask&(1u16<<{i})==0{{self.{field}.set_if_changed_by(i,{value},{equal});}}"));
+                } else {
+                    sets.push(format!(
+                        "if mask&(1u16<<{i})==0{{*self.{field}.get_unchecked_mut(i)={value};}}"
+                    ));
+                }
                 payload.push(format!("self.{field}.len()*std::mem::size_of::<{rust}>()"));
                 append.push(format!("self.{field}.append(&mut other.{field});"));
             }
@@ -194,6 +209,7 @@ impl {owner}{{
  pub fn swap(mut self,a:u32,b:u32)->Self{{if(a as usize)<self.0.len()&&(b as usize)<self.0.len(){{let x=self.0.get(a as usize).unwrap();let y=self.0.get(b as usize).unwrap();self.0.set(a as usize,y);self.0.set(b as usize,x);}}self}}
  pub fn fill_range(mut self,start:u32,count:u32,v:{row})->Self{{let a=(start as usize).min(self.0.len());let n=(count as usize).min(self.0.len()-a);for i in a..a+n{{self.0.set(i,v.clone());}}self}}
  pub fn copy_within(mut self,source:u32,destination:u32,count:u32)->Self{{let a=(source as usize).min(self.0.len());let b=(destination as usize).min(self.0.len());let n=(count as usize).min(self.0.len()-a).min(self.0.len()-b);if b>a{{for i in(0..n).rev(){{let v=self.0.get(a+i).unwrap();self.0.set(b+i,v);}}}}else if b<a{{for i in 0..n{{let v=self.0.get(a+i).unwrap();self.0.set(b+i,v);}}}}self}}
+ pub fn copy_within_copy(self,source:u32,destination:u32,count:u32)->Self{{self.copy_within(source,destination,count)}}
  pub fn truncate(mut self,n:u32)->Self{{self.0.truncate(n as usize);self}}
  pub fn pop(self)->Self{{let n=self.len().saturating_sub(1);self.truncate(n)}}
  pub fn map_inplace(self,f:impl FnMut({row})->{row})->Self{{Self(self.0.map_rows(f,0))}}
@@ -207,9 +223,10 @@ impl {owner}{{
 }}
 impl Wire for {owner}{{fn from_json(_: &Json)->Result<Self,String>{{Err("temporary storage is internal to a pure invocation".into())}}fn to_json(&self)->Json{{Json::Null}}}}
 impl InkDataEq for {owner}{{fn ink_data_eq(&self,_:&Self)->bool{{panic!("temporary storage has no value equality")}}}}
+impl PartialEq for {owner}{{fn eq(&self,r:&Self)->bool{{self.0==r.0}}}}
 "#,storage=if layout.packing.contains_key(&schema.fields[0].0){"self.c0.storage_identity()"}else{"self.c0.as_ptr()as usize"},prepare_push=prepare_push.join(""),prepare_append=prepare_append.join(""),capacities=capacities.join(","),fields=fields.join(","),defaults=defaults.join(","),payload=payload.join("+"),pushes=pushes.join(""),sets=sets.join(""),truncates=truncates.join(""),append=append.join(""),compare=if scalar{"a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)".into()}else{schema.fields.iter().map(|(f,_)|format!("let order=a.l_{f}.partial_cmp(&b.l_{f}).unwrap_or(std::cmp::Ordering::Equal);if order!=std::cmp::Ordering::Equal{{return order;}}" )).collect::<String>()+"std::cmp::Ordering::Equal"}).unwrap();
         if schema.fields.iter().all(|(_, t)| *t != Type::F32) {
-            writeln!(out, "impl Eq for {name}{{}} ").unwrap();
+            writeln!(out, "impl Eq for {name}{{}} impl Eq for {owner}{{}} ").unwrap();
         }
     }
     Ok(out)
