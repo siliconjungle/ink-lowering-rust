@@ -5,7 +5,7 @@ use crate::{syntax::*, LangResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
-fn ident(s: &str) -> String {
+pub(crate) fn ident(s: &str) -> String {
     format!("l_{s}")
 }
 pub(crate) fn ty(t: &Type) -> LangResult<String> {
@@ -1254,6 +1254,9 @@ impl Wire for {id} {{
         if v.extremum.is_some() {
             // (contribution, whether one copy was removed)
             writeln!(out, "Maintained{i}(u64,bool),").unwrap();
+        } else if v.grouped.is_some() {
+            // (group, its previous total when present)
+            writeln!(out, "Maintained{i}(u64,Option<{}>),", v.ty).unwrap();
         } else {
             writeln!(out, "Maintained{i}({}),", v.ty).unwrap();
         }
@@ -1286,6 +1289,8 @@ impl Wire for {id} {{
     for (i, v) in views.iter().enumerate() {
         if v.extremum.is_some() {
             writeln!(out, "maintained_{i}:std::collections::BTreeMap<u64,u64>,").unwrap();
+        } else if v.grouped.is_some() {
+            writeln!(out, "maintained_{i}:std::collections::HashMap<u64,{}>,", v.ty).unwrap();
         } else {
             writeln!(out, "maintained_{i}:{},", v.ty).unwrap();
         }
@@ -1314,6 +1319,8 @@ impl Wire for {id} {{
     for (i, v) in views.iter().enumerate() {
         if v.extremum.is_some() {
             writeln!(out, "maintained_{i}:std::collections::BTreeMap::new(),").unwrap();
+        } else if v.grouped.is_some() {
+            writeln!(out, "maintained_{i}:std::collections::HashMap::new(),").unwrap();
         } else {
             writeln!(out, "maintained_{i}:{},", v.zero).unwrap();
         }
@@ -1331,6 +1338,8 @@ impl Wire for {id} {{
         for (i, v) in views.iter().enumerate() {
             if v.extremum.is_some() {
                 writeln!(out, "self.maintained_{i}.clear();for(key,row)in self.{}.iter(){{Self::multiset_add(&mut self.maintained_{i},Self::maintained_{i}_contribution(key,row));}}", ident(&v.table)).unwrap();
+            } else if v.grouped.is_some() {
+                writeln!(out, "self.maintained_{i}.clear();for(key,row)in self.{}.iter(){{let group=Self::maintained_{i}_group(key,row);let total=Self::maintained_{i}_insert(self.maintained_{i}.get(&group).copied().unwrap_or({zero}),key,row);if total=={zero}{{self.maintained_{i}.remove(&group);}}else{{self.maintained_{i}.insert(group,total);}}}}", ident(&v.table), zero = v.zero).unwrap();
             } else {
                 writeln!(out, "self.maintained_{i}=self.{}.iter().fold({},|total,(key,row)|Self::maintained_{i}_insert(total,key,row));", ident(&v.table), v.zero).unwrap();
             }
@@ -1419,6 +1428,11 @@ impl Wire for {id} {{
             for i in &on_table {
                 if views[*i].extremum.is_some() {
                     write!(out, "(prior.map(|old|Self::maintained_{i}_contribution(&key,old)),value.as_ref().map(|row|Self::maintained_{i}_contribution(&key,row))),").unwrap();
+                } else if views[*i].grouped.is_some() {
+                    // New totals of the old row's group, then the new row's
+                    // (on top of the first when both are the same group).
+                    let zero = &views[*i].zero;
+                    write!(out, "{{let removed=prior.map(|old|{{let group=Self::maintained_{i}_group(&key,old);(group,Self::maintained_{i}_remove(self.maintained_{i}.get(&group).copied().unwrap_or({zero}),&key,old))}});let inserted=value.as_ref().map(|row|{{let group=Self::maintained_{i}_group(&key,row);let base=match removed{{Some((g,t)) if g==group=>t,_=>self.maintained_{i}.get(&group).copied().unwrap_or({zero})}};(group,Self::maintained_{i}_insert(base,&key,row))}});[removed,inserted]}},").unwrap();
                 } else {
                     write!(out, "match(prior,value.as_ref()){{(None,Some(row))=>Self::maintained_{i}_insert(self.maintained_{i},&key,row),(Some(old),Some(row))=>Self::maintained_{i}_replace(self.maintained_{i},&key,old,row),(Some(old),None)=>Self::maintained_{i}_remove(self.maintained_{i},&key,old),(None,None)=>self.maintained_{i}}},").unwrap();
                 }
@@ -1427,6 +1441,9 @@ impl Wire for {id} {{
             for (n, i) in on_table.iter().enumerate() {
                 if views[*i].extremum.is_some() {
                     write!(out, "if next.{n}.0!=next.{n}.1{{if let Some(c)=next.{n}.0{{Self::multiset_remove(&mut self.maintained_{i},c);self.undo.push(Undo::Maintained{i}(c,true));}}if let Some(c)=next.{n}.1{{Self::multiset_add(&mut self.maintained_{i},c);self.undo.push(Undo::Maintained{i}(c,false));}}}}").unwrap();
+                } else if views[*i].grouped.is_some() {
+                    let zero = &views[*i].zero;
+                    write!(out, "for (group,total) in next.{n}.into_iter().flatten(){{let previous=if total=={zero}{{self.maintained_{i}.remove(&group)}}else{{self.maintained_{i}.insert(group,total)}};self.undo.push(Undo::Maintained{i}(group,previous));}}").unwrap();
                 } else {
                     write!(out, "self.undo.push(Undo::Maintained{i}(self.maintained_{i}));self.maintained_{i}=next.{n};").unwrap();
                 }
@@ -1462,6 +1479,8 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     for (i, v) in views.iter().enumerate() {
         if v.extremum.is_some() {
             writeln!(out, "Undo::Maintained{i}(c,removed)=>{{if removed{{Self::multiset_add(&mut self.maintained_{i},c);}}else{{Self::multiset_remove(&mut self.maintained_{i},c);}}}},").unwrap();
+        } else if v.grouped.is_some() {
+            writeln!(out, "Undo::Maintained{i}(group,previous)=>{{match previous{{Some(total)=>{{self.maintained_{i}.insert(group,total);}},None=>{{self.maintained_{i}.remove(&group);}}}}}},").unwrap();
         } else {
             writeln!(out, "Undo::Maintained{i}(old)=>{{self.maintained_{i}=old;}},").unwrap();
         }
@@ -1481,7 +1500,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         let body = emitter.expr(&k.value, &Env::new(), Some(&k.ty))?.0;
         let id = ident(&k.name);
         let t = ty(&k.ty)?;
-        if let Some(i) = views.iter().position(|v| v.keep == k.name) {
+        if let Some(i) = views.iter().position(|v| v.keep == k.name && v.grouped.is_none()) {
             match views[i].extremum {
                 Some(ink_core::maintained::Order::Max) => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}.keys().next_back().copied().unwrap_or({})}}", views[i].zero).unwrap(),
                 Some(ink_core::maintained::Order::Min) => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}.keys().next().copied().unwrap_or({})}}", views[i].zero).unwrap(),
@@ -1561,7 +1580,10 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         emitter.reset_ownership(&a.params, &a.body);
         let body = emitter.block(&a.body, &mut a.params.iter().cloned().collect(), &a.result)?;
         emitter.clear_ownership();
-        if retained.queries.contains(&a.name) {
+        if let Some((i, v)) = views.iter().enumerate().find(|(_, v)| v.grouped.is_some() && v.keep == a.name) {
+            // A grouped view answers its query by one lookup.
+            writeln!(out,"#[allow(unused_parens)] fn action_{id}(&mut self,{params})->{result}{{self.maintained_{i}.get(&({})).copied().unwrap_or({})}}", v.grouped.as_ref().unwrap(), v.zero).unwrap();
+        } else if retained.queries.contains(&a.name) {
             writeln!(out,"fn retained_eval_{id}(&mut self)->{result}{{{body}}}\nfn action_{id}(&mut self)->{result}{{if let Some(v)=&self.retained_query_{id}{{return v.clone();}}let v=self.retained_eval_{id}();self.retained_query_{id}=Some(v.clone());v}}").unwrap();
         } else {
             writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}").unwrap();
