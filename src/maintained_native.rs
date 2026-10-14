@@ -177,6 +177,10 @@ pub(crate) struct View {
     pub methods: String,
     /// A word extremum keeps the multiset of contributions instead of a total.
     pub extremum: Option<ink_core::maintained::Order>,
+    /// A grouped view keeps one total per group word and answers the
+    /// one-parameter query `keep` names: the word of its parameter (an
+    /// expression over the parameter's identifier).
+    pub grouped: Option<String>,
 }
 pub(crate) struct Views(pub Vec<View>);
 
@@ -209,8 +213,30 @@ pub(crate) fn views(module: &CheckedModule, checked: &CheckedViews) -> LangResul
                 "#[allow(unused_variables,unused_parens)] fn maintained_{index}_contribution(key:&{},row:&{})->u64{{{code}{result}}}\n",
                 crate::state_native::ty(key)?, crate::state_native::ty(row)?
             );
-            out.push(View { keep: s.keep.clone(), table: s.table.clone(), ty, zero, methods, extremum: Some(extremum.order) });
+            out.push(View { keep: s.keep.clone(), table: s.table.clone(), ty, zero, methods, extremum: Some(extremum.order), grouped: None });
             continue;
+        }
+        let mut grouped = None;
+        let mut methods = String::new();
+        if let Some(group) = &v.group {
+            // The group word of a row, and the word of the query's parameter
+            // as the projection encodes it.
+            let query = p.actions.iter().find(|a| a.name == s.keep).ok_or("maintained grouped query")?;
+            let [(name, param)] = query.params.as_slice() else { return Err("maintained grouped query parameter".into()) };
+            let Value::Word(word) = input(p, &projection, param, &crate::state_native::ident(name), 0)? else {
+                return Err("maintained grouped parameter carrier".into());
+            };
+            grouped = Some(word);
+            let mut env = BTreeMap::new();
+            env.insert("key".to_string(), input(p, &projection, key, "(*key)", 0)?);
+            env.insert("row".to_string(), input(p, &projection, row, "(*row)", 0)?);
+            let mut emit = Emit { ds: &ds, active: BTreeSet::new(), next: 0, work: 0 };
+            let mut code = String::new();
+            let Value::Word(result) = emit.expr(&call(group, vec![var("key"), var("row")]), &env, &mut code, 0)? else {
+                return Err("maintained group word carrier".into());
+            };
+            writeln!(methods, "#[allow(unused_variables,unused_parens)] fn maintained_{index}_group(key:&{},row:&{})->u64{{{code}{result}}}",
+                crate::state_native::ty(key)?, crate::state_native::ty(row)?).unwrap();
         }
         let c = |a, b| call(&v.combine, vec![a, b]);
         let inv = |a| call(&v.inverse, vec![a]);
@@ -218,12 +244,14 @@ pub(crate) fn views(module: &CheckedModule, checked: &CheckedViews) -> LangResul
             Some(u) => call(&u.function, vec![var("total"), contribution("old"), contribution("row")]),
             None => c(c(var("total"), inv(contribution("old"))), contribution("row")),
         };
-        let candidates = [
+        let mut candidates = vec![
             ("insert", vec!["key", "row"], c(var("total"), contribution("row"))),
             ("remove", vec!["key", "old"], c(var("total"), inv(contribution("old")))),
-            ("replace", vec!["key", "old", "row"], replacement),
         ];
-        let mut methods = String::new();
+        // A grouped write may move a row between groups: remove, then insert.
+        if grouped.is_none() {
+            candidates.push(("replace", vec!["key", "old", "row"], replacement));
+        }
         for (name, params, body) in candidates {
             let mut env = BTreeMap::new();
             env.insert("total".to_string(), if ty == "u64" { Value::Word("total".into()) } else { Value::Bool("total".into()) });
@@ -239,7 +267,7 @@ pub(crate) fn views(module: &CheckedModule, checked: &CheckedViews) -> LangResul
             let result = value.scalar()?;
             writeln!(methods, "#[allow(unused_variables,unused_parens)] fn maintained_{index}_{name}({})->{ty}{{{code}{result}}}", signature.join(",")).unwrap();
         }
-        out.push(View { keep: s.keep.clone(), table: s.table.clone(), ty, zero, methods, extremum: None });
+        out.push(View { keep: s.keep.clone(), table: s.table.clone(), ty, zero, methods, extremum: None, grouped });
     }
     Ok(Views(out))
 }
