@@ -890,8 +890,23 @@ impl Emitter<'_> {
                         let Type::List(out) = &t else {
                             return Err("zip output".into());
                         };
-                        let (left, left_borrowed) = self.iterate(receiver, env, None)?;
-                        let (right, right_borrowed) = self.iterate(&args[0], env, None)?;
+                        // Both iterators are alive together. When the operands
+                        // share a variable, one may move it while the other
+                        // still borrows it, so evaluate both eagerly instead.
+                        let shared = ink_core::analysis::free_variables(receiver)
+                            .intersection(&ink_core::analysis::free_variables(&args[0]))
+                            .next()
+                            .is_some();
+                        let (left, left_borrowed) = if shared {
+                            (format!("({}).into_iter()", self.expr(receiver, env, None)?), false)
+                        } else {
+                            self.iterate(receiver, env, None)?
+                        };
+                        let (right, right_borrowed) = if shared {
+                            (format!("({}).into_iter()", self.expr(&args[0], env, None)?), false)
+                        } else {
+                            self.iterate(&args[0], env, None)?
+                        };
                         let (vs, body) = self.lambda_mode(&args[1], env, &[*inner, *other], out, &[left_borrowed, right_borrowed])?;
                         let a = self.fresh();
                         let b = self.fresh();
