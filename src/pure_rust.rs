@@ -1635,7 +1635,7 @@ impl Clone for l_Row{fn clone(&self)->Self{COPIES.fetch_add(1,Ordering::Relaxed)
 #[derive(Clone)]struct l_Inner{l_rows:OwnedBuffer<l_Row>,l_done:bool}
 #[derive(Clone)]struct l_State{l_inner:l_Inner,l_total:u32}
 "#);
-        code.push_str(include_str!("../../../native-support/src/owned-values.rs.txt"));
+        code.push_str(ink_native_support::OWNED_VALUES_RUST_SOURCE);
         for f in &program.functions {
             let params=f.params.iter().map(|(n,t)|format!("l_{n}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
             let emitted=body(&program,f).unwrap().replace("self.function_l_","");

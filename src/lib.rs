@@ -7,6 +7,7 @@ mod pure_rust;
 mod primitive_emit;
 pub mod snapshot_code;
 pub mod state_native;
+pub mod packed;
 
 pub mod representation_program;
 
