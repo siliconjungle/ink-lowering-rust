@@ -1229,7 +1229,12 @@ impl Wire for {id} {{
         out.push_str("},\n");
     }
     for (i, v) in views.iter().enumerate() {
-        writeln!(out, "Maintained{i}({}),", v.ty).unwrap();
+        if v.extremum.is_some() {
+            // (contribution, whether one copy was removed)
+            writeln!(out, "Maintained{i}(u64,bool),").unwrap();
+        } else {
+            writeln!(out, "Maintained{i}({}),", v.ty).unwrap();
+        }
     }
     out.push_str("}\n");
     out.push_str(
@@ -1257,7 +1262,11 @@ impl Wire for {id} {{
         retained.caches.retain(|(c, _)| *c != cache);
     }
     for (i, v) in views.iter().enumerate() {
-        writeln!(out, "maintained_{i}:{},", v.ty).unwrap();
+        if v.extremum.is_some() {
+            writeln!(out, "maintained_{i}:std::collections::BTreeMap<u64,u64>,").unwrap();
+        } else {
+            writeln!(out, "maintained_{i}:{},", v.ty).unwrap();
+        }
     }
     for k in p.keeps.iter().filter(|k| retained.keeps.contains(&k.name)) {
         writeln!(out, "retained_keep_{}:Option<{}>,", ident(&k.name), ty(&k.ty)?).unwrap();
@@ -1281,16 +1290,28 @@ impl Wire for {id} {{
         writeln!(out, "{cache}:None,").unwrap();
     }
     for (i, v) in views.iter().enumerate() {
-        writeln!(out, "maintained_{i}:{},", v.zero).unwrap();
+        if v.extremum.is_some() {
+            writeln!(out, "maintained_{i}:std::collections::BTreeMap::new(),").unwrap();
+        } else {
+            writeln!(out, "maintained_{i}:{},", v.zero).unwrap();
+        }
     }
     out.push_str("}}\n");
     for v in views {
         out.push_str(&v.methods);
     }
+    if views.iter().any(|v| v.extremum.is_some()) {
+        // The fixed multiset controller for word extremum views.
+        out.push_str("fn multiset_add(m:&mut std::collections::BTreeMap<u64,u64>,c:u64){*m.entry(c).or_insert(0)+=1;}\nfn multiset_remove(m:&mut std::collections::BTreeMap<u64,u64>,c:u64){if let std::collections::btree_map::Entry::Occupied(mut e)=m.entry(c){if *e.get()>1{*e.get_mut()-=1;}else{e.remove();}}}\n");
+    }
     if !views.is_empty() {
         out.push_str("fn rebuild_maintained(&mut self){");
         for (i, v) in views.iter().enumerate() {
-            writeln!(out, "self.maintained_{i}=self.{}.iter().fold({},|total,(key,row)|Self::maintained_{i}_insert(total,key,row));", ident(&v.table), v.zero).unwrap();
+            if v.extremum.is_some() {
+                writeln!(out, "self.maintained_{i}.clear();for(key,row)in self.{}.iter(){{Self::multiset_add(&mut self.maintained_{i},Self::maintained_{i}_contribution(key,row));}}", ident(&v.table)).unwrap();
+            } else {
+                writeln!(out, "self.maintained_{i}=self.{}.iter().fold({},|total,(key,row)|Self::maintained_{i}_insert(total,key,row));", ident(&v.table), v.zero).unwrap();
+            }
         }
         out.push_str("}\n");
     }
@@ -1364,11 +1385,19 @@ impl Wire for {id} {{
             out.push_str(&field);
             out.push_str(".get(&key);(");
             for i in &on_table {
-                write!(out, "match(prior,value.as_ref()){{(None,Some(row))=>Self::maintained_{i}_insert(self.maintained_{i},&key,row),(Some(old),Some(row))=>Self::maintained_{i}_replace(self.maintained_{i},&key,old,row),(Some(old),None)=>Self::maintained_{i}_remove(self.maintained_{i},&key,old),(None,None)=>self.maintained_{i}}},").unwrap();
+                if views[*i].extremum.is_some() {
+                    write!(out, "(prior.map(|old|Self::maintained_{i}_contribution(&key,old)),value.as_ref().map(|row|Self::maintained_{i}_contribution(&key,row))),").unwrap();
+                } else {
+                    write!(out, "match(prior,value.as_ref()){{(None,Some(row))=>Self::maintained_{i}_insert(self.maintained_{i},&key,row),(Some(old),Some(row))=>Self::maintained_{i}_replace(self.maintained_{i},&key,old,row),(Some(old),None)=>Self::maintained_{i}_remove(self.maintained_{i},&key,old),(None,None)=>self.maintained_{i}}},").unwrap();
+                }
             }
             out.push_str(")};");
             for (n, i) in on_table.iter().enumerate() {
-                write!(out, "self.undo.push(Undo::Maintained{i}(self.maintained_{i}));self.maintained_{i}=next.{n};").unwrap();
+                if views[*i].extremum.is_some() {
+                    write!(out, "if next.{n}.0!=next.{n}.1{{if let Some(c)=next.{n}.0{{Self::multiset_remove(&mut self.maintained_{i},c);self.undo.push(Undo::Maintained{i}(c,true));}}if let Some(c)=next.{n}.1{{Self::multiset_add(&mut self.maintained_{i},c);self.undo.push(Undo::Maintained{i}(c,false));}}}}").unwrap();
+                } else {
+                    write!(out, "self.undo.push(Undo::Maintained{i}(self.maintained_{i}));self.maintained_{i}=next.{n};").unwrap();
+                }
             }
             out.push('\n');
         }
@@ -1398,8 +1427,12 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
 
         out.push_str("},\n");
     }
-    for i in 0..views.len() {
-        writeln!(out, "Undo::Maintained{i}(old)=>{{self.maintained_{i}=old;}},").unwrap();
+    for (i, v) in views.iter().enumerate() {
+        if v.extremum.is_some() {
+            writeln!(out, "Undo::Maintained{i}(c,removed)=>{{if removed{{Self::multiset_add(&mut self.maintained_{i},c);}}else{{Self::multiset_remove(&mut self.maintained_{i},c);}}}},").unwrap();
+        } else {
+            writeln!(out, "Undo::Maintained{i}(old)=>{{self.maintained_{i}=old;}},").unwrap();
+        }
     }
     out.push_str("}}");
     for (cache, _) in &retained.caches {
@@ -1417,7 +1450,11 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         let id = ident(&k.name);
         let t = ty(&k.ty)?;
         if let Some(i) = views.iter().position(|v| v.keep == k.name) {
-            writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}}}").unwrap();
+            match views[i].extremum {
+                Some(ink_core::maintained::Order::Max) => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}.keys().next_back().copied().unwrap_or({})}}", views[i].zero).unwrap(),
+                Some(ink_core::maintained::Order::Min) => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}.keys().next().copied().unwrap_or({})}}", views[i].zero).unwrap(),
+                None => writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}}}").unwrap(),
+            }
         } else if retained.keeps.contains(&k.name) {
             writeln!(out, "fn keep_{id}(&mut self)->{t}{{if let Some(v)=&self.retained_keep_{id}{{return v.clone();}}let v:{t}={{{body}}};self.retained_keep_{id}=Some(v.clone());v}}").unwrap();
         } else {
