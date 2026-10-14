@@ -119,7 +119,7 @@ pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
                 .collect::<Vec<_>>()
                 .join(",");
             out.push_str(&format!(
-                "{i}=>unsafe{{lang_fn_{}({args})}} as u64,",
+                "{i}=>(unsafe{{lang_fn_{}({args})}}) as u64,",
                 f.name
             ));
         }
