@@ -1,0 +1,79 @@
+// Invocation-local, eight-byte-aligned packed storage. Native hosts call these
+// as ordinary Rust functions; Wasm exports retain the browser host contract.
+std::thread_local! {static INK_PACKED_ALLOCATIONS:std::cell::RefCell<Vec<Box<[u64]>>>=const{std::cell::RefCell::new(Vec::new())};}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub extern "C" fn ink_alloc(count: usize, width: usize) -> *mut std::ffi::c_void {
+    let bytes = count
+        .checked_mul(width)
+        .expect("packed allocation overflow");
+    assert!(bytes <= 256 * 1024 * 1024, "packed allocation limit");
+    let mut block = vec![0u64; bytes.max(1).div_ceil(8)].into_boxed_slice();
+    let ptr = block.as_mut_ptr().cast();
+    INK_PACKED_ALLOCATIONS.with(|blocks| blocks.borrow_mut().push(block));
+    ptr
+}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub extern "C" fn ink_compute_mark() -> usize {
+    INK_PACKED_ALLOCATIONS.with(|blocks| blocks.borrow().len())
+}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub extern "C" fn ink_compute_rewind(mark: usize) {
+    INK_PACKED_ALLOCATIONS.with(|blocks| {
+        let mut blocks = blocks.borrow_mut();
+        assert!(mark <= blocks.len(), "invalid packed mark");
+        blocks.truncate(mark);
+    });
+}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub extern "C" fn ink_compute_reset() {
+    ink_compute_rewind(0);
+}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub unsafe extern "C" fn ink_compute_into(
+    f: u32,
+    data: *const *const std::ffi::c_void,
+    lengths: *const usize,
+    destination: *mut std::ffi::c_void,
+) -> usize {
+    let words = unsafe { ink_packed_result(f, data, lengths) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(words.as_ptr(), destination.cast(), words.len());
+    }
+    words.len()
+}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub unsafe extern "C" fn ink_compute_call(
+    f: u32,
+    data: *const *const std::ffi::c_void,
+    lengths: *const usize,
+    out: *mut *mut std::ffi::c_void,
+    count: *mut usize,
+) {
+    let words = unsafe { ink_packed_result(f, data, lengths) };
+    let ptr = ink_alloc(words.len(), 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(words.as_ptr(), ptr.cast(), words.len());
+        *out = ptr;
+        *count = words.len();
+    }
+}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub unsafe extern "C" fn ink_compute_scalar32(
+    f: u32,
+    data: *const *const std::ffi::c_void,
+    lengths: *const usize,
+) -> u32 {
+    let words = unsafe { ink_packed_result(f, data, lengths) };
+    assert_eq!(words.len(), 1);
+    words[0]
+}
+#[cfg_attr(target_arch = "wasm32", no_mangle)]
+pub unsafe extern "C" fn ink_compute_scalar64(
+    f: u32,
+    data: *const *const std::ffi::c_void,
+    lengths: *const usize,
+) -> u64 {
+    let words = unsafe { ink_packed_result(f, data, lengths) };
+    assert_eq!(words.len(), 2);
+    u64::from(words[0]) | (u64::from(words[1]) << 32)
+}
