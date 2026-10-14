@@ -172,8 +172,11 @@ pub(crate) struct View {
     /// `u64` or `bool`.
     pub ty: &'static str,
     pub zero: String,
-    /// Methods on `State`: `fn maintained_<i>_{insert,remove,replace}`.
+    /// Methods on `State`: `fn maintained_<i>_{insert,remove,replace}` for a
+    /// group, `fn maintained_<i>_contribution` for an extremum.
     pub methods: String,
+    /// A word extremum keeps the multiset of contributions instead of a total.
+    pub extremum: Option<ink_core::maintained::Order>,
 }
 pub(crate) struct Views(pub Vec<View>);
 
@@ -194,6 +197,21 @@ pub(crate) fn views(module: &CheckedModule, checked: &CheckedViews) -> LangResul
         };
         let contribution_id = v.contribution_choice.as_ref().map(|c| &c.function).unwrap_or(&v.contribution);
         let contribution = |r: &str| call(contribution_id, vec![var("key"), var(r)]);
+        if let Some(extremum) = &v.extremum {
+            let mut env = BTreeMap::new();
+            env.insert("key".to_string(), input(p, &projection, key, "(*key)", 0)?);
+            env.insert("row".to_string(), input(p, &projection, row, "(*row)", 0)?);
+            let mut emit = Emit { ds: &ds, active: BTreeSet::new(), next: 0, work: 0 };
+            let mut code = String::new();
+            let value = emit.expr(&contribution("row"), &env, &mut code, 0)?;
+            let Value::Word(result) = value else { return Err("maintained extremum contribution carrier".into()) };
+            let methods = format!(
+                "#[allow(unused_variables,unused_parens)] fn maintained_{index}_contribution(key:&{},row:&{})->u64{{{code}{result}}}\n",
+                crate::state_native::ty(key)?, crate::state_native::ty(row)?
+            );
+            out.push(View { keep: s.keep.clone(), table: s.table.clone(), ty, zero, methods, extremum: Some(extremum.order) });
+            continue;
+        }
         let c = |a, b| call(&v.combine, vec![a, b]);
         let inv = |a| call(&v.inverse, vec![a]);
         let replacement = match &v.update {
@@ -221,7 +239,7 @@ pub(crate) fn views(module: &CheckedModule, checked: &CheckedViews) -> LangResul
             let result = value.scalar()?;
             writeln!(methods, "#[allow(unused_variables,unused_parens)] fn maintained_{index}_{name}({})->{ty}{{{code}{result}}}", signature.join(",")).unwrap();
         }
-        out.push(View { keep: s.keep.clone(), table: s.table.clone(), ty, zero, methods });
+        out.push(View { keep: s.keep.clone(), table: s.table.clone(), ty, zero, methods, extremum: None });
     }
     Ok(Views(out))
 }
