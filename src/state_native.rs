@@ -1006,7 +1006,7 @@ pub fn emit_selected(selected: &ink_core::optimisation::CheckedSelection) -> Lan
 }
 pub fn emit_selected_with_table_storage(selected:&ink_core::optimisation::CheckedSelection,storage:TableStorage)->LangResult<String>{
     let layout=crate::snapshot::selected_layout(selected)?;
-    emit_with_layout(selected.module().program(),&layout,storage,None,None)
+    emit_with_layout(selected.module(),&layout,storage,None,None)
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
@@ -1025,8 +1025,11 @@ fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     }
 }
 pub fn emit(p: &Program) -> LangResult<String> {
-    let layout = crate::snapshot::layout(p)?;
-    emit_with_layout(p, &layout, TableStorage::Ordered,None,None)
+    emit_with_table_storage(p, TableStorage::Ordered)
+}
+/// Emit an already admitted module; this is not an unchecked Program entrypoint.
+pub fn emit_checked(module: &ink_core::core::CheckedModule) -> LangResult<String> {
+    emit_checked_with_table_storage(module, TableStorage::Ordered)
 }
 /// Operational implementations of the same fixed finite-map primitive.
 /// This choice grants no mathematical rewrite authority. The ordered baseline
@@ -1034,8 +1037,11 @@ pub fn emit(p: &Program) -> LangResult<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableStorage { Ordered, IndexedSlots }
 pub fn emit_with_table_storage(p: &Program, storage: TableStorage) -> LangResult<String> {
-    let layout=crate::snapshot::layout(p)?;
-    emit_with_layout(p,&layout,storage,None,None)
+    emit_checked_with_table_storage(&ink_core::core::CheckedModule::from_source(p.clone())?,storage)
+}
+pub fn emit_checked_with_table_storage(module: &ink_core::core::CheckedModule, storage: TableStorage) -> LangResult<String> {
+    let layout=crate::snapshot::layout(module.program())?;
+    emit_with_layout(module,&layout,storage,None,None)
 }
 pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
     plan.require_record_elision_capability(false)?;
@@ -1050,13 +1056,13 @@ pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String
         ink_core::physical::Tables::IndexedSlots=>TableStorage::IndexedSlots,
     };
     let views=plan.maintained().map(|v|crate::maintained_native::views(plan.module(),v)).transpose()?;
-    emit_with_layout(plan.module().program(),&layout,storage,plan.physical(),views.as_ref())
+    emit_with_layout(plan.module(),&layout,storage,plan.physical(),views.as_ref())
 }
-fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>, maintained: Option<&crate::maintained_native::Views>) -> LangResult<String> {
+fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>, maintained: Option<&crate::maintained_native::Views>) -> LangResult<String> {
+    let p = module.program();
     let views: &[crate::maintained_native::View] = maintained.map(|v| v.0.as_slice()).unwrap_or(&[]);
     let _column_scope=crate::columns::scope(physical)?;
-    let module = ink_core::core::CheckedModule::from_source(p.clone())?;
-    let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
+    let action_ir = ink_core::action_ir::CheckedActions::elaborate(module)?;
     let execution = action_ir.execution()?;
     let mut emitter = Emitter {
         p,
