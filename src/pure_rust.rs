@@ -943,7 +943,7 @@ fn selected(r:Outer)->List<Item>{return r.nested.first;}
         let mut sites=std::collections::BTreeSet::new();
         for f in &p.functions {let env=ink_core::check::params_env(&f.params).unwrap();ink_core::analysis::walk(&f.body,|e|if matches!(e,Expr::Var(_)|Expr::Field(..))&&ink_core::check::infer(e,&env,&p).is_ok(){sites.insert(ink_core::registry::identity(e).unwrap());});}
         sites.insert(ink_core::registry::identity(&Expr::Field(Box::new(Expr::Var("x".into())),"key".into())).unwrap());
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites.into_iter().collect(),borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![],dictionary_tables:vec![]}).unwrap();
 
         let mut source = String::from(
             r#"
@@ -1013,7 +1013,7 @@ let a=selected(&r);assert_eq!(a.len(),3);assert_eq!(COPIES.swap(0,Ordering::Rela
         check::check(&p).unwrap();
         let module=ink_core::core::CheckedModule::from_source(p.clone()).unwrap();
         let mut sites=vec![ink_core::registry::identity(&Expr::Var("a".into())).unwrap(),ink_core::registry::identity(&Expr::Var("b".into())).unwrap()];sites.sort();
-        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![]}).unwrap();
+        let physical=ink_core::physical::check(&module,None,&ink_core::physical::Plan{schema:1,semantics:ink_core::physical::SEMANTICS.into(),input_core_sha256:module.identity().unwrap(),representation:None,tables:Default::default(), buffers:Default::default(), bounds:None, columns:vec![],record_elisions:vec![],sum_spines:vec![],column_maps:None,borrow_reads:sites,borrow_rows:vec![],definitions:Default::default(),packed_datatypes:vec![],memo_functions:vec![],reservations:vec![],dense_prefixes:vec![],dictionary_tables:vec![]}).unwrap();
 
         let mut rust = String::from(
             r#"
