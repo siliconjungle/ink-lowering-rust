@@ -46,6 +46,13 @@ fn write(p: &Program, t: &Type, v: &str) -> LangResult<String> {
 }
 pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
     let p = module.pure_program()?;
+    // The shared descriptor rejects recursive or variable-width elements before
+    // either literal reader/writer expands their record fields.
+    for f in &p.functions {
+        for t in f.params.iter().map(|(_, t)| t).chain([&f.result]) {
+            ink_abi::packed_width(&ink_abi::describe(t, &p.records, &p.enums, &p.ids)?)?;
+        }
+    }
     let mut out = crate::state_native::emit(p)?;
     out.push_str(include_str!("packed-runtime.rs.txt"));
     out.push_str("unsafe fn ink_packed_result(function:u32,data:*const *const std::ffi::c_void,lengths:*const usize)->Vec<u32>{match function{\n");
@@ -126,4 +133,20 @@ pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
         out.push_str("_=>panic!(\"unknown compiled function\")}}\n");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recursive_and_variable_width_values_reject_before_emission() {
+        for source in [
+            "module Recursive;record R{next:R,}fn identity(x:R)->R{return x;}",
+            "module Nested;record R{xs:List<u32>,}fn identity(x:R)->R{return x;}",
+            "module Text;fn identity(x:String)->String{return x;}",
+        ] {
+            let checked=CheckedModule::from_source(ink_core::syntax::parse(source).unwrap()).unwrap();
+            assert!(lower(&checked,true).is_err());
+        }
+    }
 }
