@@ -2,6 +2,7 @@ pub use ink_core::*;
 pub mod definition_native;
 pub mod machine_native;
 mod ownership;
+mod maintained_native;
 mod pure_rust;
 mod primitive_emit;
 pub mod snapshot_code;

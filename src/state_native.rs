@@ -986,7 +986,7 @@ pub fn emit_selected(selected: &ink_core::optimisation::CheckedSelection) -> Lan
 }
 pub fn emit_selected_with_table_storage(selected:&ink_core::optimisation::CheckedSelection,storage:TableStorage)->LangResult<String>{
     let layout=crate::snapshot::selected_layout(selected)?;
-    emit_with_layout(selected.module().program(),&layout,storage,None)
+    emit_with_layout(selected.module().program(),&layout,storage,None,None)
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
@@ -1006,7 +1006,7 @@ fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
 }
 pub fn emit(p: &Program) -> LangResult<String> {
     let layout = crate::snapshot::layout(p)?;
-    emit_with_layout(p, &layout, TableStorage::Ordered,None)
+    emit_with_layout(p, &layout, TableStorage::Ordered,None,None)
 }
 /// Operational implementations of the same fixed finite-map primitive.
 /// This choice grants no mathematical rewrite authority. The ordered baseline
@@ -1015,19 +1015,25 @@ pub fn emit(p: &Program) -> LangResult<String> {
 pub enum TableStorage { Ordered, IndexedSlots }
 pub fn emit_with_table_storage(p: &Program, storage: TableStorage) -> LangResult<String> {
     let layout=crate::snapshot::layout(p)?;
-    emit_with_layout(p,&layout,storage,None)
+    emit_with_layout(p,&layout,storage,None,None)
 }
 pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
     plan.require_record_elision_capability(false)?;
-    plan.require_source_storage_capability(false,false)?;
+    if plan.protocol().is_some() {
+        return Err("target does not support selected state protocol".into());
+    }
+    // Maintained group folds are supported; dense prefixes are not.
+    plan.require_source_storage_capability(true,false)?;
     let layout=crate::snapshot::layout(plan.original().program())?;
     let storage=match plan.physical().map(|p|p.plan().tables).unwrap_or_default() {
         ink_core::physical::Tables::Ordered=>TableStorage::Ordered,
         ink_core::physical::Tables::IndexedSlots=>TableStorage::IndexedSlots,
     };
-    emit_with_layout(plan.module().program(),&layout,storage,plan.physical())
+    let views=plan.maintained().map(|v|crate::maintained_native::views(plan.module(),v)).transpose()?;
+    emit_with_layout(plan.module().program(),&layout,storage,plan.physical(),views.as_ref())
 }
-fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>) -> LangResult<String> {
+fn emit_with_layout(p: &Program, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>, maintained: Option<&crate::maintained_native::Views>) -> LangResult<String> {
+    let views: &[crate::maintained_native::View] = maintained.map(|v| v.0.as_slice()).unwrap_or(&[]);
     let _column_scope=crate::columns::scope(physical)?;
     let module = ink_core::core::CheckedModule::from_source(p.clone())?;
     let action_ir = ink_core::action_ir::CheckedActions::elaborate(&module)?;
@@ -1222,6 +1228,9 @@ impl Wire for {id} {{
 
         out.push_str("},\n");
     }
+    for (i, v) in views.iter().enumerate() {
+        writeln!(out, "Maintained{i}({}),", v.ty).unwrap();
+    }
     out.push_str("}\n");
     out.push_str(
         "struct HostTransaction {version:u64,removed:Vec<Event>}\npub struct State {version:u64,staged:Vec<EventData>,outbox:Vec<Event>,undo:Vec<Undo>,host:Option<HostTransaction>,\n",
@@ -1240,7 +1249,16 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
-    let retained = retained(p);
+    let mut retained = retained(p);
+    // A maintained keep is already constant time; it is not retained.
+    for v in views {
+        retained.keeps.remove(&v.keep);
+        let cache = format!("retained_keep_{}", ident(&v.keep));
+        retained.caches.retain(|(c, _)| *c != cache);
+    }
+    for (i, v) in views.iter().enumerate() {
+        writeln!(out, "maintained_{i}:{},", v.ty).unwrap();
+    }
     for k in p.keeps.iter().filter(|k| retained.keeps.contains(&k.name)) {
         writeln!(out, "retained_keep_{}:Option<{}>,", ident(&k.name), ty(&k.ty)?).unwrap();
     }
@@ -1262,7 +1280,20 @@ impl Wire for {id} {{
     for (cache, _) in &retained.caches {
         writeln!(out, "{cache}:None,").unwrap();
     }
+    for (i, v) in views.iter().enumerate() {
+        writeln!(out, "maintained_{i}:{},", v.zero).unwrap();
+    }
     out.push_str("}}\n");
+    for v in views {
+        out.push_str(&v.methods);
+    }
+    if !views.is_empty() {
+        out.push_str("fn rebuild_maintained(&mut self){");
+        for (i, v) in views.iter().enumerate() {
+            writeln!(out, "self.maintained_{i}=self.{}.iter().fold({},|total,(key,row)|Self::maintained_{i}_insert(total,key,row));", ident(&v.table), v.zero).unwrap();
+        }
+        out.push_str("}\n");
+    }
     out.push_str("pub fn begin_transaction(&mut self)->Result<bool,String>{if self.host.is_some()||!self.undo.is_empty()||!self.staged.is_empty(){return Err(\"transaction already in progress\".into())}self.host=Some(HostTransaction{version:self.version,removed:vec![]});Ok(true)}\n pub fn commit_transaction(&mut self){self.host=None;self.undo.clear();self.clear_journal_keys();}\n pub fn rollback_transaction(&mut self){if let Some(host)=self.host.take(){self.rollback();self.version=host.version;self.outbox.retain(|e|e.commit<=host.version);let mut restored=host.removed;restored.append(&mut self.outbox);self.outbox=restored;}}\n");
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox(&self)->&[Event]{&self.outbox}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){let old=std::mem::take(&mut self.outbox);for e in old{if(e.commit,e.position)>(commit,position){self.outbox.push(e)}else if let Some(host)=&mut self.host{host.removed.push(e)}}}\n");
     out.push_str("pub fn checkpoint(&self)->Result<Vec<u8>,String>{self.checkpoint_with_limits(SnapshotLimits::default())}\npub fn checkpoint_with_limits(&self,limits:SnapshotLimits)->Result<Vec<u8>,String>{if (self.host.is_none()&&!self.undo.is_empty())||!self.staged.is_empty(){return Err(\"checkpoint requires transaction boundary\".into())}let layout=snapshot_layout();let tables=vec![");
@@ -1286,6 +1317,10 @@ impl Wire for {id} {{
             unreachable!()
         };
         writeln!(out,"for(k,v)in tables.next().unwrap(){{state.{}.insert(<{} as Wire>::from_json(&k)?,<{} as Wire>::from_json(&v)?);}}",ident(n),ty(k)?,ty(v)?).unwrap();
+    }
+    // Auxiliary folds are rebuilt from validated rows, never read from bytes.
+    if !views.is_empty() {
+        out.push_str("state.rebuild_maintained();");
     }
     out.push_str("state.outbox=logical.outbox.into_iter().map(|e|{let data=match e.channel{");
     for (i, (n, _)) in layout.events.iter().enumerate() {
@@ -1321,6 +1356,22 @@ impl Wire for {id} {{
         )
         .unwrap();
 
+        let on_table: Vec<usize> = views.iter().enumerate().filter(|(_, v)| v.table == s.name).map(|(i, _)| i).collect();
+        if !on_table.is_empty() {
+            // Each maintained fold moves by the cell's old and new rows before
+            // the table changes; rollback restores the previous totals.
+            out.push_str("let next={let prior=self.");
+            out.push_str(&field);
+            out.push_str(".get(&key);(");
+            for i in &on_table {
+                write!(out, "match(prior,value.as_ref()){{(None,Some(row))=>Self::maintained_{i}_insert(self.maintained_{i},&key,row),(Some(old),Some(row))=>Self::maintained_{i}_replace(self.maintained_{i},&key,old,row),(Some(old),None)=>Self::maintained_{i}_remove(self.maintained_{i},&key,old),(None,None)=>self.maintained_{i}}},").unwrap();
+            }
+            out.push_str(")};");
+            for (n, i) in on_table.iter().enumerate() {
+                write!(out, "self.undo.push(Undo::Maintained{i}(self.maintained_{i}));self.maintained_{i}=next.{n};").unwrap();
+            }
+            out.push('\n');
+        }
         writeln!(out,"let old=match value{{Some(v)=>self.{field}.insert(key.clone(),v),None=>self.{field}.remove(&key)}};").unwrap();
         for (cache, roots) in &retained.caches {
             if roots.contains(&s.name) {
@@ -1347,6 +1398,9 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
 
         out.push_str("},\n");
     }
+    for i in 0..views.len() {
+        writeln!(out, "Undo::Maintained{i}(old)=>{{self.maintained_{i}=old;}},").unwrap();
+    }
     out.push_str("}}");
     for (cache, _) in &retained.caches {
         write!(out, "self.{cache}=None;").unwrap();
@@ -1362,7 +1416,9 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         let body = emitter.expr(&k.value, &Env::new(), Some(&k.ty))?.0;
         let id = ident(&k.name);
         let t = ty(&k.ty)?;
-        if retained.keeps.contains(&k.name) {
+        if let Some(i) = views.iter().position(|v| v.keep == k.name) {
+            writeln!(out, "fn keep_{id}(&mut self)->{t}{{self.maintained_{i}}}").unwrap();
+        } else if retained.keeps.contains(&k.name) {
             writeln!(out, "fn keep_{id}(&mut self)->{t}{{if let Some(v)=&self.retained_keep_{id}{{return v.clone();}}let v:{t}={{{body}}};self.retained_keep_{id}=Some(v.clone());v}}").unwrap();
         } else {
             writeln!(out, "fn keep_{id}(&mut self)->{t}{{{body}}}").unwrap();
