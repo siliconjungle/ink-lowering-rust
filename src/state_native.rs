@@ -553,7 +553,10 @@ impl Emitter<'_> {
                     } else if ["intersect_keys", "put_many", "remove_many"].contains(&n.as_str()) {
                         let keys = self.expr(&args[0], env, Some(&T::List(k.clone())))?.0;
                         match n.as_str() {
-                            "intersect_keys" => (format!("{{let selected=({keys}).into_iter().collect::<std::collections::BTreeSet<_>>();self.{field}.keys().filter(|key|selected.contains(*key)).cloned().collect::<{}>()}}",ty(&T::List(k.clone()))?), T::List(k.clone())),
+                            // Fewer requested keys than rows: look each one up
+                            // (k log n) instead of scanning the table; the
+                            // result keeps table (ascending key) order.
+                            "intersect_keys" => (format!("{{let requested=({keys});if requested.len()<self.{field}.len(){{let mut found=requested.into_iter().filter(|key|self.{field}.contains_key(key)).collect::<Vec<_>>();found.sort();found.dedup();found.into_iter().collect::<{list}>()}}else{{let selected=requested.into_iter().collect::<std::collections::BTreeSet<_>>();self.{field}.keys().filter(|key|selected.contains(*key)).cloned().collect::<{list}>()}}}}",list=ty(&T::List(k.clone()))?), T::List(k.clone())),
                             "remove_many" => (format!("{{let keys={keys};for key in keys{{self.set_{field}(key,None,false);}}}}"), T::Unit),
                             _ => {
                                 let values = self.expr(&args[1], env, Some(&T::List(v.clone())))?.0;
