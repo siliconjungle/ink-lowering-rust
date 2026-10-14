@@ -95,6 +95,79 @@ struct Emitter<'a> {
     lazy_done: bool,
 }
 
+
+/// Retained derived values: scalar keeps and parameterless scalar queries keep
+/// their last result until a table they can observe is written. Reads are
+/// deterministic functions of the tables, so a retained value is the value a
+/// fresh evaluation would produce. Rollback and restore discard every result.
+struct Retained {
+    /// (cache field, roots it observes)
+    caches: Vec<(String, BTreeSet<String>)>,
+    keeps: BTreeSet<String>,
+    queries: BTreeSet<String>,
+}
+fn retainable(t: &Type) -> bool {
+    matches!(t, Type::U32 | Type::U64 | Type::I32 | Type::F32 | Type::Bool | Type::Unit | Type::Int)
+}
+fn statement_expressions<'a>(s: &'a Statement, out: &mut Vec<&'a Expr>) {
+    match s {
+        Statement::Let(_, _, e) | Statement::Return(e) | Statement::Emit(_, e) | Statement::Expr(e) => out.push(e),
+        Statement::If(c, a, b) => {
+            out.push(c);
+            for s in a.iter().chain(b) {
+                statement_expressions(s, out);
+            }
+        }
+    }
+}
+/// Every table a keep or action can observe, following keeps and nested
+/// action calls. Pure functions cannot read state.
+fn observed_roots(p: &Program, start: Vec<&Expr>) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = start;
+    while let Some(e) = pending.pop() {
+        let mut found = vec![];
+        ink_core::analysis::walk(e, |x| match x {
+            Expr::Var(n) | Expr::Call(n, _) => found.push(n.clone()),
+            _ => {}
+        });
+        for n in found {
+            if p.states.iter().any(|s| s.name == n) {
+                roots.insert(n);
+            } else if !seen.insert(n.clone()) {
+                continue;
+            } else if let Some(k) = p.keeps.iter().find(|k| k.name == n) {
+                pending.push(&k.value);
+            } else if let Some(a) = p.actions.iter().find(|a| a.name == n) {
+                for s in &a.body {
+                    statement_expressions(s, &mut pending);
+                }
+            }
+        }
+    }
+    roots
+}
+fn retained(p: &Program) -> Retained {
+    let mut r = Retained { caches: vec![], keeps: BTreeSet::new(), queries: BTreeSet::new() };
+    for k in &p.keeps {
+        if retainable(&k.ty) {
+            r.caches.push((format!("retained_keep_{}", ident(&k.name)), observed_roots(p, vec![&k.value])));
+            r.keeps.insert(k.name.clone());
+        }
+    }
+    for a in &p.actions {
+        if a.kind == ActionKind::Query && a.params.is_empty() && a.emits.is_empty() && retainable(&a.result) && !p.contracts.precondition_checks.contains_key(&a.name) {
+            let mut start = vec![];
+            for s in &a.body {
+                statement_expressions(s, &mut start);
+            }
+            r.caches.push((format!("retained_query_{}", ident(&a.name)), observed_roots(p, start)));
+            r.queries.insert(a.name.clone());
+        }
+    }
+    r
+}
 /// Conservative range analysis for one exact sum of an unsigned row field.
 /// Full key-domain cardinality is used, not an observed size or host RAM bound.
 
@@ -1164,6 +1237,13 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
+    let retained = retained(p);
+    for k in p.keeps.iter().filter(|k| retained.keeps.contains(&k.name)) {
+        writeln!(out, "retained_keep_{}:Option<{}>,", ident(&k.name), ty(&k.ty)?).unwrap();
+    }
+    for a in p.actions.iter().filter(|a| retained.queries.contains(&a.name)) {
+        writeln!(out, "retained_query_{}:Option<{}>,", ident(&a.name), ty(&a.result)?).unwrap();
+    }
     out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],host:None,\n");
     for s in &p.states {
         let constructor = "InkTable::new()";
@@ -1176,6 +1256,9 @@ impl Wire for {id} {{
         .unwrap();
     }
 
+    for (cache, _) in &retained.caches {
+        writeln!(out, "{cache}:None,").unwrap();
+    }
     out.push_str("}}\n");
     out.push_str("pub fn begin_transaction(&mut self)->Result<bool,String>{if self.host.is_some()||!self.undo.is_empty()||!self.staged.is_empty(){return Err(\"transaction already in progress\".into())}self.host=Some(HostTransaction{version:self.version,removed:vec![]});Ok(true)}\n pub fn commit_transaction(&mut self){self.host=None;self.undo.clear();self.clear_journal_keys();}\n pub fn rollback_transaction(&mut self){if let Some(host)=self.host.take(){self.rollback();self.version=host.version;self.outbox.retain(|e|e.commit<=host.version);let mut restored=host.removed;restored.append(&mut self.outbox);self.outbox=restored;}}\n");
     out.push_str("pub fn version(&self)->u64{self.version}\npub fn outbox(&self)->&[Event]{&self.outbox}\npub fn acknowledge_through(&mut self,commit:u64,position:u64){let old=std::mem::take(&mut self.outbox);for e in old{if(e.commit,e.position)>(commit,position){self.outbox.push(e)}else if let Some(host)=&mut self.host{host.removed.push(e)}}}\n");
@@ -1236,6 +1319,11 @@ impl Wire for {id} {{
         .unwrap();
 
         writeln!(out,"let old=match value{{Some(v)=>self.{field}.insert(key.clone(),v),None=>self.{field}.remove(&key)}};").unwrap();
+        for (cache, roots) in &retained.caches {
+            if roots.contains(&s.name) {
+                writeln!(out, "self.{cache}=None;").unwrap();
+            }
+        }
 
         write!(
             out,
@@ -1256,8 +1344,12 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
 
         out.push_str("},\n");
     }
+    out.push_str("}}");
+    for (cache, _) in &retained.caches {
+        write!(out, "self.{cache}=None;").unwrap();
+    }
     out.push_str(
-        "}}self.clear_journal_keys();self.staged.clear();}\nfn clear_journal_keys(&mut self){",
+        "self.clear_journal_keys();self.staged.clear();}\nfn clear_journal_keys(&mut self){",
     );
     for s in &p.states {
         writeln!(out, "self.journal_keys_{}.clear();", ident(&s.name)).unwrap();
@@ -1265,13 +1357,13 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     out.push_str("}\n");
     for k in execution.keeps() {
         let body = emitter.expr(&k.value, &Env::new(), Some(&k.ty))?.0;
-        writeln!(
-            out,
-            "fn keep_{}(&mut self)->{}{{{body}}}",
-            ident(&k.name),
-            ty(&k.ty)?
-        )
-        .unwrap();
+        let id = ident(&k.name);
+        let t = ty(&k.ty)?;
+        if retained.keeps.contains(&k.name) {
+            writeln!(out, "fn keep_{id}(&mut self)->{t}{{if let Some(v)=&self.retained_keep_{id}{{return v.clone();}}let v:{t}={{{body}}};self.retained_keep_{id}=Some(v.clone());v}}").unwrap();
+        } else {
+            writeln!(out, "fn keep_{id}(&mut self)->{t}{{{body}}}").unwrap();
+        }
     }
     let mut parallel_tasks = Vec::new();
     for f in &p.functions {
@@ -1331,7 +1423,12 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         emitter.reset_ownership(&a.params, &a.body);
         let body = emitter.block(&a.body, &mut a.params.iter().cloned().collect(), &a.result)?;
         emitter.clear_ownership();
-        writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}\npub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{").unwrap();
+        if retained.queries.contains(&a.name) {
+            writeln!(out,"fn retained_eval_{id}(&mut self)->{result}{{{body}}}\nfn action_{id}(&mut self)->{result}{{if let Some(v)=&self.retained_query_{id}{{return v.clone();}}let v=self.retained_eval_{id}();self.retained_query_{id}=Some(v.clone());v}}").unwrap();
+        } else {
+            writeln!(out,"fn action_{id}(&mut self,{params})->{result}{{{body}}}").unwrap();
+        }
+        writeln!(out,"pub fn invoke_view_{id}(&mut self,{params})->Result<OutcomeView<'_,{result}>,String>{{").unwrap();
         if let Some(guard)=p.contracts.precondition_checks.get(&a.name){
             let copied=a.params.iter().map(|(n,_)|format!("{}.clone()",ident(n))).collect::<Vec<_>>().join(",");
             writeln!(out,"if !self.action_{}({copied}){{return Err(\"contract precondition failed\".into());}}",ident(guard)).unwrap();
