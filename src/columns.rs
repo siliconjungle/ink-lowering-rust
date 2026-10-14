@@ -174,12 +174,21 @@ impl BinaryValue for {name}{{fn from_binary(v:value_wire::Validated<'_>)->Result
 impl InkDataEq for {name}{{fn ink_data_eq(&self,r:&Self)->bool{{self.len()==r.len()&&self.iter().zip(r.iter()).all(|(a,b)|a.ink_data_eq(&b))}}}}
 impl PartialEq for {name}{{fn eq(&self,r:&Self)->bool{{self.ink_data_eq(r)}}}}
 #[derive(Clone,Debug)]pub struct {owner}({name});
+pub struct {owner}View<'a>{{data:&'a {name},start:usize,end:usize}}
+impl {owner}View<'_>{{
+ pub fn len(&self)->u32{{(self.end-self.start).try_into().expect("buffer exceeds u32")}}
+ pub fn get(&self,i:u32)->Option<{row}>{{if(i as usize)<self.end-self.start{{self.data.get(self.start+i as usize)}}else{{None}}}}
+ pub fn with_item<R>(&self,i:u32,f:impl FnOnce(Option<&{row}>)->R)->R{{let value=self.get(i);f(value.as_ref())}}
+ pub unsafe fn get_unchecked(&self,i:u32)->{row}{{self.data.get_unchecked(self.start+i as usize)}}
+ pub fn with_range<R>(&self,start:u32,count:u32,f:impl FnOnce({owner}View<'_>)->R)->R{{let start=self.start+(start as usize).min(self.end-self.start);let end=start+(count as usize).min(self.end-start);f({owner}View{{data:self.data,start,end}})}}
+}}
 impl {owner}{{
  pub fn new(xs:{name})->Self{{Self(xs)}}
  pub fn len(&self)->u32{{self.0.len().try_into().expect("buffer exceeds u32")}}
  pub fn get(&self,i:u32)->Option<{row}>{{self.0.get(i as usize)}}
  pub unsafe fn get_unchecked(&self,i:u32)->{row}{{self.0.get_unchecked(i as usize)}}
  pub fn with_item<R>(&self,i:u32,f:impl FnOnce(Option<&{row}>)->R)->R{{let v=self.get(i);f(v.as_ref())}}
+ pub fn with_range<R>(&self,start:u32,count:u32,f:impl FnOnce({owner}View<'_>)->R)->R{{let start=(start as usize).min(self.0.len());let end=start+(count as usize).min(self.0.len()-start);f({owner}View{{data:&self.0,start,end}})}}
  pub fn push(mut self,v:{row})->Self{{assert!(self.0.len()<u32::MAX as usize,"buffer length exhausted");self.0.push(v);self}}
  pub fn set(mut self,i:u32,v:{row})->Self{{if(i as usize)<self.0.len(){{self.0.set(i as usize,v);}}self}}
  pub fn swap(mut self,a:u32,b:u32)->Self{{if(a as usize)<self.0.len()&&(b as usize)<self.0.len(){{let x=self.0.get(a as usize).unwrap();let y=self.0.get(b as usize).unwrap();self.0.set(a as usize,y);self.0.set(b as usize,x);}}self}}

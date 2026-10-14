@@ -505,6 +505,12 @@ impl Emitter<'_> {
                     _ => unreachable!(),
                 };
                 match n.as_str() {
+                    "borrow_range" => {
+                        let start=self.expr(&args[0],env,Some(&Type::U32))?;
+                        let count=self.expr(&args[1],env,Some(&Type::U32))?;
+                        let (vars,body)=self.lambda(&args[2],env,&[xt.clone()],&t)?;
+                        format!("({xv}).with_range({start},{count},|{}|{{{body}}})",vars[0])
+                    }
                     "map" | "map_indexed" => {
                         let params = if n == "map" {
                             vec![value.clone()]
