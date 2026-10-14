@@ -809,6 +809,17 @@ impl Emitter<'_> {
                         let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
                         if n=="map"&&self.infer(xs_receiver(e),env,None)?==t&&crate::columns::names(&output).is_some()&&self.borrowed_place(xs_receiver(e),env).is_none()&&!self.reservation.as_ref().is_some_and(|(site,_)|ink_core::registry::identity(e).is_ok_and(|id|id==*site)){
                             let mask=self.column_mask(e,&output);format!("({xs}).map_rows(|{}|{{{body}}},{mask})",vs[0])
+                        }else if n=="map" && self.infer(xs_receiver(e),env,None)?==t
+                            && matches!(&output,Type::Named(name) if self.p.records.get(name).is_some_and(|fields| fields.iter().all(|(_,ty)| matches!(ty,Type::U32|Type::U64|Type::I32|Type::F32|Type::Bool|Type::Unit))))
+                            && self.borrowed_place(xs_receiver(e),env).is_none()
+                            && !self.reservation.as_ref().is_some_and(|(site,_)|ink_core::registry::identity(e).is_ok_and(|id|id==*site)) {
+                            // Fixed scalar records have no ownership-bearing fields.
+                            // Preserve ordered callback evaluation while making the
+                            // already-owned input allocation explicit to the host
+                            // optimizer. Captured source lists retain their normal
+                            // lexical copies; only this private receiver is mutated.
+                            let values=self.fresh();let slot=self.fresh();
+                            format!("{{let mut {values}={xs};for {slot} in &mut {values}{{let {}=({slot}).clone();*{slot}={body};}}{values}}}",vs[0])
                         }else if n == "filter" {
                             self.collect(e,format!("({iterator}).filter(|ink_ref|{{let {}=ink_ref.clone();{body}}})",vs[0]),&collection)?
                         } else if n == "map_indexed" {
@@ -1211,5 +1222,57 @@ assert_eq!(moving(row(7)),row(7));assert_eq!(COPIES.load(Ordering::Relaxed),1);
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
         let output=std::process::Command::new(dir.join("run")).output().unwrap();std::fs::remove_dir_all(dir).unwrap();
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+#[cfg(test)]
+mod scalar_record_map_tests {
+    use super::*;
+    use std::{fs,process::Command};
+
+    #[test]
+    fn ordered_maps_reuse_private_storage_and_keep_captured_inputs_unchanged() {
+        let p=crate::syntax::parse(r#"module scalar_maps;
+record R { value:u32, wide:u64, signed:i32, flag:Bool, raw:f32, unit:Unit, }
+fn update(xs:List<R>,amount:u32)->List<R>{
+ return xs.map(fn(x)=>R{value:x.value+amount,wide:x.wide,signed:x.signed,flag:!x.flag,raw:x.raw,unit:()});
+}
+fn captured(xs:List<R>)->List<R>{
+ return xs.map(fn(x)=>R{value:x.value+xs.at_or(0,x).value,wide:x.wide,signed:x.signed,flag:x.flag,raw:xs.at_or(1,x).raw,unit:()});
+}
+fn branches(xs:List<R>)->List<R>{
+ return xs.map(fn(x)=>if x.flag {x} else {R{value:x.value+1,wide:x.wide,signed:x.signed,flag:true,raw:x.raw,unit:()}});
+}
+"#).unwrap();
+        check::check(&p).unwrap();
+        let mut source=String::from("#![allow(non_camel_case_types,unused_parens)]\n#[derive(Clone)]struct l_R{l_value:u32,l_wide:u64,l_signed:i32,l_flag:bool,l_raw:f32,l_unit:()}\n");
+        source.push_str("trait InkDataEq{fn ink_data_eq(&self,other:&Self)->bool;}impl InkDataEq for bool{fn ink_data_eq(&self,other:&Self)->bool{self==other}}\n");
+        for f in &p.functions {
+            let args=f.params.iter().map(|(n,t)|format!("l_{n}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
+            source.push_str(&format!("fn {}({args})->Vec<l_R>{{{}}}\n",f.name,body_with_tasks_planned(&p,f,None).unwrap().0));
+        }
+        source.push_str(r#"
+fn row(value:u32,raw:u32)->l_R{l_R{l_value:value,l_wide:u64::MAX,l_signed:i32::MIN,l_flag:false,l_raw:f32::from_bits(raw),l_unit:()}}
+fn main(){
+ for bits in [0,0x80000000,1,0x7f800000,0xff800000,0x7fa12345,0xff812345]{
+  let mut xs=Vec::with_capacity(17);xs.extend([row(u32::MAX,bits),row(3,bits)]);let storage=xs.as_ptr();
+  let out=update(xs,2);assert_eq!(storage,out.as_ptr());assert_eq!(out[0].l_value,1);assert_eq!(out[1].l_value,5);
+  assert!(out.iter().all(|x|x.l_raw.to_bits()==bits&&x.l_wide==u64::MAX&&x.l_signed==i32::MIN&&x.l_flag));
+ }
+ let xs=vec![row(2,0),row(3,0x7fa12345),row(4,0x80000000)];
+ let out=captured(xs.clone());assert_eq!(out.iter().map(|x|x.l_value).collect::<Vec<_>>(),vec![4,5,6]);
+ assert!(out.iter().all(|x|x.l_raw.to_bits()==0x7fa12345));
+ assert_eq!(xs.iter().map(|x|x.l_value).collect::<Vec<_>>(),vec![2,3,4]);
+ let mut xs=vec![row(u32::MAX,0x80000000),row(9,0x7fa12345)];xs[1].l_flag=true;
+ let out=branches(xs);assert_eq!(out[0].l_value,0);assert_eq!(out[1].l_value,9);
+ assert_eq!(out[0].l_raw.to_bits(),0x80000000);assert_eq!(out[1].l_raw.to_bits(),0x7fa12345);
+ assert!(update(Vec::new(),0).is_empty());assert!(captured(Vec::new()).is_empty());
+}
+"#);
+        let dir=std::env::temp_dir().join(format!("ink-scalar-map-{}",std::process::id()));
+        fs::create_dir_all(&dir).unwrap();fs::write(dir.join("main.rs"),source).unwrap();
+        let out=Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs")).arg("-o").arg(dir.join("run")).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        assert!(Command::new(dir.join("run")).status().unwrap().success());fs::remove_dir_all(dir).unwrap();
     }
 }
