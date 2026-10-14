@@ -1370,10 +1370,6 @@ impl Wire for {id} {{
         };
         writeln!(out,"for(k,v)in tables.next().unwrap(){{state.{}.insert(<{} as Wire>::from_json(&k)?,<{} as Wire>::from_json(&v)?);}}",ident(n),ty(k)?,ty(v)?).unwrap();
     }
-    // Auxiliary folds are rebuilt from validated rows, never read from bytes.
-    if !views.is_empty() {
-        out.push_str("state.rebuild_maintained();");
-    }
     out.push_str("state.outbox=logical.outbox.into_iter().map(|e|{let data=match e.channel{");
     for (i, (n, _)) in layout.events.iter().enumerate() {
         writeln!(
@@ -1386,6 +1382,10 @@ impl Wire for {id} {{
     }
     out.push_str("_=>return Err(\"unknown event channel\".into())};Ok(Event{commit:e.commit,position:e.position,data})}).collect::<Result<Vec<_>,String>>()?;");
 
+    }
+    // Auxiliary folds are rebuilt from validated rows, never read from bytes.
+    if !views.is_empty() {
+        out.push_str("state.rebuild_maintained();");
     }
     for name in &p.contracts.invariant_checks {
         writeln!(out, "if !state.action_{}(){{return Err(\"snapshot violates state invariant\".into());}}", ident(name)).unwrap();
