@@ -469,7 +469,15 @@ impl Emitter<'_> {
             Expr::Call(n,args) if ink_core::primitives::primitive(n) => {
                 let first=if ink_core::primitives::bit_count(n){args.first().map(|a|self.infer(a,env,None)).transpose()?}else{None};
                 let (params,_)=ink_core::primitives::signature(n,first.as_ref())?;
-                let values=args.iter().zip(params).map(|(a,t)|self.expr(a,env,Some(&t))).collect::<LangResult<Vec<_>>>()?;
+                // Fixed read-only primitives borrow immutable lexical scalar
+                // places for this call. Their result never retains the loan;
+                // evaluating a computed argument still produces its own value.
+                let values=args.iter().zip(params).map(|(a,t)|{
+                    if matches!(t,Type::String|Type::Int) {
+                        if let Some(place)=self.lexical_place(a,env){return Ok(place);}
+                    }
+                    self.expr(a,env,Some(&t))
+                }).collect::<LangResult<Vec<_>>>()?;
                 crate::primitive_emit::expression(n,&values)?
             }
             Expr::Call(n, args) if ["vec2", "vec3", "vec4"].contains(&n.as_str()) => {
@@ -1771,5 +1779,61 @@ fn main(){
         let out=Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs")).arg("-o").arg(dir.join("run")).output().unwrap();
         assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
         assert!(Command::new(dir.join("run")).status().unwrap().success());fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod primitive_loan_tests {
+    use super::*;
+    use std::{fs,process::Command};
+
+    #[test]
+    fn readonly_string_primitives_do_not_clone_lexical_bytes() {
+        let program=crate::syntax::parse(r#"module text_loans;
+record Pair{text:String,needle:String,}
+fn sizes(text:String)->u32{return string_byte_len(text)+string_byte_len(text);}
+fn locate(pair:Pair,start:u32)->Option<u32>{return string_find(pair.text,pair.needle,start);}
+fn self_find(text:String)->Option<u32>{return string_find(text,text,0);}
+"#).unwrap();
+        check::check(&program).unwrap();
+        let mut source=String::from(r#"#![allow(non_camel_case_types,unused_parens)]
+use std::alloc::{GlobalAlloc,Layout,System};use std::sync::atomic::{AtomicUsize,Ordering};
+static ALLOCS:AtomicUsize=AtomicUsize::new(0);
+struct Alloc;unsafe impl GlobalAlloc for Alloc{
+ unsafe fn alloc(&self,l:Layout)->*mut u8{ALLOCS.fetch_add(1,Ordering::SeqCst);System.alloc(l)}
+ unsafe fn dealloc(&self,p:*mut u8,l:Layout){System.dealloc(p,l)}
+ unsafe fn realloc(&self,p:*mut u8,l:Layout,n:usize)->*mut u8{ALLOCS.fetch_add(1,Ordering::SeqCst);System.realloc(p,l,n)}
+}#[global_allocator]static A:Alloc=Alloc;
+#[derive(Clone)]struct l_Pair{l_text:String,l_needle:String}
+mod temporary{
+ pub fn ink_string_byte_len(s:&str)->u32{s.len().try_into().unwrap()}
+ pub fn ink_string_find(s:&str,n:&str,from:u32)->Option<u32>{s.get(from as usize..).and_then(|tail|tail.find(n).map(|i|from+i as u32))}
+}
+"#);
+        for f in &program.functions {
+            let args=f.params.iter().map(|(name,t)|format!("l_{name}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
+            let body=body_with_tasks_planned(&program,f,None).unwrap().0;
+            source.push_str(&format!("fn {}({args})->{}{{{body}}}\n",f.name,crate::state_native::ty(&f.result).unwrap()));
+        }
+        source.push_str(r#"
+fn main(){
+ let text="aé😀\u{feff}\0".repeat(4096);let want=(text.len()*2)as u32;
+ ALLOCS.store(0,Ordering::SeqCst);assert_eq!(sizes(text),want);assert_eq!(ALLOCS.load(Ordering::SeqCst),0);
+ for start in [0,1,2,3,7,10,u32::MAX]{
+  let text="aé😀\u{feff}\0erroréerror".to_owned();let needle="error".to_owned();
+  let want=text.get(start as usize..).and_then(|tail|tail.find(&needle).map(|i|start+i as u32));
+  let pair=l_Pair{l_text:text,l_needle:needle};
+  ALLOCS.store(0,Ordering::SeqCst);assert_eq!(locate(pair,start),want);assert_eq!(ALLOCS.load(Ordering::SeqCst),0);
+ }
+ let text="é😀".repeat(4096);ALLOCS.store(0,Ordering::SeqCst);
+ assert_eq!(self_find(text),Some(0));assert_eq!(ALLOCS.load(Ordering::SeqCst),0);
+}
+"#);
+        let dir=std::env::temp_dir().join(format!("ink-primitive-loans-{}",std::process::id()));
+        fs::create_dir_all(&dir).unwrap();fs::write(dir.join("main.rs"),source).unwrap();
+        let out=Command::new("rustc").args(["--edition=2021","-O"]).arg(dir.join("main.rs")).arg("-o").arg(dir.join("run")).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        assert!(Command::new(dir.join("run")).status().unwrap().success());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

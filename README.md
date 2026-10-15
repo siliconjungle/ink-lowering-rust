@@ -60,6 +60,13 @@ representation calls skip whole-state checkpoint validation; query envelopes exe
 
 Fixed table operations now include batch upsert/removal, shared keys and forward numerical/predicate scans. `emit_with_table_storage` selects the ordered baseline or indexed row slots while preserving the same source semantics. This operational choice grants no rewrite authority. Ordered storage stays default; source-bound measurements include losses for construction, scalar storage and churn. Direct scans preserve wrapping, exact integers and floating-point key order.
 
+Fixed read-only text and exact-integer primitives borrow immutable lexical
+arguments for the duration of the call, avoiding copies made solely to inspect
+their values. Computed arguments still evaluate in source order; returned text
+is owned. This does not change source helper parameter ownership or admit an
+algebraic replacement. An allocation-counting generated-code test exercises
+repeated reads, record fields, shared arguments and UTF-8 search boundaries.
+
 ## License
 
 Project code and documentation are [MIT licensed](LICENSE). Third-party dependencies,
