@@ -126,7 +126,7 @@ pub(crate) fn emit(p: &Program, physical: Option<&CheckedPhysicalPlan>) -> LangR
                     // A row replacement often changes just one column. Compare
                     // the actual scalar before detaching a retained page. Float
                     // equality must preserve signed zero and NaN payload bits.
-                    let equal = if *t == Type::F32 {
+                    let equal = if matches!(t,Type::F32|Type::F64) {
                         "|old,new|old.to_bits()==new.to_bits()"
                     } else {
                         "|old,new|old==new"
@@ -225,7 +225,7 @@ impl Wire for {owner}{{fn from_json(_: &Json)->Result<Self,String>{{Err("tempora
 impl InkDataEq for {owner}{{fn ink_data_eq(&self,_:&Self)->bool{{panic!("temporary storage has no value equality")}}}}
 impl PartialEq for {owner}{{fn eq(&self,r:&Self)->bool{{self.0==r.0}}}}
 "#,storage=if layout.packing.contains_key(&schema.fields[0].0){"self.c0.storage_identity()"}else{"self.c0.as_ptr()as usize"},prepare_push=prepare_push.join(""),prepare_append=prepare_append.join(""),capacities=capacities.join(","),fields=fields.join(","),defaults=defaults.join(","),payload=payload.join("+"),pushes=pushes.join(""),sets=sets.join(""),truncates=truncates.join(""),append=append.join(""),compare=if scalar{"a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)".into()}else{schema.fields.iter().map(|(f,_)|format!("let order=a.l_{f}.partial_cmp(&b.l_{f}).unwrap_or(std::cmp::Ordering::Equal);if order!=std::cmp::Ordering::Equal{{return order;}}" )).collect::<String>()+"std::cmp::Ordering::Equal"}).unwrap();
-        if schema.fields.iter().all(|(_, t)| *t != Type::F32) {
+        if schema.fields.iter().all(|(_, t)| !matches!(t,Type::F32|Type::F64)) {
             writeln!(out, "impl Eq for {name}{{}} impl Eq for {owner}{{}} ").unwrap();
         }
     }

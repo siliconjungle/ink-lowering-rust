@@ -12,6 +12,7 @@ pub(crate) fn ty(t: &Type) -> LangResult<String> {
     Ok(match t {
         Type::I32 => "i32".into(),
         Type::F32 => "f32".into(),
+        Type::F64 => "f64".into(),
         Type::Vector(t, n) => format!("[{};{}]", ty(t)?, n),
         Type::U64 => "u64".into(),
         Type::U32 => "u32".into(),
@@ -109,7 +110,7 @@ struct Retained {
     queries: BTreeSet<String>,
 }
 fn retainable(t: &Type) -> bool {
-    matches!(t, Type::U32 | Type::U64 | Type::I32 | Type::F32 | Type::Bool | Type::Unit | Type::Int)
+    matches!(t, Type::U32 | Type::U64 | Type::I32 | Type::F32 | Type::F64 | Type::Bool | Type::Unit | Type::Int)
 }
 fn retained(p: &Program, effects: &ink_core::effects::CheckedEffects) -> LangResult<Retained> {
     let mut r = Retained { caches: vec![], keeps: BTreeSet::new(), queries: BTreeSet::new() };
@@ -188,6 +189,7 @@ impl Emitter<'_> {
         use Type as T;
         let (code, t) = match e {
             Expr::Float(bits) => (format!("f32::from_bits({bits}u32)"), T::F32),
+            Expr::Double(bits) => (format!("f64::from_bits({bits}u64)"), T::F64),
             Expr::Neg(value) => {
                 if want == Some(&T::I32) && matches!(value.as_ref(), Expr::Num(2147483648)) {
                     return Ok(("i32::MIN".into(), T::I32));
@@ -195,6 +197,8 @@ impl Emitter<'_> {
                 let (v, t) = self.expr(value, env, want)?;
                 let code = if t == T::F32 {
                     format!("f32::from_bits(({v}).to_bits()^0x80000000)")
+                } else if t == T::F64 {
+                    format!("f64::from_bits(({v}).to_bits()^0x8000000000000000)")
                 } else if t == T::Int {
                     format!("-({v})")
                 } else {
@@ -214,7 +218,7 @@ impl Emitter<'_> {
             }
             Expr::Num(n) => {
                 let t = want
-                    .filter(|t| matches!(t, T::U32 | T::Int | T::I32 | T::F32))
+                    .filter(|t| matches!(t, T::U32 | T::Int | T::I32 | T::F32 | T::F64))
                     .cloned()
                     .unwrap_or(T::U64);
                 let s = match t {
@@ -222,6 +226,7 @@ impl Emitter<'_> {
                     T::U32 => format!("{n}u32"),
                     T::I32 => format!("{n}i32"),
                     T::F32 => format!("f32::from_bits({}u32)", (*n as f32).to_bits()),
+                    T::F64 => format!("f64::from_bits({}u64)", (*n as f64).to_bits()),
                     _ => format!("{n}u64"),
                 };
                 (s, t)
@@ -339,13 +344,13 @@ impl Emitter<'_> {
                     let probed = self.expr(b, env, None);
                     self.probe -= 1;
                     let (_, bt) = probed?;
-                    if matches!(bt, T::U32 | T::Int | T::I32 | T::F32) {
+                    if matches!(bt, T::U32 | T::Int | T::I32 | T::F32 | T::F64) {
                         (ac, at) = self.expr(a, env, Some(&bt))?
                     }
                 }
                 let (bc, _) = self.expr(b, env, Some(&at))?;
                 let arithmetic = ["+", "-", "*"].contains(&op.as_str());
-                let s = if (op == "==" || op == "!=") && at != T::F32 {
+                let s = if (op == "==" || op == "!=") && !matches!(at,T::F32|T::F64) {
                     format!(
                         "{}InkDataEq::ink_data_eq(&({ac}),&({bc}))",
                         if op == "!=" { "!" } else { "" }
@@ -359,6 +364,8 @@ impl Emitter<'_> {
                     format!("({ac}).{method}({bc})")
                 } else if arithmetic && at == T::F32 {
                     format!("temporary::ink_f32(({ac}) {op} ({bc}))")
+                } else if arithmetic && at == T::F64 {
+                    format!("temporary::ink_f64(({ac}) {op} ({bc}))")
                 } else {
                     format!("(({ac}) {op} ({bc}))")
                 };
@@ -369,7 +376,7 @@ impl Emitter<'_> {
                     let first=args.first().and_then(|a|self.execution.type_of(a));
                     let (params,result)=ink_core::primitives::signature(n,first)?;
                     let values=args.iter().zip(params).map(|(a,t)|self.expr(a,env,Some(&t)).map(|x|x.0)).collect::<LangResult<Vec<_>>>()?;
-                    (crate::primitive_emit::expression(n,&values)?,result)
+                    (crate::primitive_emit::expression(n,&values,first)?,result)
                 }
                 name if ink_core::word::primitive(name) => {
                     let t = want
@@ -460,6 +467,8 @@ impl Emitter<'_> {
                         };
                         let add = if *t == T::F32 {
                             "temporary::ink_f32(a+b)"
+                        } else if *t == T::F64 {
+                            "temporary::ink_f64(a+b)"
                         } else if *t == T::Int {
                             "a+b"
                         } else {
@@ -519,7 +528,7 @@ impl Emitter<'_> {
                         let iterator=if ownership::expr_mutates_state(self.p,&args[0]) {format!("self.{field}.values().cloned().collect::<Vec<_>>().into_iter()")} else {format!("self.{field}.values()")};
                         if n=="count_where" {return Ok((format!("{{let mut count=BigInt::from(0u8);for {} in {iterator}{{if {body}{{count+=1;}}}}count}}",ident(parameter)),T::Int));}
                         let zero=if result_type==T::Int {"BigInt::from(0u8)".into()} else {format!("0{}",ty(&result_type)?)};
-                        let add=if result_type==T::F32 {"temporary::ink_f32(acc+contribution)"} else if result_type==T::Int {"acc+contribution"} else {"acc.wrapping_add(contribution)"};
+                        let add=if result_type==T::F32 {"temporary::ink_f32(acc+contribution)"} else if result_type==T::F64 {"temporary::ink_f64(acc+contribution)"} else if result_type==T::Int {"acc+contribution"} else {"acc.wrapping_add(contribution)"};
                         return Ok((format!("{{let mut acc={zero};for {} in {iterator}{{let contribution={body};acc={add};}}acc}}",ident(parameter)),result_type));
                     }
                     if n == "values" || n == "keys" {
@@ -967,7 +976,7 @@ pub fn emit_selected_with_table_storage(selected:&ink_core::optimisation::Checke
 }
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
-        Type::F32 => true,
+        Type::F32 | Type::F64 => true,
         Type::Named(n) if seen.insert(n.clone()) => p
             .records
             .get(n)

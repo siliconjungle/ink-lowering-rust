@@ -38,7 +38,7 @@ fn value(
         (Type::U32, Schema::U32) | (Type::U64, Schema::U64) | (Type::I32, Schema::I32) => {
             write!(out, "writer.bytes(&({v}).to_le_bytes())?;").unwrap()
         }
-        (Type::F32, Schema::F32) => {
+        (Type::F32, Schema::F32) | (Type::F64, Schema::F64) => {
             write!(out, "writer.bytes(&({v}).to_bits().to_le_bytes())?;").unwrap()
         }
         (Type::String, Schema::String) => write!(out, "writer.raw(({v}).as_bytes())?;").unwrap(),
@@ -163,7 +163,7 @@ fn decoded(
     let expression=match(t,s){
   (Type::Unit,Schema::Unit)=>"()".into(),(Type::Bool,Schema::Bool)=>"reader.boolean()?".into(),
   (Type::U32,Schema::U32)=>"reader.u32()?".into(),(Type::U64,Schema::U64)=>"reader.u64()?".into(),(Type::I32,Schema::I32)=>"reader.u32()? as i32".into(),
-  (Type::F32,Schema::F32)=>"f32::from_bits(reader.u32()?)".into(),(Type::String,Schema::String)=>"std::str::from_utf8(reader.raw()?).map_err(|_|\"invalid UTF-8\")?.to_owned()".into(),(Type::Int,Schema::Int)=>"reader.integer()?".into(),
+  (Type::F32,Schema::F32)=>"f32::from_bits(reader.u32()?)".into(),(Type::F64,Schema::F64)=>"f64::from_bits(reader.u64()?)".into(),(Type::String,Schema::String)=>"std::str::from_utf8(reader.raw()?).map_err(|_|\"invalid UTF-8\")?.to_owned()".into(),(Type::Int,Schema::Int)=>"reader.integer()?".into(),
   (Type::Named(_),Schema::Id)=>format!("{}(u128::from_le_bytes(reader.take(16)?.try_into().unwrap()))",crate::state_native::ty(t)?),
   (Type::Named(n),Schema::Enum(_))=>{let variants=if n=="ArithmeticError"{vec!["Overflow".to_string()]}else{p.enums[n].clone()};let name=crate::state_native::ty(t)?;let mut body=String::from("match reader.u32()?{");for(i,v)in variants.iter().enumerate(){write!(body,"{i}=>{name}::l_{v},").unwrap();}body.push_str("_=>return Err(\"invalid enum tag\".into())}");body},
   (Type::Named(n),Schema::Record(fields))=>{let mut body=format!("{}{{",crate::state_native::ty(t)?);for(f,s)in fields{let t=&p.records[n].iter().find(|(name,_)|name==f).ok_or("snapshot field")?.1;let v=decoded(p,t,s,depth+1,serial)?;write!(body,"l_{f}:{},",if crate::state_native::boxed_field(n,t,p){format!("Box::new({v})")}else{v}).unwrap();}body.push('}');body},

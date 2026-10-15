@@ -56,6 +56,8 @@ impl Emitter<'_> {
             )
         } else if *t == Type::F32 {
             format!("temporary::ink_f32(({a}) {op} ({b}))")
+        } else if *t == Type::F64 {
+            format!("temporary::ink_f64(({a}) {op} ({b}))")
         } else {
             format!("(({a}) {op} ({b}))")
         }
@@ -63,6 +65,7 @@ impl Emitter<'_> {
     fn zero(t: &Type) -> String {
         match t {
             Type::F32 => "0.0f32".into(),
+            Type::F64 => "0.0f64".into(),
             Type::I32 => "0i32".into(),
             Type::U32 => "0u32".into(),
             Type::Int => "BigInt::from(0u8)".into(),
@@ -295,9 +298,11 @@ impl Emitter<'_> {
                 Type::U32 => format!("{n}u32"),
                 Type::I32 => format!("{n}i32"),
                 Type::F32 => format!("f32::from_bits({}u32)", (*n as f32).to_bits()),
+                Type::F64 => format!("f64::from_bits({}u64)", (*n as f64).to_bits()),
                 _ => format!("{n}u64"),
             },
             Expr::Float(b) => format!("f32::from_bits({b}u32)"),
+            Expr::Double(b) => format!("f64::from_bits({b}u64)"),
             Expr::Bool(b) => b.to_string(),
             Expr::String(s) => format!("{s:?}.to_owned()"),
             Expr::Unit => "()".into(),
@@ -323,6 +328,8 @@ impl Emitter<'_> {
                     format!("-({x})")
                 } else if t == Type::F32 {
                     format!("f32::from_bits(({x}).to_bits() ^ 0x80000000)")
+                } else if t == Type::F64 {
+                    format!("f64::from_bits(({x}).to_bits() ^ 0x8000000000000000)")
                 } else {
                     format!("({x}).wrapping_neg()")
                 }
@@ -457,7 +464,7 @@ impl Emitter<'_> {
                 let b = self.expr(b, env, Some(&at))?;
                 if ["+", "-", "*"].contains(&op.as_str()) {
                     Self::arithmetic(op, &a, &b, &at)
-                } else if (op == "==" || op == "!=") && at != Type::F32 {
+                } else if (op == "==" || op == "!=") && !matches!(at,Type::F32|Type::F64) {
                     format!(
                         "{}InkDataEq::ink_data_eq(&({a}),&({b}))",
                         if op == "!=" { "!" } else { "" }
@@ -467,7 +474,7 @@ impl Emitter<'_> {
                 }
             }
             Expr::Call(n,args) if ink_core::primitives::primitive(n) => {
-                let first=if ink_core::primitives::bit_count(n){args.first().map(|a|self.infer(a,env,None)).transpose()?}else{None};
+                let first=ink_core::primitives::input_type(n,args.first(),|a|self.infer(a,env,None))?;
                 let (params,_)=ink_core::primitives::signature(n,first.as_ref())?;
                 // Fixed read-only primitives borrow immutable lexical scalar
                 // places for this call. Their result never retains the loan;
@@ -478,7 +485,7 @@ impl Emitter<'_> {
                     }
                     self.expr(a,env,Some(&t))
                 }).collect::<LangResult<Vec<_>>>()?;
-                crate::primitive_emit::expression(n,&values)?
+                crate::primitive_emit::expression(n,&values,first.as_ref())?
             }
             Expr::Call(n, args) if ["vec2", "vec3", "vec4"].contains(&n.as_str()) => {
                 let Type::Vector(inner, _) = &t else {
@@ -706,7 +713,7 @@ impl Emitter<'_> {
                             env,
                             Some(if n == "fill_range" { value } else { &Type::U32 }),
                         )?;
-                        let method=if n=="copy_within" && matches!(value,Type::U32|Type::U64|Type::I32|Type::F32|Type::Bool){"copy_within_copy"}else{n.as_str()};
+                        let method=if n=="copy_within" && matches!(value,Type::U32|Type::U64|Type::I32|Type::F32|Type::F64|Type::Bool){"copy_within_copy"}else{n.as_str()};
                         format!("({xv}).{method}({a},{b},{c})")
                     }
                     "push" => format!("({xv}).push({})", self.expr(&args[0], env, Some(value))?),
@@ -976,7 +983,7 @@ impl Emitter<'_> {
                             let (vs, body) = self.lambda(&args[0], env, &params, &output)?;
                             let mask=self.column_mask(e,&output);format!("({xs}).map_rows(|{}|{{{body}}},{mask})",vs[0])
                         }else if n=="map" && self.infer(xs_receiver(e),env,None)?==t
-                            && matches!(&output,Type::Named(name) if self.p.records.get(name).is_some_and(|fields| fields.iter().all(|(_,ty)| matches!(ty,Type::U32|Type::U64|Type::I32|Type::F32|Type::Bool|Type::Unit))))
+                            && matches!(&output,Type::Named(name) if self.p.records.get(name).is_some_and(|fields| fields.iter().all(|(_,ty)| matches!(ty,Type::U32|Type::U64|Type::I32|Type::F32|Type::F64|Type::Bool|Type::Unit))))
                             && self.borrowed_place(xs_receiver(e),env).is_none()
                             && !self.reserved(e) {
                             // Fixed scalar records have no ownership-bearing fields.

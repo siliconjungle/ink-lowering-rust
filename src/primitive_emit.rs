@@ -1,7 +1,18 @@
 use ink_core::LangResult;
-pub fn expression(n: &str, a: &[String]) -> LangResult<String> {
+pub fn expression(n: &str, a: &[String], first: Option<&ink_core::core::Type>) -> LangResult<String> {
     let x = &a[0];
+    if first==Some(&ink_core::core::Type::F64)&&matches!(n,"sqrt"|"floor"|"ceil"|"trunc"|"round_ties_even"){
+        return Ok(format!("temporary::ink_{n}_f64({x})"));
+    }
     Ok(match n {
+        "f64_div" => format!("temporary::ink_f64_div({x},{})",a[1]),
+        "f64_bits" => format!("({x}).to_bits()"),
+        "f64_from_bits" => format!("f64::from_bits({x})"),
+        "f64_from_f32"|"f64_from_u32"|"f64_from_u64"|"f64_from_i32" => format!("temporary::ink_f64(({x}) as f64)"),
+        "f32_from_f64" => format!("temporary::ink_f32(({x}) as f32)"),
+        "f64_from_int" => format!("ink_f64_from_int(&({x}))"),
+        "int_from_f64" => format!("ink_int_from_f64({x})"),
+        "u32_from_f64"|"u64_from_f64"|"i32_from_f64" => format!("temporary::ink_{n}({x})"),
         "sqrt" | "floor" | "ceil" | "trunc" | "round_ties_even" | "u32_from_f32"
         | "u64_from_f32" | "i32_from_f32" => format!("temporary::ink_{n}({x})"),
         "f32_div" => format!("temporary::ink_f32_div({x},{})", a[1]),

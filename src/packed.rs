@@ -10,6 +10,7 @@ fn read(p: &Program, t: &Type) -> LangResult<String> {
         Type::I32 => format!("({word}) as i32"),
         Type::Bool => format!("({word})!=0"),
         Type::F32 => format!("f32::from_bits({word})"),
+        Type::F64 => format!("{{let lo={word};let hi={word};f64::from_bits(u64::from(lo)|(u64::from(hi)<<32))}}"),
         Type::U64 => format!("{{let lo={word};let hi={word};u64::from(lo)|(u64::from(hi)<<32)}}"),
         Type::Vector(t, n) => format!("std::array::from_fn::<_,{n},_>(|_|{})", read(p, t)?),
         Type::Named(n) => format!(
@@ -29,6 +30,7 @@ fn write(p: &Program, t: &Type, v: &str) -> LangResult<String> {
     Ok(match t {
         Type::U32 | Type::I32 | Type::Bool => format!("words.push(({v}) as u32);"),
         Type::F32 => format!("words.push(({v}).to_bits());"),
+        Type::F64 => format!("{{let bits=({v}).to_bits();words.push(bits as u32);words.push((bits>>32)as u32);}}"),
         Type::U64 => format!("words.push(({v}) as u32);words.push((({v})>>32) as u32);"),
         Type::Vector(t, _) | Type::List(t) => {
             format!("for item in ({v}).iter(){{{}}}", write(p, t, "*item")?)
