@@ -98,7 +98,7 @@ struct Emitter<'a> {
 }
 
 
-/// Retained derived values: scalar keeps and parameterless scalar queries keep
+/// Retained derived values: immutable keeps and parameterless scalar queries keep
 /// their last result until a table they can observe is written. Reads are
 /// deterministic functions of the tables, so a retained value is the value a
 /// fresh evaluation would produce. Rollback and restore discard every result.
@@ -111,64 +111,21 @@ struct Retained {
 fn retainable(t: &Type) -> bool {
     matches!(t, Type::U32 | Type::U64 | Type::I32 | Type::F32 | Type::Bool | Type::Unit | Type::Int)
 }
-fn statement_expressions<'a>(s: &'a Statement, out: &mut Vec<&'a Expr>) {
-    match s {
-        Statement::Let(_, _, e) | Statement::Return(e) | Statement::Emit(_, e) | Statement::Expr(e) => out.push(e),
-        Statement::If(c, a, b) => {
-            out.push(c);
-            for s in a.iter().chain(b) {
-                statement_expressions(s, out);
-            }
-        }
-    }
-}
-/// Every table a keep or action can observe, following keeps and nested
-/// action calls. Pure functions cannot read state.
-fn observed_roots(p: &Program, start: Vec<&Expr>) -> BTreeSet<String> {
-    let mut roots = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    let mut pending = start;
-    while let Some(e) = pending.pop() {
-        let mut found = vec![];
-        ink_core::analysis::walk(e, |x| match x {
-            Expr::Var(n) | Expr::Call(n, _) => found.push(n.clone()),
-            _ => {}
-        });
-        for n in found {
-            if p.states.iter().any(|s| s.name == n) {
-                roots.insert(n);
-            } else if !seen.insert(n.clone()) {
-                continue;
-            } else if let Some(k) = p.keeps.iter().find(|k| k.name == n) {
-                pending.push(&k.value);
-            } else if let Some(a) = p.actions.iter().find(|a| a.name == n) {
-                for s in &a.body {
-                    statement_expressions(s, &mut pending);
-                }
-            }
-        }
-    }
-    roots
-}
-fn retained(p: &Program) -> Retained {
+fn retained(p: &Program, effects: &ink_core::effects::CheckedEffects) -> LangResult<Retained> {
     let mut r = Retained { caches: vec![], keeps: BTreeSet::new(), queries: BTreeSet::new() };
     for k in &p.keeps {
-        if retainable(&k.ty) {
-            r.caches.push((format!("retained_keep_{}", ident(&k.name)), observed_roots(p, vec![&k.value])));
+        if !ink_core::local_collections::owned(&k.ty, p) {
+            r.caches.push((format!("retained_keep_{}", ident(&k.name)), effects.keep(&k.name).ok_or("missing checked keep effects")?.access.reads.clone()));
             r.keeps.insert(k.name.clone());
         }
     }
     for a in &p.actions {
         if a.kind == ActionKind::Query && a.params.is_empty() && a.emits.is_empty() && retainable(&a.result) && !p.contracts.precondition_checks.contains_key(&a.name) {
-            let mut start = vec![];
-            for s in &a.body {
-                statement_expressions(s, &mut start);
-            }
-            r.caches.push((format!("retained_query_{}", ident(&a.name)), observed_roots(p, start)));
+            r.caches.push((format!("retained_query_{}", ident(&a.name)), effects.action(&a.name).ok_or("missing checked query effects")?.access.reads.clone()));
             r.queries.insert(a.name.clone());
         }
     }
-    r
+    Ok(r)
 }
 /// Conservative range analysis for one exact sum of an unsigned row field.
 /// Full key-domain cardinality is used, not an observed size or host RAM bound.
@@ -1285,7 +1242,7 @@ impl Wire for {id} {{
         )
         .unwrap();
     }
-    let mut retained = retained(p);
+    let mut retained = retained(p, &ink_core::effects::CheckedEffects::derive(&action_ir)?)?;
     // A maintained keep is already constant time; it is not retained.
     for v in views {
         retained.keeps.remove(&v.keep);
