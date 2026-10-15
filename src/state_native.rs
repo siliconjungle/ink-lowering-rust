@@ -1062,7 +1062,7 @@ fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snap
     let p = module.program();
     let views: &[crate::maintained_native::View] = maintained.map(|v| v.0.as_slice()).unwrap_or(&[]);
     let _column_scope=crate::columns::scope(physical)?;
-    let action_ir = ink_core::action_ir::CheckedActions::elaborate(module)?;
+    let action_ir = ink_core::action_ir::CheckedActions::elaborate_with_frozen_roots(module)?;
     let execution = action_ir.execution()?;
     let mut emitter = Emitter {
         p,
@@ -1307,7 +1307,9 @@ impl Wire for {id} {{
     for a in p.actions.iter().filter(|a| retained.queries.contains(&a.name)) {
         writeln!(out, "retained_query_{}:Option<{}>,", ident(&a.name), ty(&a.result)?).unwrap();
     }
-    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{Self{version:0,staged:vec![],outbox:vec![],undo:vec![],host:None,\n");
+    out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{");
+    if !p.frozen.is_empty(){out.push_str("let mut state=");}
+    out.push_str("Self{version:0,staged:vec![],outbox:vec![],undo:vec![],host:None,\n");
     for s in &p.states {
         let constructor = "InkTable::new()";
         writeln!(out, "{}:{constructor},", ident(&s.name)).unwrap();
@@ -1331,7 +1333,17 @@ impl Wire for {id} {{
             writeln!(out, "maintained_{i}:{},", v.zero).unwrap();
         }
     }
-    out.push_str("}}\n");
+    if p.frozen.is_empty(){out.push_str("}}\n");}else{
+        out.push_str("};");
+        for (name,rows) in &p.frozen {
+            let root=p.states.iter().find(|s|&s.name==name).ok_or("frozen native root")?;
+            let Type::Table(k,v)=&root.ty else{return Err("frozen native table".into())};
+            let data=serde_json::to_string(rows).map_err(|e|e.to_string())?;
+            writeln!(out,"for(key,value)in serde_json::from_str::<Vec<(Json,Json)>>({data:?}).expect(\"checked frozen rows\"){{state.{}.insert(<{} as Wire>::from_json(&key).expect(\"checked frozen key\"),<{} as Wire>::from_json(&value).expect(\"checked frozen value\"));}}",ident(name),ty(k)?,ty(v)?).unwrap();
+        }
+        if !views.is_empty(){out.push_str("state.rebuild_maintained();");}
+        out.push_str("state}\n");
+    }
     for v in views {
         out.push_str(&v.methods);
     }
@@ -1373,11 +1385,17 @@ impl Wire for {id} {{
     }
     out.push_str("};portable::Event{commit:e.commit,position:e.position,channel,value}}).collect();portable::encode(&layout,&portable::Logical{version:self.version,tables,outbox},limits)}\n");
     }
-    if let Some(typed)=crate::typed_snapshot::restore(p,layout){
+    if let Some(typed)=p.frozen.is_empty().then(||crate::typed_snapshot::restore(p,layout)).flatten(){
         out.push_str("pub fn restore(bytes:&[u8])->Result<Self,String>{Self::restore_with_limits(bytes,SnapshotLimits::default())}\npub fn restore_with_limits(bytes:&[u8],limits:SnapshotLimits)->Result<Self,String>{let layout=snapshot_layout();");
         out.push_str(&typed);
     }else{
-    out.push_str("pub fn restore(bytes:&[u8])->Result<Self,String>{Self::restore_with_limits(bytes,SnapshotLimits::default())}\npub fn restore_with_limits(bytes:&[u8],limits:SnapshotLimits)->Result<Self,String>{let layout=snapshot_layout();let logical=portable::decode(&layout,bytes,limits)?;let mut state=Self::new();state.version=logical.version;let mut tables=logical.tables.into_iter();");
+    out.push_str("pub fn restore(bytes:&[u8])->Result<Self,String>{Self::restore_with_limits(bytes,SnapshotLimits::default())}\npub fn restore_with_limits(bytes:&[u8],limits:SnapshotLimits)->Result<Self,String>{let layout=snapshot_layout();let logical=portable::decode(&layout,bytes,limits)?;");
+    for (name,rows) in &p.frozen {
+        let index=layout.roots.iter().position(|(n,_,_)|n==name).ok_or("frozen native snapshot root")?;
+        let data=serde_json::to_string(rows).map_err(|e|e.to_string())?;
+        writeln!(out,"let fixed=serde_json::from_str::<Vec<(Json,Json)>>({data:?}).map_err(|e|e.to_string())?;if portable::table_bytes(&layout.roots[{index}].1,&layout.roots[{index}].2,&logical.tables[{index}],limits)?!=portable::table_bytes(&layout.roots[{index}].1,&layout.roots[{index}].2,&fixed,SnapshotLimits::default())?{{return Err(\"snapshot changes frozen state: {name}\".into());}}").unwrap();
+    }
+    out.push_str("let mut state=Self::new();state.version=logical.version;let mut tables=logical.tables.into_iter();");
     for (n, _, _) in &layout.roots {
         let s = p.states.iter().find(|s| &s.name == n).unwrap();
         let Type::Table(k, v) = &s.ty else {
