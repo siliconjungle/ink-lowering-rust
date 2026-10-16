@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "keep": [
+    {
+      "path": ".gitignore",
+      "reason": "Repository source/history or exact dependency validation input; existing generated outputs require separate classification."
+    },
+    {
+      "path": "Cargo.lock",
+      "reason": "Repository source/history or exact dependency validation input; existing generated outputs require separate classification."
+    },
+    {
+      "path": "Cargo.toml",
+      "reason": "Repository source/history or exact dependency validation input; existing generated outputs require separate classification."
+    },
+    {
+      "path": "LICENSE",
+      "reason": "Repository source/history or exact dependency validation input; existing generated outputs require separate classification."
+    },
+    {
+      "path": "README.md",
+      "reason": "Repository source/history or exact dependency validation input; existing generated outputs require separate classification."
+    },
+    {
+      "path": "src",
+      "reason": "Repository source/history or exact dependency validation input; existing generated outputs require separate classification."
+    },
+    {
+      "path": "storage-retention.json",
+      "reason": "Repository source/history or exact dependency validation input; existing generated outputs require separate classification."
+    }
+  ],
+  "safe_to_remove": []
+}
