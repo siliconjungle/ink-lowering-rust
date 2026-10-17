@@ -47,10 +47,24 @@ fn write(p: &Program, t: &Type, v: &str) -> LangResult<String> {
     })
 }
 pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
+    lower_filtered(module, packed, None)
+}
+/// Expose one checked entry through the packed host ABI. Typed helper bodies
+/// remain in the full program; only actual ingress/egress needs packed transport.
+/// Any entry precondition callback retains its original function index/export.
+pub fn lower_entry(module: &CheckedModule, packed: bool, entry: &str) -> LangResult<String> {
+    lower_filtered(module, packed, Some(entry))
+}
+fn lower_filtered(module: &CheckedModule, packed: bool, entry: Option<&str>) -> LangResult<String> {
     let p = module.pure_program()?;
+    if entry.is_some_and(|name| !p.functions.iter().any(|f| f.name == name)) {
+        return Err("unknown packed CPU entry function".into());
+    }
+    let selected = |name: &str| entry.map_or(true, |root| name == root ||
+        p.contracts.precondition_checks.get(root).is_some_and(|guard| guard == name));
     // The shared descriptor rejects recursive or variable-width elements before
     // either literal reader/writer expands their record fields.
-    for f in &p.functions {
+    for f in p.functions.iter().filter(|f| selected(&f.name)) {
         for t in f.params.iter().map(|(_, t)| t).chain([&f.result]) {
             ink_abi::packed_width(&ink_abi::describe(t, &p.records, &p.enums, &p.ids)?)?;
         }
@@ -62,7 +76,7 @@ pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
     // locally with the same ordered value semantics.
     out.push_str("#[cfg(target_arch=\"wasm32\")] fn __ink_parallel_host(mut task:Json)->Result<Json,String>{task[\"start\"]=json!(0u32);State::new().parallel_worker(&task)}\n");
     out.push_str("unsafe fn ink_packed_result(function:u32,data:*const *const std::ffi::c_void,lengths:*const usize)->Vec<u32>{match function{\n");
-    for (i, f) in p.functions.iter().enumerate() {
+    for (i, f) in p.functions.iter().enumerate().filter(|(_,f)|selected(&f.name)) {
         out.push_str(&format!("{i}=>{{"));
         for (j, (_, t)) in f.params.iter().enumerate() {
             let value = match t {
@@ -86,7 +100,7 @@ pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
     }
     out.push_str("_=>panic!(\"unknown compiled function\")}}\n");
     if !packed {
-        for f in &p.functions {
+        for f in p.functions.iter().filter(|f| selected(&f.name)) {
             let mut params = vec![];
             let mut args = vec![];
             for (j, (_, t)) in f.params.iter().enumerate() {
@@ -117,7 +131,7 @@ pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
             out.push_str(&format!("#[cfg_attr(target_arch=\"wasm32\",no_mangle)]pub unsafe extern \"C\" fn lang_fn_{}({})->{result}{{State::new().function_l_{}({})}}\n",f.name,params.join(","),f.name,args.join(",")));
         }
         out.push_str("pub unsafe fn ink_cpu_call(function:u32,lists:*const *const std::ffi::c_void,lengths:*const usize,scalars:*const u64)->u64{match function{");
-        for (i, f) in p.functions.iter().enumerate() {
+        for (i, f) in p.functions.iter().enumerate().filter(|(_,f)|selected(&f.name)) {
             let args = f
                 .params
                 .iter()
@@ -144,6 +158,33 @@ pub fn lower(module: &CheckedModule, packed: bool) -> LangResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_entry_keeps_typed_helpers_and_original_transport_index() {
+        let checked=CheckedModule::from_source(ink_core::syntax::parse("module Entries;fn helper(x:u32)->Buffer<u32>{return buffer_fill(4,x);}fn unused(x:String)->String{return x;}fn output(xs:List<u32>)->List<u32>{return xs.map(fn(x)=>helper(x).at_or(0,0));}").unwrap()).unwrap();
+        let before=checked.bytes().unwrap();
+        assert!(lower(&checked,true).is_err());
+        let code=lower_entry(&checked,true,"output").unwrap();
+        let adapter=code.split("unsafe fn ink_packed_result").nth(1).unwrap();
+        assert!(adapter.contains("2=>{"));
+        assert!(!adapter.contains("0=>{") && !adapter.contains("1=>{"));
+        assert!(code.contains("function_l_helper"));
+        assert_eq!(checked.bytes().unwrap(),before);
+        assert!(lower_entry(&checked,true,"helper").is_err());
+        assert!(lower_entry(&checked,true,"missing").unwrap_err().contains("unknown"));
+    }
+    #[test]
+    fn selected_entry_keeps_ingress_precondition_exports() {
+        let checked=CheckedModule::from_source(ink_core::syntax::parse("module Guards;spec fn positive(x:u32)->u32 requires x>0; ensures result==x;implementation direct for positive{return x;}").unwrap()).unwrap();
+        let p=checked.program();
+        let root="positive";
+        let guard=p.contracts.precondition_checks.get(root).unwrap();
+        let code=lower_entry(&checked,true,root).unwrap();
+        let adapter=code.split("unsafe fn ink_packed_result").nth(1).unwrap();
+        for name in [root,guard.as_str()] {
+            let index=p.functions.iter().position(|f|f.name==name).unwrap();
+            assert!(adapter.contains(&format!("{index}=>{{")));
+        }
+    }
     #[test]
     fn recursive_and_variable_width_values_reject_before_emission() {
         for source in [
