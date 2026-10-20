@@ -1138,11 +1138,11 @@ impl Wire for {id} {{
         } else {
             ",Eq"
         };
-        writeln!(out,"#[derive(Clone,Debug,PartialEq{eq})] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{json!({{").unwrap();
+        writeln!(out,"#[derive(Clone,Debug,PartialEq{eq})] pub struct {id}{{{fields}}}\nimpl Wire for {id} {{fn to_json(&self)->Json{{let mut object=serde_json::Map::new();").unwrap();
         for (f, _) in fs {
-            writeln!(out, "{f:?}:self.{}.to_json(),", ident(f)).unwrap();
+            writeln!(out, "object.insert({f:?}.into(),self.{}.to_json());", ident(f)).unwrap();
         }
-        writeln!(out,"}})}} fn from_json(v:&Json)->Result<Self,String>{{let obj=v.as_object().unwrap();Ok(Self{{").unwrap();
+        writeln!(out,"Json::Object(object)}} fn from_json(v:&Json)->Result<Self,String>{{let obj=v.as_object().unwrap();Ok(Self{{").unwrap();
         for (f, t) in fs {
             writeln!(
                 out,
