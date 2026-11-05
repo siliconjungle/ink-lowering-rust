@@ -77,28 +77,28 @@ impl Emit<'_> {
             )
             .unwrap();
             let native = match t {
-                Type::U64 => "v.as_u64().unwrap()".into(),
-                Type::F32 => "{let bits=if let Some(x)=v.get(\"F32Bits\"){x.as_u64().unwrap() as u32}else{(v.as_f64().unwrap() as f32).to_bits()};bits as u64}".into(),
-                Type::U32 => "v.as_u64().unwrap()".into(),
-                Type::I32 => "v.as_i64().unwrap() as i32 as u32 as u64".into(),
+                Type::U64 => "wire_u64(v)?".into(),
+                Type::F32 => "wire_f32(v)?".into(),
+                Type::U32 => "wire_u32(v)?".into(),
+                Type::I32 => "wire_i32(v)?".into(),
                 Type::Int => {
                     let id=data(sort)?;
                     let natural=self.checked.projection().objects[id].payload["declaration"]["Datatype"]["constructors"][1]["fields"][0]["Data"].as_str().ok_or("binary magnitude datatype")?;
-                    format!("{{let text=v.get(\"Int\").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string());let n=text.parse::<num_bigint::BigInt>().unwrap();let bits=n.bits() as usize;let(_,bytes)=n.to_bytes_le();let mut tail=D_{natural}::C0;for bit in (0..bits).rev(){{tail=if bytes[bit/8]&(1<<(bit%8))==0{{D_{natural}::C1(Some(std::sync::Arc::new(tail)))}}else{{D_{natural}::C2(Some(std::sync::Arc::new(tail)))}};}}if bits==0{{D_{id}::C0}}else if n.sign()==num_bigint::Sign::Minus{{D_{id}::C2(std::sync::Arc::new(tail))}}else{{D_{id}::C1(std::sync::Arc::new(tail))}}}}")
+                    format!("{{let text=v.get(\"Int\").and_then(Json::as_str).map(str::to_owned).unwrap_or_else(||v.to_string());let n=text.parse::<num_bigint::BigInt>().map_err(|_|\"expected exact integer\")?;let bits=n.bits() as usize;let(_,bytes)=n.to_bytes_le();let mut tail=D_{natural}::C0;for bit in (0..bits).rev(){{tail=if bytes[bit/8]&(1<<(bit%8))==0{{D_{natural}::C1(Some(std::sync::Arc::new(tail)))}}else{{D_{natural}::C2(Some(std::sync::Arc::new(tail)))}};}}if bits==0{{D_{id}::C0}}else if n.sign()==num_bigint::Sign::Minus{{D_{id}::C2(std::sync::Arc::new(tail))}}else{{D_{id}::C1(std::sync::Arc::new(tail))}}}}")
                 }
-                Type::String => {let id=data(sort)?;let step=if self.packed_ids.contains(id){"tail.prepend(byte as u64)".into()}else{format!("D_{id}::C1(byte as u64,Some(std::sync::Arc::new(tail)))")};format!("{{let mut tail=D_{id}::C0;for byte in v.as_str().unwrap().bytes().rev(){{tail={step};}}tail}}")},
-                Type::Named(n) if p.ids.contains(n) => {let id=data(sort)?;format!("{{let x=u128::from_str_radix(v.as_str().unwrap(),16).unwrap();D_{id}::C0((x>>64)as u64,x as u64)}}")},
-                Type::Bool => "v.as_bool().unwrap()".into(),
-                Type::Unit => format!("{{D_{}::C0}}", data(sort)?),
+                Type::String => {let id=data(sort)?;let step=if self.packed_ids.contains(id){"tail.prepend(byte as u64)".into()}else{format!("D_{id}::C1(byte as u64,Some(std::sync::Arc::new(tail)))")};format!("{{let mut tail=D_{id}::C0;for byte in wire_str(v)?.bytes().rev(){{tail={step};}}tail}}")},
+                Type::Named(n) if p.ids.contains(n) => {let id=data(sort)?;format!("{{let x=wire_id(v)?;D_{id}::C0((x>>64)as u64,x as u64)}}")},
+                Type::Bool => "wire_bool(v)?".into(),
+                Type::Unit => format!("{{if !v.is_null(){{return Err(\"expected Unit\".into());}}D_{}::C0}}", data(sort)?),
                 Type::Named(n) if p.enums.contains_key(n) => {
                     let id=data(sort)?;
                     let branches=p.enums[n].iter().enumerate().map(|(i,v)|format!("{:?}=>D_{id}::C{i},",format!("{n}.{v}"))).collect::<String>();
-                    format!("{{let text=v.as_str().unwrap();match text{{{branches}_=>unreachable!(\"caller enum precondition\")}}}}")
+                    format!("{{let text=wire_str(v)?;match text{{{branches}_=>return Err({:?}.into())}}}}",format!("unknown {n} variant"))
                 }
                 Type::Named(n) if p.records.contains_key(n) => {
                     let fs=&p.records[n];
                     let reads=fs.iter().map(|(name,t)| {
-                        let read=self.codec(t,"read",&format!("xs.get({name:?}).unwrap()",),"d+1")?;
+                        let read=self.codec(t,"read",&format!("wire_field(xs,{n:?},{name:?})?",),"d+1")?;
                         Ok(read)
                     }).collect::<LangResult<Vec<_>>>()?;
                     if let Some(record)=self.checked.projection().recursive_records.get(n) {
@@ -107,29 +107,29 @@ impl Emit<'_> {
                             let encoded=field.encode.as_ref().map(|f|format!("f_{f}({})",borrowed(self.sort(t).unwrap(),&read))).unwrap_or(read);
                             tail=format!("D_{id}::C3(std::sync::Arc::new({encoded}),std::sync::Arc::new({tail}))");
                         }
-                        format!("{{let xs=v.as_object().unwrap();D_{id}::C4({}u64,std::sync::Arc::new({tail}))}}",record.tag)
+                        format!("{{let xs=wire_record(v,{n:?},{})?;D_{id}::C4({}u64,std::sync::Arc::new({tail}))}}",fs.len(),record.tag)
                     } else {
                         let args=fs.iter().map(|(_,t)|t).zip(reads).map(|(t,x)|Ok(stored(self.sort(t)?,&x))).collect::<LangResult<Vec<_>>>()?;
-                        format!("{{let xs=v.as_object().unwrap();D_{}::C0{}}}",data(sort)?,fields(&args))
+                        format!("{{let xs=wire_record(v,{n:?},{})?;D_{}::C0{}}}",fs.len(),data(sort)?,fields(&args))
                     }
                 }
                 Type::Option(a) => {
                     let id=data(sort)?;
                     let read=stored(self.sort(a)?,&self.codec(a,"read","x","d+1")?);
-                    format!("{{let xs=one_tag(v,\"Option\")?;if let Some(x)=xs.get(\"Some\"){{D_{id}::C1({read})}}else{{D_{id}::C0}}}}")
+                    format!("{{let xs=one_tag(v,\"Option\")?;if let Some(x)=xs.get(\"Some\"){{D_{id}::C1({read})}}else if xs.get(\"None\").is_some_and(Json::is_null){{D_{id}::C0}}else{{return Err(\"invalid Option tag\".into())}}}}")
                 }
                 Type::Result(a,b) => {
                     let id=data(sort)?;
                     let a=stored(self.sort(a)?,&self.codec(a,"read","x","d+1")?);
                     let b=stored(self.sort(b)?,&self.codec(b,"read","x","d+1")?);
-                    format!("{{let xs=one_tag(v,\"Result\")?;if let Some(x)=xs.get(\"Ok\"){{D_{id}::C0({a})}}else{{let x=xs.get(\"Err\").unwrap();D_{id}::C1({b})}}}}")
+                    format!("{{let xs=one_tag(v,\"Result\")?;if let Some(x)=xs.get(\"Ok\"){{D_{id}::C0({a})}}else{{let x=xs.get(\"Err\").ok_or(\"invalid Result tag\")?;D_{id}::C1({b})}}}}")
                 }
-                Type::Vector(a,n) => {let args=(0..*n as usize).map(|i|Ok(stored(self.sort(a)?,&self.codec(a,"read",&format!("&xs[{i}]"),"d+1")?))).collect::<LangResult<Vec<_>>>()?;format!("{{let xs=v.as_array().unwrap();D_{}::C0{}}}",data(sort)?,fields(&args))},
+                Type::Vector(a,n) => {let args=(0..*n as usize).map(|i|Ok(stored(self.sort(a)?,&self.codec(a,"read",&format!("&xs[{i}]"),"d+1")?))).collect::<LangResult<Vec<_>>>()?;format!("{{let xs=wire_array(v)?;if xs.len()!={n}{{return Err(\"vector dimension mismatch\".into());}}D_{}::C0{}}}",data(sort)?,fields(&args))},
                 Type::List(a) => {
                     let id=data(sort)?;
                     let read=stored(self.sort(a)?,&self.codec(a,"read","x","d+1")?);
                     let step=if self.packed_ids.contains(id){format!("tail.prepend({read})")}else{format!("D_{id}::C1({read},Some(std::sync::Arc::new(tail)))")};
-                    format!("{{let xs=v.as_array().unwrap();let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail={step};}}tail}}")
+                    format!("{{let xs=wire_array(v)?;let mut tail=D_{id}::C0;for x in xs.iter().rev(){{tail={step};}}tail}}")
                 }
                 _ => return Err("unsupported standalone source codec".into()),
             };
@@ -407,7 +407,7 @@ fn lower_native(
         .unwrap();
     }
     out.push_str("]}}\n");
-    out.push_str("fn one_tag<'a>(v:&'a Json,_kind:&str)->Result<&'a serde_json::Map<String,Json>,String>{Ok(v.as_object().unwrap())}\n");
+    out.push_str(WIRE_INGRESS);
     out.push_str(&e.wire()?);
     out.push_str(&e.tables()?);
     let physical = crate::definition_native::ty(&plan.physical_state)?;
@@ -562,7 +562,7 @@ fn lower_native(
         } else {
             "reply,committed,version,_,events"
         };
-        writeln!(out, "{:?}=>{{let xs=args.as_array().unwrap();", source.name).unwrap();
+        writeln!(out, "{:?}=>{{let xs=args.as_array().ok_or(\"arguments must be a JSON array\")?;if xs.len()!={}{{return Err({:?}.into());}}", source.name, source.params.len(), format!("{} expects {} arguments", source.name, source.params.len())).unwrap();
         let mut args = vec![
             borrowed(&plan.physical_state, "self.physical"),
             "self.version".into(),
@@ -608,3 +608,18 @@ fn lower_native(
     }
     Ok(out)
 }
+
+/// Checked JSON ingress for generated readers: a wrongly typed value is an
+/// error, never a trap. The rules match the compiler's `prepare`.
+const WIRE_INGRESS: &str = r#"fn one_tag<'a>(v:&'a Json,kind:&str)->Result<&'a serde_json::Map<String,Json>,String>{let o=v.as_object().ok_or_else(||format!("expected {kind} object"))?;if o.len()!=1{return Err(format!("{kind} requires one tag"));}Ok(o)}
+fn wire_u64(v:&Json)->Result<u64,String>{v.as_u64().ok_or_else(||"expected u64".into())}
+fn wire_u32(v:&Json)->Result<u64,String>{v.as_u64().filter(|n|*n<=u32::MAX as u64).ok_or_else(||"expected u32".into())}
+fn wire_i32(v:&Json)->Result<u64,String>{v.as_i64().and_then(|n|i32::try_from(n).ok()).map(|n|n as u32 as u64).ok_or_else(||"expected i32".into())}
+fn wire_f32(v:&Json)->Result<u64,String>{let bits=if let Some(x)=v.get("F32Bits"){if v.as_object().map_or(true,|o|o.len()!=1){return Err("expected only F32Bits field".into());}u32::try_from(x.as_u64().ok_or("expected f32 bits")?).map_err(|_|"f32 bits outside range")?}else{let x=v.as_f64().ok_or("expected f32")? as f32;if !x.is_finite(){return Err("finite f32 input required; use explicit F32Bits for exceptional CPU values".into());}x.to_bits()};Ok(bits as u64)}
+fn wire_bool(v:&Json)->Result<bool,String>{v.as_bool().ok_or_else(||"expected Bool".into())}
+fn wire_str(v:&Json)->Result<&str,String>{v.as_str().ok_or_else(||"expected String".into())}
+fn wire_id(v:&Json)->Result<u128,String>{let s=v.as_str().ok_or("ID must be a 32-digit hexadecimal string")?;if s.len()!=32||!s.bytes().all(|b|b.is_ascii_hexdigit()){return Err("ID must be a 32-digit hexadecimal string".into());}u128::from_str_radix(s,16).map_err(|_|"invalid ID".into())}
+fn wire_array(v:&Json)->Result<&Vec<Json>,String>{v.as_array().ok_or_else(||"expected list".into())}
+fn wire_record<'a>(v:&'a Json,name:&str,fields:usize)->Result<&'a serde_json::Map<String,Json>,String>{let o=v.as_object().ok_or_else(||format!("expected {name} record object"))?;if o.len()!=fields{return Err(format!("record {name} field count mismatch"));}Ok(o)}
+fn wire_field<'a>(o:&'a serde_json::Map<String,Json>,record:&str,field:&str)->Result<&'a Json,String>{o.get(field).ok_or_else(||format!("missing {record}.{field}"))}
+"#;

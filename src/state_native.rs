@@ -1142,13 +1142,15 @@ impl Wire for {id} {{
         for (f, _) in fs {
             writeln!(out, "object.insert({f:?}.into(),self.{}.to_json());", ident(f)).unwrap();
         }
-        writeln!(out,"Json::Object(object)}} fn from_json(v:&Json)->Result<Self,String>{{let obj=v.as_object().unwrap();Ok(Self{{").unwrap();
+        // Ingress is total: a wrongly typed value is an error, never a trap.
+        writeln!(out,"Json::Object(object)}} fn from_json(v:&Json)->Result<Self,String>{{let obj=v.as_object().ok_or({:?})?;if obj.len()!={}{{return Err({:?}.into());}}Ok(Self{{",format!("expected {n} record object"),fs.len(),format!("record {n} field count mismatch")).unwrap();
         for (f, t) in fs {
             writeln!(
                 out,
-                "{}:<{} as Wire>::from_json(obj.get({f:?}).unwrap())?,",
+                "{}:<{} as Wire>::from_json(obj.get({f:?}).ok_or({:?})?)?,",
                 ident(f),
-                field_ty(n, t, p)?
+                field_ty(n, t, p)?,
+                format!("missing {n}.{f}")
             )
             .unwrap();
         }
@@ -1170,7 +1172,7 @@ impl Wire for {id} {{
             )
             .unwrap();
         }
-        out.push_str("_=>unreachable!(\"caller enum precondition\")}}}\n");
+        writeln!(out, "_=>Err({:?}.into())}}}}}}", format!("unknown {n} variant")).unwrap();
     }
     for n in p.ids.iter().chain(p.enums.keys()) {
         writeln!(
@@ -1595,7 +1597,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }
-    out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().unwrap();match name{\n");
+    out.push_str("pub fn call_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"arguments must be a JSON array\")?;match name{\n");
     for f in &p.functions {
         if ink_core::local_collections::owned(&f.result, p)
             || f.params
@@ -1610,7 +1612,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
             .unwrap();
             continue;
         }
-        write!(out, "{:?}=>{{", f.name).unwrap();
+        write!(out, "{:?}=>{{if args.len()!={}{{return Err({:?}.into());}}", f.name, f.params.len(), format!("{} expects {} arguments", f.name, f.params.len())).unwrap();
         let mut argv = vec![];
         for (i, (_, t)) in f.params.iter().enumerate() {
             write!(
@@ -1633,9 +1635,9 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         .unwrap();
     }
     out.push_str("_=>Err(\"unknown function\".into())}}\n");
-    out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().unwrap();match name{\n");
+    out.push_str("pub fn invoke_json(&mut self,name:&str,args:&Json)->Result<Json,String>{let args=args.as_array().ok_or(\"arguments must be a JSON array\")?;match name{\n");
     for a in &p.actions {
-        write!(out, "{:?}=>{{", a.name).unwrap();
+        write!(out, "{:?}=>{{if args.len()!={}{{return Err({:?}.into());}}", a.name, a.params.len(), format!("{} expects {} arguments", a.name, a.params.len())).unwrap();
         let mut argv = vec![];
         for (i, (_, t)) in a.params.iter().enumerate() {
             write!(
