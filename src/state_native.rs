@@ -1237,7 +1237,7 @@ impl Wire for {id} {{
     }
     out.push_str("}\n");
     out.push_str(
-        "struct HostTransaction {version:u64,removed:Vec<Event>}\npub struct State {version:u64,staged:Vec<EventData>,outbox:Vec<Event>,undo:Vec<Undo>,host:Option<HostTransaction>,\n",
+        "struct HostTransaction {version:u64,removed:Vec<Event>}\npub struct State {version:u64,staged:Vec<EventData>,outbox:Vec<Event>,undo:Vec<Undo>,host:Option<HostTransaction>,changes:Option<Vec<(bool,Option<Vec<Json>>)>>,\n",
     );
     for s in &p.states {
         let row_type = ty(&s.ty)?;
@@ -1277,7 +1277,7 @@ impl Wire for {id} {{
     }
     out.push_str("}\nimpl Default for State {fn default()->Self{Self::new()}}\nimpl State {pub fn parallel_statistics()->Json{let(n,ids,last)=temporary::ink_parallel_statistics();json!({\"workers\":n,\"workerIds\":ids,\"lastWorkerIds\":last})} pub fn new()->Self{");
     if !p.frozen.is_empty(){out.push_str("let mut state=");}
-    out.push_str("Self{version:0,staged:vec![],outbox:vec![],undo:vec![],host:None,\n");
+    out.push_str("Self{version:0,staged:vec![],outbox:vec![],undo:vec![],host:None,changes:None,\n");
     for s in &p.states {
         let constructor = "InkTable::new()";
         writeln!(out, "{}:{constructor},", ident(&s.name)).unwrap();
@@ -1458,6 +1458,17 @@ impl Wire for {id} {{
         out.push_str("});}\n");
         out.push_str("result}\n");
     }
+    // Change reports (the shape the JavaScript lowering's takeChanges uses):
+    // each commit compares the rows it journaled with their values now.
+    let names = p.states.iter().map(|s| format!("{:?}", s.name)).collect::<Vec<_>>().join(",");
+    writeln!(out, "/// Start recording which state paths commits change; see take_changes.\npub fn track_changes(&mut self)->bool{{self.changes=Some(vec![(false,Some(vec![]));{}]);true}}", p.states.len()).unwrap();
+    writeln!(out, "/// What commits changed since the last call: the roots whose rows differ\n/// (an identical rewrite changes nothing) and up to 64 changed keys per root\n/// (null past that). `filters` is null: this lowering keeps no filtered views,\n/// so readers count every view of a changed root as changed.\npub fn take_changes(&mut self)->Json{{const NAMES:[&str;{}]=[{names}];let Some(log)=self.changes.as_mut() else{{return json!({{\"all\":true}})}};let mut roots=vec![];let mut keys=serde_json::Map::new();for (i,(changed,k)) in log.iter_mut().enumerate(){{if !*changed{{continue;}}roots.push(json!(NAMES[i]));keys.insert(NAMES[i].into(),k.take().map_or(Json::Null,Json::Array));*changed=false;*k=Some(vec![]);}}json!({{\"all\":false,\"roots\":roots,\"filters\":Json::Null,\"keys\":keys}})}}", p.states.len()).unwrap();
+    out.push_str("fn record_changes(&mut self,mark:usize){let Some(log)=self.changes.as_mut() else{return};for undo in &self.undo[mark..]{#[allow(unreachable_patterns)]match undo{\n");
+    for (i, s) in p.states.iter().enumerate() {
+        let id = ident(&s.name);
+        writeln!(out, "Undo::{id}{{key,old}}=>if self.{id}.get(key)!=old.as_ref(){{let entry=&mut log[{i}];entry.0=true;if let Some(k)=entry.1.as_mut(){{let key=key.to_json();if !k.contains(&key){{if k.len()>=64{{entry.1=None;}}else{{k.push(key);}}}}}}}},").unwrap();
+    }
+    out.push_str("_=>{}}}}\n");
     out.push_str("fn rollback(&mut self){self.rollback_to(0);}
 fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){match undo{\n");
     for s in &p.states {
@@ -1593,7 +1604,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
         } else {
             out.push_str("let version=match transaction::decide(self.version,");
             out.push_str(if matches!(a.result, Type::Result(..)) { "result.is_ok()" } else { "true" });
-            out.push_str("){transaction::Decision::Rollback=>{self.rollback_to(mark);return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback_to(mark);return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;if self.host.is_none(){self.undo.clear();}self.clear_journal_keys();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
+            out.push_str("){transaction::Decision::Rollback=>{self.rollback_to(mark);return Ok(OutcomeView{result,committed:false,version:self.version,events:&[]})},transaction::Decision::Exhausted=>{self.rollback_to(mark);return Err(\"commit sequence exhausted\".into())},transaction::Decision::Commit{version}=>version};self.version=version;self.record_changes(mark);if self.host.is_none(){self.undo.clear();}self.clear_journal_keys();let start=self.outbox.len();self.outbox.extend(transaction::publish(version,self.staged.drain(..)).map(|published|Event{commit:published.commit,position:published.position,data:published.value}));Ok(OutcomeView{result,committed:true,version,events:&self.outbox[start..]})}\n");
         }
         writeln!(out,"pub fn invoke_{id}(&mut self,{params})->Result<Outcome<{result}>,String>{{self.invoke_view_{id}({args}).map(OutcomeView::into_owned)}}").unwrap();
     }
