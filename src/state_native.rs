@@ -1064,7 +1064,9 @@ fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snap
         ink_abi::VALUE_ABI
     )
     .unwrap();
-    writeln!(out,"pub const INK_WIRE_CONTRACT:&str={:?};",ink_abi::wire_contract::source_contract(p)?.to_string()).unwrap();
+    // Built once: the binary value bridge below reads the same contract.
+    let wire_contract = ink_abi::wire_contract::source_contract(p)?;
+    writeln!(out,"pub const INK_WIRE_CONTRACT:&str={:?};",wire_contract.to_string()).unwrap();
     out.push_str(ink_native_support::TYPED_VALUES_RUST_SOURCE);
     out.push_str(ink_native_support::NUMERIC_INT_RUST_SOURCE);
     out.push_str("\nmod temporary {\n");
@@ -1673,12 +1675,12 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     out.push_str("\n}\npub use value_wire::Limits as ValueWireLimits;\n");
     out.push_str(ink_native_support::BINARY_VALUES_RUST_SOURCE);
     out.push_str(ink_native_support::DIRECT_VALUES_RUST_SOURCE);
-    out.push_str(&emit_binary_values(p)?);
+    out.push_str(&emit_binary_values(p, &wire_contract)?);
     Ok(out)
 }
 
 /// Type-directed codec emission; representation strategy still comes from plans.
-fn emit_binary_values(p: &Program) -> LangResult<String> {
+fn emit_binary_values(p: &Program, contract: &serde_json::Value) -> LangResult<String> {
     let mut out = String::new();
     let describe = |t: &Type| ink_abi::describe(t, &p.records, &p.enums, &p.ids);
     let named = p.records.keys().map(|n| Ok((n.clone(), describe(&Type::Named(n.clone()))?))).collect::<LangResult<BTreeMap<_,_>>>()?;
@@ -1703,7 +1705,6 @@ fn emit_binary_values(p: &Program) -> LangResult<String> {
         for v in variants { writeln!(out,"Self::{}=>{:?}.as_bytes(),",ident(v),format!("{n}.{v}")).unwrap(); }
         out.push_str("}))}}\n");
     }
-    let contract = ink_abi::wire_contract::source_contract(p)?;
     out.push_str("impl State{fn binary_call_frame(&mut self,name:&str,record:value_wire::Validated<'_>,output:&value_wire::Schema,limits:ValueWireLimits)->Result<Vec<u8>,String>{match name{\n");
     for f in &p.functions {
         if contract["functions"][&f.name].get("unsupported").is_some() { continue; }
