@@ -61,12 +61,69 @@ impl Emitter<'_> {
                 }
             )
         } else if *t == Type::F32 {
-            format!("temporary::ink_f32(({a}) {op} ({b}))")
+            format!("temporary::ink_f32(({}) {op} ({}))", crate::primitive_emit::uncanonical(a), crate::primitive_emit::uncanonical(b))
         } else if *t == Type::F64 {
-            format!("temporary::ink_f64(({a}) {op} ({b}))")
+            format!("temporary::ink_f64(({}) {op} ({}))", crate::primitive_emit::uncanonical(a), crate::primitive_emit::uncanonical(b))
         } else {
             format!("(({a}) {op} ({b}))")
         }
+    }
+    /// Float canonicalisations in the step of a fold or bounded loop, in the
+    /// form that keeps them off the path from one iteration to the next.
+    /// Only code is rewritten: the text of a string literal in the step is
+    /// the program's own data. A step whose quoting this cannot follow with
+    /// certainty keeps the plain form.
+    fn carried(step: String) -> String {
+        let code = |text: &str| {
+            text.replace("temporary::ink_f32(", "temporary::ink_f32_carried(")
+                .replace("temporary::ink_f64(", "temporary::ink_f64_carried(")
+        };
+        // A loop inside the step keeps the plain form, which lets an
+        // element-wise loop use vector instructions; an inner fold has
+        // already had its own step rewritten.
+        if [".into_iter()", ".iter()", ".iter_mut()", ".drain(", ".map(", "for ", "while ", "loop ", "loop{"].iter().any(|form| step.contains(form)) {
+            return step;
+        }
+        if !step.contains('"') {
+            return code(&step);
+        }
+        // Raw strings, a quote as a character literal and comments would
+        // each need more than the escape rule below.
+        if ["r\"", "r#", "'\"'", "'\\\"'", "//", "/*"].iter().any(|form| step.contains(form)) {
+            return step;
+        }
+        let mut out = String::with_capacity(step.len() + 64);
+        let (mut from, mut literal, mut escaped) = (0, false, false);
+        for (at, c) in step.char_indices() {
+            if literal {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    out.push_str(&step[from..=at]);
+                    from = at + 1;
+                    literal = false;
+                }
+            } else if c == '"' {
+                out.push_str(&code(&step[from..at]));
+                from = at;
+                literal = true;
+            }
+        }
+        if literal {
+            return step;
+        }
+        out.push_str(&code(&step[from..]));
+        out
+    }
+    /// The step of a loop whose accumulator is a float, or a record with a
+    /// float field: its arithmetic feeds the next iteration.
+    fn carried_step(&self, step: String, accumulator: &Type) -> String {
+        let float = |t: &Type| matches!(t, Type::F32 | Type::F64);
+        let carries = float(accumulator)
+            || matches!(accumulator, Type::Named(name) if self.p.records.get(name).is_some_and(|fields| fields.iter().any(|(_, t)| float(t))));
+        if carries { Self::carried(step) } else { step }
     }
     fn zero(t: &Type) -> String {
         match t {
@@ -598,6 +655,7 @@ impl Emitter<'_> {
                 self.observe_formals = ink_core::local_collections::owned(&t, self.p);
                 let (stopvars, stop) = self.lambda(&args[2], env, &[t.clone()], &Type::Bool)?;
                 let (vs, body) = self.lambda(&args[3], env, &[Type::U32, t.clone()], &t)?;
+                let body = self.carried_step(body, &t);
                 let acc = self.fresh();
                 let bound = self.fresh();
                 let observed = if ink_core::local_collections::owned(&t, self.p) {
@@ -751,6 +809,7 @@ impl Emitter<'_> {
                 };
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 let (vs, body) = self.lambda(&args[2], env, &[Type::U32, t.clone()], &t)?;
+                let body = self.carried_step(body, &t);
                 let acc = self.fresh();
                 format!("{{let mut {acc}={initial};for {} in 0..{bound}u32 {{let {}={acc};{acc}={body};}}{acc}}}",vs[0],vs[1])
             }
@@ -767,6 +826,7 @@ impl Emitter<'_> {
                 let loans=ink_core::local_collections::callback_parameter_loans(&args[2],&types,self.p,&params,&Type::Bool)?;
                 let (stopvars, stop) = self.lambda_borrows(&args[2],env,&params,&Type::Bool,&loans)?;
                 let (vs, body) = self.lambda(&args[3], env, &[*inner, t.clone()], &t)?;
+                let body = self.carried_step(body, &t);
                 let list = self.fresh();
                 let acc = self.fresh();
                 let item = self.fresh();
@@ -789,6 +849,7 @@ impl Emitter<'_> {
                 } else {self.iterate(&args[0],env,None)?};
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 let (vs, body) = self.lambda_mode(&args[2], env, &[*inner, t.clone()], &t, &[borrowed, false])?;
+                let body = self.carried_step(body, &t);
                 let acc = self.fresh();
                 let list = self.fresh();
                 let direction = if n == "foldr" { ".rev()" } else { "" };
@@ -808,7 +869,7 @@ impl Emitter<'_> {
                     return Ok(format!(
                         "({iterator}).fold({},|{acc},{item}|{})",
                         Self::zero(&t),
-                        Self::arithmetic("+", &acc, &item, &t)
+                        Self::carried(Self::arithmetic("+", &acc, &item, &t))
                     ));
                 }
                 // count: a lexical list has its length; a computed list
@@ -1273,6 +1334,28 @@ assert_eq!(t.function_l_from_owner(fresh),15);assert_eq!(COPIES.swap(0,Ordering:
         assert!(Command::new(dir.join("test")).status().unwrap().success());fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn carried_canonicalisation_rewrites_code_and_never_string_text(){
+        let carried=|step:&str|Emitter::carried(step.to_string());
+        assert_eq!(carried("temporary::ink_f32((a) + (temporary::ink_f64(b) as f32))"),"temporary::ink_f32_carried((a) + (temporary::ink_f64_carried(b) as f32))");
+        // A literal holding the helper's name, an escaped quote and a backslash stays as written.
+        assert_eq!(
+            carried(r#"f(temporary::ink_f32(a),"temporary::ink_f32(\" \\".to_string(),temporary::ink_f32(b),"temporary::ink_f64(")"#),
+            r#"f(temporary::ink_f32_carried(a),"temporary::ink_f32(\" \\".to_string(),temporary::ink_f32_carried(b),"temporary::ink_f64(")"#
+        );
+        for kept in [
+            "(xs).into_iter().map(|x|temporary::ink_f32((x) * (y))).collect::<Vec<f32>>()",
+            "{let mut a=0.0f32;for x in 0..n {a=temporary::ink_f32((a) + (b));}a}",
+            "g(r\"temporary::ink_f32(\",temporary::ink_f32(a))",
+            "g(r#\"temporary::ink_f32(\"#,temporary::ink_f32(a))",
+            "g('\"',temporary::ink_f32(a),\"x\")",
+            "g('\\\"',temporary::ink_f32(a),\"x\")",
+            "g(\"x\",temporary::ink_f32(a)) // \"",
+            "g(\"unterminated,temporary::ink_f32(a))",
+        ] {
+            assert_eq!(carried(kept), kept);
+        }
+    }
     #[test]
     fn stop_predicates_copy_fields_of_a_borrowed_owned_accumulator(){
         // An accumulator that owns a Buffer is shown to the stop predicate as

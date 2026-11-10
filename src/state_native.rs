@@ -363,9 +363,9 @@ impl Emitter<'_> {
                     };
                     format!("({ac}).{method}({bc})")
                 } else if arithmetic && at == T::F32 {
-                    format!("temporary::ink_f32(({ac}) {op} ({bc}))")
+                    format!("temporary::ink_f32(({}) {op} ({}))",crate::primitive_emit::uncanonical(&ac),crate::primitive_emit::uncanonical(&bc))
                 } else if arithmetic && at == T::F64 {
-                    format!("temporary::ink_f64(({ac}) {op} ({bc}))")
+                    format!("temporary::ink_f64(({}) {op} ({}))",crate::primitive_emit::uncanonical(&ac),crate::primitive_emit::uncanonical(&bc))
                 } else {
                     format!("(({ac}) {op} ({bc}))")
                 };
@@ -466,9 +466,9 @@ impl Emitter<'_> {
                             format!("0{}", ty(&t)?)
                         };
                         let add = if *t == T::F32 {
-                            "temporary::ink_f32(a+b)"
+                            "temporary::ink_f32_carried(a+b)"
                         } else if *t == T::F64 {
-                            "temporary::ink_f64(a+b)"
+                            "temporary::ink_f64_carried(a+b)"
                         } else if *t == T::Int {
                             "a+b"
                         } else {
@@ -528,7 +528,7 @@ impl Emitter<'_> {
                         let iterator=if ownership::expr_mutates_state(self.p,&args[0]) {format!("self.{field}.values().cloned().collect::<Vec<_>>().into_iter()")} else {format!("self.{field}.values()")};
                         if n=="count_where" {return Ok((format!("{{let mut count=BigInt::from(0u8);for {} in {iterator}{{if {body}{{count+=1;}}}}count}}",ident(parameter)),T::Int));}
                         let zero=if result_type==T::Int {"BigInt::from(0u8)".into()} else {format!("0{}",ty(&result_type)?)};
-                        let add=if result_type==T::F32 {"temporary::ink_f32(acc+contribution)"} else if result_type==T::F64 {"temporary::ink_f64(acc+contribution)"} else if result_type==T::Int {"acc+contribution"} else {"acc.wrapping_add(contribution)"};
+                        let add=if result_type==T::F32 {"temporary::ink_f32_carried(acc+contribution)"} else if result_type==T::F64 {"temporary::ink_f64_carried(acc+contribution)"} else if result_type==T::Int {"acc+contribution"} else {"acc.wrapping_add(contribution)"};
                         return Ok((format!("{{let mut acc={zero};for {} in {iterator}{{let contribution={body};acc={add};}}acc}}",ident(parameter)),result_type));
                     }
                     if n == "values" || n == "keys" {
