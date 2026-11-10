@@ -187,8 +187,110 @@ impl Emitter<'_> {
                 }
             }
         }
+        if let Expr::Method(receiver, n, args) = e {
+            if n == "zip" && !self.reserved(e) && plain(self, inner) {
+                // A zip feeding another traversal stays lazy like map/filter.
+                return Ok((self.zip_iterator(receiver, args, env, inner)?, false));
+            }
+        }
         let value = self.expr(e, env, want)?;
         Ok((format!("({value}).into_iter()"), false))
+    }
+    /// `receiver.zip(other, callback)` as an iterator of callback results.
+    fn zip_iterator(&mut self, receiver: &Expr, args: &[Expr], env: &Env, out: &Type) -> LangResult<String> {
+        let Type::List(inner) = self.infer(receiver, env, None)? else {
+            return Err("zip receiver".into());
+        };
+        let Type::List(other) = self.infer(&args[0], env, None)? else {
+            return Err("zip input".into());
+        };
+        // Both iterators are alive together. When the operands
+        // share a variable, one may move it while the other
+        // still borrows it, so evaluate both eagerly instead.
+        let shared = ink_core::analysis::free_variables(receiver)
+            .intersection(&ink_core::analysis::free_variables(&args[0]))
+            .next()
+            .is_some();
+        let (left, left_borrowed) = if shared {
+            (format!("({}).into_iter()", self.expr(receiver, env, None)?), false)
+        } else {
+            self.iterate(receiver, env, None)?
+        };
+        let (right, right_borrowed) = if shared {
+            (format!("({}).into_iter()", self.expr(&args[0], env, None)?), false)
+        } else {
+            self.iterate(&args[0], env, None)?
+        };
+        let (vs, body) = self.lambda_mode(&args[1], env, &[*inner, *other], out, &[left_borrowed, right_borrowed])?;
+        let a = self.fresh();
+        let b = self.fresh();
+        Ok(format!("{{let {a}={left};let {b}={right};{a}.zip({b}).map(|({},{})|{body})}}", vs[0], vs[1]))
+    }
+    /// sum over map/filter stages with at least one filter, as one loop whose
+    /// body tests each predicate in turn. A filter is a branch inside the
+    /// loop rather than an iterator adaptor, which lets the compiler turn it
+    /// into a select and vectorise the loop. Stages run in source order for
+    /// each element, as the lazy iterator chain does; callbacks are pure.
+    fn fused_sum(&mut self, e: &Expr, env: &Env, t: &Type) -> LangResult<Option<String>> {
+        let plain = |me: &Self, item: &Type| crate::columns::names(item).is_none() && !ink_core::local_collections::owned(item, me.p);
+        let mut stages = vec![];
+        let mut source = e;
+        let whole = Type::List(Box::new(t.clone()));
+        while let Expr::Method(receiver, n, args) = source {
+            if !matches!(n.as_str(), "map" | "filter") || args.len() != 1 || self.reserved(source) {
+                break;
+            }
+            let list = self.infer(source, env, if std::ptr::eq(source, e) { Some(&whole) } else { None })?;
+            let Type::List(out) = list.clone() else { return Ok(None) };
+            let input = self.infer(receiver, env, if n == "filter" { Some(&list) } else { None })?;
+            let Type::List(input) = input else { return Ok(None) };
+            if !plain(self, &out) || !plain(self, &input) {
+                return Ok(None);
+            }
+            stages.push((n.as_str(), &args[0], *input, *out));
+            source = receiver;
+        }
+        if !stages.iter().any(|(n, ..)| *n == "filter") {
+            return Ok(None);
+        }
+        stages.reverse();
+        let (iterator, mut borrowed) = self.iterate(source, env, None)?;
+        let acc = self.fresh();
+        let mut current = self.fresh();
+        let item = current.clone();
+        let mut body = String::new();
+        let mut closing = String::new();
+        for (n, callback, input, out) in stages {
+            if n == "map" {
+                let (vs, code) = self.lambda_mode(callback, env, &[input], &out, &[borrowed])?;
+                let next = self.fresh();
+                body.push_str(&format!("let {}={current};let {next}={{{code}}};", vs[0]));
+                current = next;
+                borrowed = false;
+            } else {
+                let (vs, code) = self.lambda_mode(callback, env, &[input], &Type::Bool, &[true])?;
+                let reference = if borrowed { current.clone() } else { format!("&{current}") };
+                body.push_str(&format!("let {}={reference};if {{{code}}} {{", vs[0]));
+                closing.push('}');
+            }
+        }
+        let value = if borrowed { format!("({current}).clone()") } else { current };
+        // Float steps stay uncanonicalised: NaN propagates through addition,
+        // so canonicalising the final sum gives the same bits as
+        // canonicalising every step, with nothing on the loop-carried path.
+        let step = match t {
+            Type::F32 | Type::F64 => format!("(({acc}) + ({}))", crate::primitive_emit::uncanonical(&value)),
+            _ => Self::arithmetic("+", &acc, &value, t),
+        };
+        body.push_str(&format!("{acc}={step};{closing}"));
+        // A loop rather than Iterator::fold: owned records move into each
+        // iteration more cheaply, and scalar loops vectorise the same.
+        let total = format!("{{let mut {acc}={};for {item} in ({iterator}) {{{body}}}{acc}}}", Self::zero(t));
+        Ok(Some(match t {
+            Type::F32 => format!("temporary::ink_f32({total})"),
+            Type::F64 => format!("temporary::ink_f64({total})"),
+            _ => total,
+        }))
     }
     // Field projection copies the field value, not its containing record.
     // This is literal access to a checked place; it retains no borrowed value
@@ -627,12 +729,14 @@ impl Emitter<'_> {
                 format!("{{let {av}={a};let {bv}={b};if {bv}==0 {overflow} {{{fallback}}} else {{{av} {} {bv}}}}}",if n=="quot_or"{"/"}else{"%"})
             }
             Expr::Call(n, args) if n == "length" => {
-                let xs = if let Some(place) = self.lexical_place(&args[0], env) {
-                    place
+                if let Some(place) = self.lexical_place(&args[0], env) {
+                    format!("({place}).len() as u32")
+                } else if matches!(&args[0], Expr::Method(_, m, _) if matches!(m.as_str(), "map" | "filter" | "zip")) && !self.reserved(&args[0]) {
+                    // Count a computed pipeline without materialising it.
+                    format!("({}).count() as u32", self.iterate(&args[0], env, None)?.0)
                 } else {
-                    self.expr(&args[0], env, None)?
-                };
-                format!("({xs}).len() as u32")
+                    format!("({}).len() as u32", self.expr(&args[0], env, None)?)
+                }
             }
             Expr::Call(n, args) if n == "parallel_map" => {
                 let Type::List(input) = self.infer(&args[0], env, None)? else {
@@ -862,6 +966,9 @@ impl Emitter<'_> {
                     None
                 };
                 if n == "sum" {
+                    if let Some(fused) = self.fused_sum(&args[0], env, &t)? {
+                        return Ok(fused);
+                    }
                     let (iterator, borrowed) = self.iterate(&args[0], env, context.as_ref())?;
                     let iterator = if borrowed { format!("({iterator}).cloned()") } else { iterator };
                     let acc = self.fresh();
@@ -1093,33 +1200,11 @@ impl Emitter<'_> {
                         }
                     }
                     "zip" => {
-                        let Type::List(other) = self.infer(&args[0], env, None)? else {
-                            return Err("zip input".into());
-                        };
                         let Type::List(out) = &t else {
                             return Err("zip output".into());
                         };
-                        // Both iterators are alive together. When the operands
-                        // share a variable, one may move it while the other
-                        // still borrows it, so evaluate both eagerly instead.
-                        let shared = ink_core::analysis::free_variables(receiver)
-                            .intersection(&ink_core::analysis::free_variables(&args[0]))
-                            .next()
-                            .is_some();
-                        let (left, left_borrowed) = if shared {
-                            (format!("({}).into_iter()", self.expr(receiver, env, None)?), false)
-                        } else {
-                            self.iterate(receiver, env, None)?
-                        };
-                        let (right, right_borrowed) = if shared {
-                            (format!("({}).into_iter()", self.expr(&args[0], env, None)?), false)
-                        } else {
-                            self.iterate(&args[0], env, None)?
-                        };
-                        let (vs, body) = self.lambda_mode(&args[1], env, &[*inner, *other], out, &[left_borrowed, right_borrowed])?;
-                        let a = self.fresh();
-                        let b = self.fresh();
-                        format!("{{let {a}={left};let {b}={right};{}}}",self.collect(e,format!("{a}.zip({b}).map(|({},{})|{body})",vs[0],vs[1]),&collection)?)
+                        let iterator = self.zip_iterator(receiver, args, env, out)?;
+                        self.collect(e, iterator, &collection)?
                     }
                     _ => return Err(format!("unsupported pure method {n}")),
                 }
