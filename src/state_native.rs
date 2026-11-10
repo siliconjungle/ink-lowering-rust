@@ -1047,7 +1047,9 @@ fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snap
         "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
     );
     writeln!(out,"pub const INK_TABLE_STORAGE:&str={:?};",match storage {TableStorage::Ordered=>"ordered",TableStorage::IndexedSlots=>"indexed-slots"}).unwrap();
-    let describe = |t: &Type| ink_abi::describe(t, &p.records, &p.enums, &p.ids);
+    // Serialize the declarations once; each description then borrows them.
+    let declared = Declared::new(p)?;
+    let describe = |t: &Type| declared.describe(t);
     let functions=p.functions.iter().map(|f|Ok(serde_json::json!({"name":f.name,"params":f.params.iter().map(|(n,t)|Ok(serde_json::json!({"name":n,"type":describe(t)?}))).collect::<LangResult<Vec<_>>>()?,"result":describe(&f.result)?}))).collect::<LangResult<Vec<_>>>()?;
     let actions=p.actions.iter().map(|a|Ok(serde_json::json!({"name":a.name,"params":a.params.iter().map(|(n,t)|Ok(serde_json::json!({"name":n,"type":describe(t)?}))).collect::<LangResult<Vec<_>>>()?,"result":describe(&a.result)?}))).collect::<LangResult<Vec<_>>>()?;
     let contract =
@@ -1679,17 +1681,62 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     Ok(out)
 }
 
+/// A program's declarations as JSON, serialized once for many descriptions.
+struct Declared {
+    records: serde_json::Value,
+    enums: serde_json::Value,
+    ids: serde_json::Value,
+}
+impl Declared {
+    fn new(p: &Program) -> LangResult<Self> {
+        let json = |e: serde_json::Error| e.to_string();
+        Ok(Self {
+            records: serde_json::to_value(&p.records).map_err(json)?,
+            enums: serde_json::to_value(&p.enums).map_err(json)?,
+            ids: serde_json::to_value(&p.ids).map_err(json)?,
+        })
+    }
+    fn describe(&self, t: &Type) -> LangResult<serde_json::Value> {
+        ink_abi::describe(t, &self.records, &self.enums, &self.ids)
+    }
+}
+/// The named descriptions `root` can reach through references. A wire schema
+/// keeps exactly the references its check visits along these edges, so this
+/// closure stands in for the whole table with the same result or error.
+fn referenced(root: &serde_json::Value, named: &BTreeMap<String, serde_json::Value>) -> BTreeMap<String, serde_json::Value> {
+    fn visit<'a>(t: &'a serde_json::Value, named: &'a BTreeMap<String, serde_json::Value>, found: &mut BTreeSet<&'a str>) {
+        let Some(object) = t.as_object() else { return };
+        if object.get("kind").and_then(|k| k.as_str()) == Some("ref") {
+            if let Some((name, target)) = object.get("name").and_then(|n| n.as_str()).and_then(|n| named.get_key_value(n)) {
+                if found.insert(name) { visit(target, named, found); }
+            }
+        }
+        for key in ["element", "ok", "error"] {
+            if let Some(inner) = object.get(key) { visit(inner, named, found); }
+        }
+        for field in object.get("fields").and_then(|f| f.as_array()).into_iter().flatten() {
+            if let Some(inner) = field.get("type") { visit(inner, named, found); }
+        }
+    }
+    let mut found = BTreeSet::new();
+    visit(root, named, &mut found);
+    found.into_iter().map(|name| (name.to_owned(), named[name].clone())).collect()
+}
 /// Type-directed codec emission; representation strategy still comes from plans.
 fn emit_binary_values(p: &Program, contract: &serde_json::Value) -> LangResult<String> {
     let mut out = String::new();
-    let describe = |t: &Type| ink_abi::describe(t, &p.records, &p.enums, &p.ids);
-    let named = p.records.keys().map(|n| Ok((n.clone(), describe(&Type::Named(n.clone()))?))).collect::<LangResult<BTreeMap<_,_>>>()?;
+    let declared = Declared::new(p)?;
+    let named = p.records.keys().map(|n| Ok((n.clone(), declared.describe(&Type::Named(n.clone()))?))).collect::<LangResult<BTreeMap<_,_>>>()?;
     for n in &p.ids {
         let id = ident(n);
         writeln!(out, "impl BinaryValue for {id}{{fn from_binary(v:value_wire::Validated<'_>)->Result<Self,String>{{v.require_kind(\"id\")?;v.require_name({n:?})?;Ok(Self(u128::from_str_radix(v.text()?,16).map_err(|_|\"wire ID\")?))}}fn write_binary(&self,w:&mut value_wire::Encoder)->Result<(),String>{{w.frame(|w|w.bytes(format!(\"{{:032x}}\",self.0).as_bytes()))}}}}").unwrap();
     }
     for (n,fs) in &p.records {
-        if ink_abi::value_wire::Schema::new(describe(&Type::Named(n.clone()))?, named.clone()).is_err() { continue; }
+        // `named[n]` is this record's description. The schema check follows
+        // references only, so the records it can reach decide the outcome.
+        let root = named[n].clone();
+        let reachable = referenced(&root, &named);
+        if ink_abi::value_wire::Schema::new(root, reachable).is_err() { continue; }
         let id = ident(n);
         writeln!(out, "impl BinaryValue for {id}{{fn from_binary(v:value_wire::Validated<'_>)->Result<Self,String>{{v.require_kind(\"record\")?;v.require_name({n:?})?;let mut fields=v.fields()?;Ok(Self{{").unwrap();
         for (f,t) in fs { writeln!(out,"{}:<{} as BinaryValue>::from_binary(fields.next().ok_or(\"wire record field\")??)?,",ident(f),field_ty(n,t,p)?).unwrap(); }
