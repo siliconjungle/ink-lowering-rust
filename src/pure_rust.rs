@@ -12,6 +12,12 @@ struct Emitter<'a> {
     last_uses: ink_core::last_use::LastUses,
     borrowed_bindings: std::collections::BTreeSet<String>,
     live_loans: std::collections::BTreeSet<String>,
+    /// Set for the next callback whose parameters are observed through a
+    /// reference to their owner.
+    observe_formals: bool,
+    /// Bindings that are such references. A final use may still read a
+    /// scalar field in place, but it moves nothing out of the owner.
+    observed: std::collections::BTreeSet<String>,
     paths: BTreeMap<usize,Vec<usize>>,
     next: usize,
     prefix: String,
@@ -80,7 +86,7 @@ impl Emitter<'_> {
         let borrowed=ink_core::collection_facts::lexical_projection(e).is_some_and(|(root,_)|
             env.get(root).is_some_and(|(binding,_)|self.borrowed_bindings.contains(binding)));
         let mut root=e;while let Expr::Field(parent,_)=root{root=parent;}
-        let final_move=matches!(root,Expr::Var(name)if env.get(name).is_some_and(|(binding,_)|!self.borrowed_bindings.contains(binding)&&!self.live_loans.contains(binding)))
+        let final_move=matches!(root,Expr::Var(name)if env.get(name).is_some_and(|(binding,_)|!self.borrowed_bindings.contains(binding)&&!self.live_loans.contains(binding)&&!self.observed.contains(binding)))
             && (self.last_uses.contains(root)||self.last_uses.contains_field(e));
         if self.physical.is_none() && !borrowed && final_move {return None;}
         if !borrowed && self.physical.is_some() && !self.physical.is_some_and(|plan| ink_core::registry::identity(e).is_ok_and(|id| plan.borrows_read(&id))
@@ -143,7 +149,7 @@ impl Emitter<'_> {
         let mut root=e;while let Expr::Field(parent,_)=root{root=parent;}
         let Expr::Var(name)=root else{return true;};
         env.get(name).is_some_and(|(binding,_)|
-            !self.borrowed_bindings.contains(binding)&&!self.live_loans.contains(binding))
+            !self.borrowed_bindings.contains(binding)&&!self.live_loans.contains(binding)&&!self.observed.contains(binding))
             &&(self.last_uses.contains(root)||self.last_uses.contains_field(e))
     }
 
@@ -196,6 +202,7 @@ impl Emitter<'_> {
         &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:&[bool],once:bool,
     )->LangResult<(Vec<String>,String)>{
         if borrowed.len()!=params.len(){return Err("callback borrow arity".into());}
+        let observed=std::mem::take(&mut self.observe_formals);
         let mut local = env.clone();
         let mut vars = vec![];
         let mut body = e;
@@ -222,7 +229,9 @@ impl Emitter<'_> {
         let outer=std::mem::replace(&mut self.last_uses,facts);
         let previous_borrows=self.borrowed_bindings.clone();
         self.borrowed_bindings.extend(vars.iter().zip(borrowed).filter(|(_,b)|**b).map(|(v,_)|v.clone()));
+        if observed{self.observed.extend(vars.iter().cloned());}
         let emitted=self.expr(body,&local,Some(result));
+        if observed{for v in &vars{self.observed.remove(v);}}
         self.borrowed_bindings=previous_borrows;
         self.last_uses=outer;
         Ok((vars,emitted?))
@@ -404,7 +413,11 @@ impl Emitter<'_> {
                             // projections still transfer their field. Borrowed
                             // parameters, captures and pending call loans are
                             // excluded by the binding checks above.
-                            if movable {
+                            // A field of a binding observed through `&owner`
+                            // cannot be moved out. Scalars are read in place.
+                            let observed=matches!(root,Expr::Var(name)if env.get(name).is_some_and(|(binding,_)|self.observed.contains(binding)))
+                                && !matches!(ft,Type::U32|Type::U64|Type::I32|Type::F32|Type::F64|Type::Bool|Type::Unit);
+                            if movable && !observed {
                                 return Ok(if crate::state_native::boxed_field(owner,ft,self.p){format!("*({place})")}else{place});
                             }
                             return Ok(if crate::state_native::boxed_field(owner, ft, self.p) {
@@ -578,6 +591,11 @@ impl Emitter<'_> {
             Expr::Call(n, args) if n == "repeat_until" => {
                 let limit = self.expr(&args[0], env, Some(&Type::U32))?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
+                // An accumulator that owns temporary storage is observed by
+                // the stop predicate through `&acc`. Its last field read
+                // there copies the field like every earlier read; moving it
+                // out of the reference is not valid Rust.
+                self.observe_formals = ink_core::local_collections::owned(&t, self.p);
                 let (stopvars, stop) = self.lambda(&args[2], env, &[t.clone()], &Type::Bool)?;
                 let (vs, body) = self.lambda(&args[3], env, &[Type::U32, t.clone()], &t)?;
                 let acc = self.fresh();
@@ -1120,6 +1138,8 @@ pub(crate) fn body_with_tasks_loans(p:&Program,f:&Function,physical:Option<&ink_
         last_uses: ink_core::last_use::analyse(&f.body, f.params.iter().map(|(n, _)| n.as_str())),
         borrowed_bindings:f.params.iter().zip(loans).filter(|(_,loan)|**loan).map(|((n,_),_)|format!("l_{n}")).collect(),
         live_loans:Default::default(),
+        observe_formals:false,
+        observed:Default::default(),
         next: 0,
         prefix: f.name.clone(),
         task_prefix:if loans.iter().any(|b|*b){format!("__ink_borrowed_{}",f.name)}else{f.name.clone()},
@@ -1253,6 +1273,28 @@ assert_eq!(t.function_l_from_owner(fresh),15);assert_eq!(COPIES.swap(0,Ordering:
         assert!(Command::new(dir.join("test")).status().unwrap().success());fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn stop_predicates_copy_fields_of_a_borrowed_owned_accumulator(){
+        // An accumulator that owns a Buffer is shown to the stop predicate as
+        // `&acc`. The predicate's last read of a record field used to be
+        // emitted as a move out of that reference, which rustc rejects.
+        let p=parse(r#"module stops;
+record Row{key:u32,weight:u32,}
+record Walk{seen:Buffer<u32>,fallback:Row,steps:u32,}
+fn weight(r:Row)->u32{return r.weight;}
+fn walk(limit:u32,start:Row)->u32{
+ let done:Walk=repeat_until(limit,Walk{seen:Buffer.empty(),fallback:start,steps:0},fn(w)=>weight(w.fallback)==0,fn(i)=>fn(w)=>Walk{seen:w.seen.push(i),fallback:w.fallback,steps:w.steps+1});
+ return done.steps;}
+"#).unwrap();check::check(&p).unwrap();
+        let f=p.functions.iter().find(|f|f.name=="walk").unwrap();
+        let body=body_with_tasks_planned(&p,f,None).unwrap().0;
+        let stop=&body[body.find("if ").unwrap()..body.find("{break;}").unwrap()];
+        assert!(stop.contains(".l_fallback).clone()"),"{stop}");
+        assert!(!stop.contains(".l_fallback;"),"{stop}");
+        // The step owns the accumulator and still moves the field.
+        let step=&body[body.find("{break;}").unwrap()..];
+        assert!(step.contains(".l_fallback;"),"{step}");
+    }
     #[test]
     fn record_rebuild_moves_disjoint_vectors_but_repeated_and_captured_fields_copy(){
         let p=parse(r#"module field_moves;
