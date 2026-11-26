@@ -137,7 +137,7 @@ pub fn binders(params: &[(String, Type)], stmts: &[Statement]) -> BTreeMap<Strin
 }
 
 /// Whether evaluating this statement can call a generated method taking
-/// `&mut self`: a table write, an emitted event, a change/function call, or a
+/// `&mut self`: a table write, an emitted event, an action call, or a
 /// derived-value read. Shared row borrows must end before such a statement.
 pub fn mutates_state(p: &Program, s: &Statement) -> bool {
     match s {
@@ -162,7 +162,6 @@ pub fn expr_mutates_state(p: &Program, e: &Expr) -> bool {
         }
         Expr::Call(n, args) => {
             p.actions.iter().any(|a| &a.name == n)
-                || p.functions.iter().any(|f| &f.name == n)
                 || args.iter().any(|a| expr_mutates_state(p, a))
         }
         Expr::Binary(_, a, b) | Expr::Let(_, _, a, b) => {

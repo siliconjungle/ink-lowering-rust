@@ -182,6 +182,25 @@ impl Emitter<'_> {
         self.serial += 1;
         format!("tmp_{}", self.serial)
     }
+
+    // A value-state read is lowered by core to a table lookup with an eager
+    // default. The stored value and its fallback can both be lent to a pure
+    // helper for the duration of a single call.
+    fn stored_argument<'e>(&self, e: &'e Expr, env: &Env, expected: &Type)
+        -> Option<(&'e str, &'e Expr, &'e Expr, Type)>
+    {
+        let Expr::Method(lookup, unwrap, defaults) = e else { return None };
+        let ("unwrap_or", [default]) = (unwrap.as_str(), defaults.as_slice()) else { return None };
+        let Expr::Method(root, get, keys) = lookup.as_ref() else { return None };
+        let (Expr::Var(name), "get", [key]) = (root.as_ref(), get.as_str(), keys.as_slice()) else { return None };
+        if env.contains_key(name) || ownership::expr_mutates_state(self.p, default) {
+            return None;
+        }
+        let state = self.p.states.iter().find(|state| state.name == *name)?;
+        let Type::Table(key_type, value_type) = &state.ty else { return None };
+        (value_type.as_ref() == expected).then(|| (name.as_str(), key, default, key_type.as_ref().clone()))
+    }
+
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, Type)> {
         let lazy = std::mem::take(&mut self.lazy);
         let resolved = self.execution.type_of(e).cloned();
@@ -478,23 +497,51 @@ impl Emitter<'_> {
                     }
                 }
                 _ => {
+                    let function = self.p.functions.iter().find(|f| &f.name == n);
                     let (params, result, is_change, prefix) =
                         if let Some(a) = self.p.actions.iter().find(|a| &a.name == n) {
                             (&a.params, &a.result, a.kind == ActionKind::Change, "action")
-                        } else if let Some(f) = self.p.functions.iter().find(|a| &a.name == n) {
+                        } else if let Some(f) = function {
                             (&f.params, &f.result, false, "function")
                         } else {
                             return Err(format!("native unknown call {n}"));
                         };
+                    let loans = if prefix == "function" {
+                        crate::pure_rust::parameter_loans(self.p, function.unwrap(), self.physical)
+                    } else {
+                        vec![false; params.len()]
+                    };
+                    let mut stored = vec![None; args.len()];
+                    if loans.iter().any(|loan| *loan) {
+                        let mut later_mutates = false;
+                        for (index, (arg, (_, ty))) in args.iter().zip(params).enumerate().rev() {
+                            if loans[index] && !later_mutates {
+                                stored[index] = self.stored_argument(arg, env, ty);
+                            }
+                            later_mutates |= ownership::expr_mutates_state(self.p, arg);
+                        }
+                    }
+                    let borrow = stored.iter().any(Option::is_some);
                     let mut bindings = String::new();
                     let mut values = vec![];
-                    for (e, (_, t)) in args.iter().zip(params) {
-                        let (s, _) = self.expr(e, env, Some(t))?;
-                        let v = self.fresh();
-                        write!(bindings, "let {v}:{rt}={s};", rt = ty(t)?).unwrap();
-                        values.push(v)
+                    for (index, (e, (_, t))) in args.iter().zip(params).enumerate() {
+                        if let Some((root, key, default, key_type)) = &stored[index] {
+                            let key = self.expr(key, env, Some(key_type))?.0;
+                            let slot = self.fresh();
+                            let fallback = self.fresh();
+                            let default = self.expr(default, env, Some(t))?.0;
+                            let v = self.fresh();
+                            let rt = ty(t)?;
+                            write!(bindings, "let {slot}=self.{}.get(&({key}));let {fallback}:{rt}={default};let {v}={slot}.unwrap_or(&{fallback});", ident(root)).unwrap();
+                            values.push(v);
+                        } else {
+                            let (s, _) = self.expr(e, env, Some(t))?;
+                            let v = self.fresh();
+                            write!(bindings, "let {v}:{rt}={s};", rt = ty(t)?).unwrap();
+                            values.push(if borrow && loans[index] { format!("&{v}") } else { v });
+                        }
                     }
-                    let call = format!("self.{prefix}_{}({})", ident(n), values.join(","));
+                    let call = format!("self.{}{prefix}_{}({})", if borrow { "ink_borrowed_" } else { "" }, ident(n), values.join(","));
                     let call = if is_change && matches!(result, T::Result(..)) {
                         format!("transaction::nested_change({call})?")
                     } else {
@@ -587,9 +634,8 @@ impl Emitter<'_> {
                     // A pipeline stage applied directly to stored rows can read
                     // them by reference instead of cloning every row first.
                     let mut by_ref = None;
-                    // Generated helpers, queries and derived reads currently
-                    // take &mut self. Such a closure cannot run while the table
-                    // iterator holds a shared borrow; keep the owned baseline.
+                    // Actions and derived reads can take &mut self. A table
+                    // iterator cannot stay borrowed across those calls.
                     let closure_borrows_self = args
                         .iter()
                         .any(|arg| ownership::expr_mutates_state(self.p, arg));
