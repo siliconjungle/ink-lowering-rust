@@ -354,8 +354,8 @@ impl Emitter<'_> {
     ) -> LangResult<(Vec<String>,String)> {
         self.lambda_ownership(e,env,params,result,borrowed,false)
     }
-    fn lambda_once(&mut self,e:&Expr,env:&Env,params:&[Type],result:&Type)->LangResult<(Vec<String>,String)>{
-        self.lambda_ownership(e,env,params,result,&vec![false;params.len()],true)
+    fn lambda_once(&mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:&[bool])->LangResult<(Vec<String>,String)>{
+        self.lambda_ownership(e,env,params,result,borrowed,true)
     }
     fn lambda_ownership(
         &mut self,e:&Expr,env:&Env,params:&[Type],result:&Type,borrowed:&[bool],once:bool,
@@ -1045,15 +1045,35 @@ impl Emitter<'_> {
                 ) =>
             {
                 let input = self.infer(xs, env, None)?;
-                let value = self.expr(xs, env, Some(&input))?;
+                let place = if n == "fold" && self.physical.is_some()
+                    && !ink_core::local_collections::owned(&input, self.p) {
+                    self.borrowed_place(xs, env)
+                } else {
+                    None
+                };
+                let value = if let Some(place) = &place {
+                    format!("&({place})")
+                } else {
+                    self.expr(xs, env, Some(&input))?
+                };
                 if n == "fold" {
                     let (a, b, tag_a, tag_b) = match &input {
                         Type::Option(a) => (a.as_ref().clone(), Type::Unit, "Some", "None"),
                         Type::Result(a, b) => (a.as_ref().clone(), b.as_ref().clone(), "Ok", "Err"),
                         _ => unreachable!(),
                     };
-                    let (va, body_a) = self.lambda_once(&args[0], env, &[a], &t)?;
-                    let (vb, body_b) = self.lambda_once(&args[1], env, &[b], &t)?;
+                    let prior_loans = self.live_loans.clone();
+                    let borrowed = place.is_some();
+                    if borrowed {
+                        if let Some((root, _)) = ink_core::collection_facts::lexical_projection(xs) {
+                            self.live_loans.insert(env[root].0.clone());
+                        }
+                    }
+                    let left = self.lambda_once(&args[0], env, &[a], &t, &[borrowed]);
+                    let right = self.lambda_once(&args[1], env, &[b], &t, &[borrowed && tag_b == "Err"]);
+                    self.live_loans = prior_loans;
+                    let (va, body_a) = left?;
+                    let (vb, body_b) = right?;
                     let right = if tag_b == "None" {
                         format!("None=>{{let {}=();{body_b}}}", vb[0])
                     } else {
@@ -1266,7 +1286,9 @@ pub fn body_with_tasks_planned(p: &Program, f: &Function, physical: Option<&ink_
 // Computed arguments and projections out of affine owners are materialised
 // before borrowing; their owning temporaries live for the complete call.
 pub(crate) fn parameter_loans(p:&Program,f:&Function,physical:Option<&ink_core::physical::CheckedPhysicalPlan>)->Vec<bool>{
-    f.params.iter().map(|(n,t)|!ink_core::recursion::recursive(f) && matches!(t,Type::List(_)|Type::Named(_)) && !ink_core::local_collections::owned(t,p)
+    f.params.iter().map(|(n,t)|!ink_core::recursion::recursive(f)
+        && matches!(t, Type::List(_) | Type::Named(_) | Type::Option(_) | Type::Result(..))
+        && !ink_core::local_collections::owned(t, p)
         && physical.is_some_and(|plan|ink_core::physical::parameter_read_site(&f.name,n).is_ok_and(|id|plan.borrows_read(&id))
             || ink_core::registry::identity(&Expr::Var(n.clone())).is_ok_and(|id|plan.borrows_read(&id)))).collect()
 }
