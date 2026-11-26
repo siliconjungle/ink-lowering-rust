@@ -527,12 +527,14 @@ impl Emitter<'_> {
                     for (index, (e, (_, t))) in args.iter().zip(params).enumerate() {
                         if let Some((root, key, default, key_type)) = &stored[index] {
                             let key = self.expr(key, env, Some(key_type))?.0;
+                            let key_value = self.fresh();
                             let slot = self.fresh();
                             let fallback = self.fresh();
                             let default = self.expr(default, env, Some(t))?.0;
                             let v = self.fresh();
                             let rt = ty(t)?;
-                            write!(bindings, "let {slot}=self.{}.get(&({key}));let {fallback}:{rt}={default};let {v}={slot}.unwrap_or(&{fallback});", ident(root)).unwrap();
+                            writeln!(bindings, "let {key_value}={key};let {slot}=self.{}.get(&{key_value});", ident(root)).unwrap();
+                            write!(bindings, "let {fallback}:{rt}={default};let {v}={slot}.unwrap_or(&{fallback});").unwrap();
                             values.push(v);
                         } else {
                             let (s, _) = self.expr(e, env, Some(t))?;
