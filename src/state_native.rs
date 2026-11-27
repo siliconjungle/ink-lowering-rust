@@ -1019,9 +1019,14 @@ pub fn emit_selected(selected: &ink_core::optimisation::CheckedSelection) -> Lan
     emit_selected_with_table_storage(selected, TableStorage::Ordered)
 }
 pub fn emit_selected_with_table_storage(selected:&ink_core::optimisation::CheckedSelection,storage:TableStorage)->LangResult<String>{
-    let layout=crate::snapshot::selected_layout(selected)?;
-    emit_with_layout(selected.module(),&layout,storage,None,None)
+    lower_selected(selected, storage).map(Emission::into_inline)
 }
+
+fn lower_selected(selected: &ink_core::optimisation::CheckedSelection, storage: TableStorage) -> LangResult<Emission> {
+    let layout = crate::snapshot::selected_layout(selected)?;
+    emit_with_layout(selected.module(), &layout, storage, None, None)
+}
+
 fn floating(t: &Type, p: &Program, seen: &mut BTreeSet<String>) -> bool {
     match t {
         Type::F32 | Type::F64 => true,
@@ -1054,10 +1059,19 @@ pub fn emit_with_table_storage(p: &Program, storage: TableStorage) -> LangResult
     emit_checked_with_table_storage(&ink_core::core::CheckedModule::from_source(p.clone())?,storage)
 }
 pub fn emit_checked_with_table_storage(module: &ink_core::core::CheckedModule, storage: TableStorage) -> LangResult<String> {
-    let layout=crate::snapshot::layout(module.program())?;
-    emit_with_layout(module,&layout,storage,None,None)
+    lower_checked(module, storage).map(Emission::into_inline)
 }
+
+fn lower_checked(module: &ink_core::core::CheckedModule, storage: TableStorage) -> LangResult<Emission> {
+    let layout = crate::snapshot::layout(module.program())?;
+    emit_with_layout(module, &layout, storage, None, None)
+}
+
 pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String> {
+    lower_planned(plan).map(Emission::into_inline)
+}
+
+fn lower_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<Emission> {
     plan.require_record_elision_capability(false)?;
     if plan.protocol().is_some() {
         return Err("target does not support selected state protocol".into());
@@ -1072,7 +1086,70 @@ pub fn emit_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<String
     let views=plan.maintained().map(|v|crate::maintained_native::views(plan.module(),v)).transpose()?;
     emit_with_layout(plan.module(),&layout,storage,plan.physical(),views.as_ref())
 }
-fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>, maintained: Option<&crate::maintained_native::Views>) -> LangResult<String> {
+const ABI_CONTRACT_FILE: &str = "ink-abi-contract.json";
+const WIRE_CONTRACT_FILE: &str = "ink-wire-contract.json";
+
+/// Literal Rust and the adjacent input files read by its `include_str!` declarations.
+pub struct ProjectSource {
+    pub source: String,
+    abi_contract: String,
+    wire_contract: String,
+}
+
+impl ProjectSource {
+    pub fn contracts(&self) -> [(&'static str, &str); 2] {
+        [(ABI_CONTRACT_FILE, &self.abi_contract), (WIRE_CONTRACT_FILE, &self.wire_contract)]
+    }
+}
+
+pub fn project_checked(module: &ink_core::core::CheckedModule, storage: TableStorage) -> LangResult<ProjectSource> {
+    lower_checked(module, storage).map(Emission::into_project)
+}
+
+pub fn project_selected(selected: &ink_core::optimisation::CheckedSelection, storage: TableStorage) -> LangResult<ProjectSource> {
+    lower_selected(selected, storage).map(Emission::into_project)
+}
+
+pub fn project_planned(plan: &ink_core::planning::CheckedPlan) -> LangResult<ProjectSource> {
+    lower_planned(plan).map(Emission::into_project)
+}
+
+struct Emission {
+    storage: TableStorage,
+    body: String,
+    abi_contract: String,
+    wire_contract: String,
+}
+
+impl Emission {
+    fn source(&self, abi: &str, wire: &str) -> String {
+        let mut out = String::with_capacity(self.body.len() + abi.len() + wire.len() + 400);
+        out.push_str("#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n");
+        writeln!(out, "pub const INK_TABLE_STORAGE:&str={:?};", match self.storage {
+            TableStorage::Ordered => "ordered",
+            TableStorage::IndexedSlots => "indexed-slots",
+        }).unwrap();
+        writeln!(out, "pub const INK_ABI_CONTRACT:&str={abi};").unwrap();
+        writeln!(out, "pub const INK_VALUE_ABI:&str={:?};", ink_abi::VALUE_ABI).unwrap();
+        writeln!(out, "pub const INK_WIRE_CONTRACT:&str={wire};").unwrap();
+        out.push_str(&self.body);
+        out
+    }
+
+    fn into_inline(self) -> String {
+        self.source(&format!("{:?}", self.abi_contract), &format!("{:?}", self.wire_contract))
+    }
+
+    fn into_project(self) -> ProjectSource {
+        let source = self.source(
+            &format!("include_str!({ABI_CONTRACT_FILE:?})"),
+            &format!("include_str!({WIRE_CONTRACT_FILE:?})"),
+        );
+        ProjectSource { source, abi_contract: self.abi_contract, wire_contract: self.wire_contract }
+    }
+}
+
+fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snapshot_wire::Layout, storage: TableStorage, physical: Option<&ink_core::physical::CheckedPhysicalPlan>, maintained: Option<&crate::maintained_native::Views>) -> LangResult<Emission> {
     let p = module.program();
     let views: &[crate::maintained_native::View] = maintained.map(|v| v.0.as_slice()).unwrap_or(&[]);
     let _column_scope=crate::columns::scope(physical)?;
@@ -1091,10 +1168,7 @@ fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snap
         lazy: false,
         lazy_done: false,
     };
-    let mut out = String::from(
-        "#![allow(non_camel_case_types,non_snake_case,unused_variables,unused_parens,dead_code)]\n",
-    );
-    writeln!(out,"pub const INK_TABLE_STORAGE:&str={:?};",match storage {TableStorage::Ordered=>"ordered",TableStorage::IndexedSlots=>"indexed-slots"}).unwrap();
+    let mut out = String::new();
     // Serialize the declarations once; each description then borrows them.
     let declared = Declared::new(p)?;
     let describe = |t: &Type| declared.describe(t);
@@ -1102,21 +1176,9 @@ fn emit_with_layout(module: &ink_core::core::CheckedModule, layout: &crate::snap
     let actions=p.actions.iter().map(|a|Ok(serde_json::json!({"name":a.name,"params":a.params.iter().map(|(n,t)|Ok(serde_json::json!({"name":n,"type":describe(t)?}))).collect::<LangResult<Vec<_>>>()?,"result":describe(&a.result)?}))).collect::<LangResult<Vec<_>>>()?;
     let contract =
         serde_json::json!({"abi":ink_abi::VALUE_ABI,"functions":functions,"actions":actions});
-    writeln!(
-        out,
-        "pub const INK_ABI_CONTRACT:&str={:?};",
-        serde_json::to_string(&contract).map_err(|e| e.to_string())?
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "pub const INK_VALUE_ABI:&str={:?};",
-        ink_abi::VALUE_ABI
-    )
-    .unwrap();
-    // Built once: the binary value bridge below reads the same contract.
+    let abi_contract = serde_json::to_string(&contract).map_err(|e| e.to_string())?;
+    // The binary value bridge below reads the same contract.
     let wire_contract = ink_abi::wire_contract::source_contract(p)?;
-    writeln!(out,"pub const INK_WIRE_CONTRACT:&str={:?};",wire_contract.to_string()).unwrap();
     out.push_str(ink_native_support::TYPED_VALUES_RUST_SOURCE);
     out.push_str(ink_native_support::NUMERIC_INT_RUST_SOURCE);
     out.push_str("\nmod temporary {\n");
@@ -1726,7 +1788,7 @@ fn rollback_to(&mut self,mark:usize){for undo in self.undo.drain(mark..).rev(){m
     out.push_str(ink_native_support::BINARY_VALUES_RUST_SOURCE);
     out.push_str(ink_native_support::DIRECT_VALUES_RUST_SOURCE);
     out.push_str(&emit_binary_values(p, &wire_contract)?);
-    Ok(out)
+    Ok(Emission { storage, body: out, abi_contract, wire_contract: wire_contract.to_string() })
 }
 
 /// A program's declarations as JSON, serialized once for many descriptions.
