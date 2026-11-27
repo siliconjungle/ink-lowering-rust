@@ -302,6 +302,17 @@ impl Emitter<'_> {
         Some(place)
     }
 
+    fn string_operand(&mut self, e: &Expr, env: &Env) -> LangResult<String> {
+        if let Expr::String(text) = e {
+            return Ok(format!("{text:?}"));
+        }
+        let value = match self.lexical_place(e, env) {
+            Some(place) => place,
+            None => self.expr(e, env, Some(&Type::String))?,
+        };
+        Ok(format!("({value}).as_str()"))
+    }
+
     fn lookup_place(&self, receiver: &Expr, arguments: &[Expr], env: &Env) -> Option<String> {
         let (root, _) = ink_core::collection_facts::lexical_projection(receiver)?;
         let (binding, _) = env.get(root)?;
@@ -647,6 +658,15 @@ impl Emitter<'_> {
                             .as_ref(),
                     )?
                 };
+                // A literal comparison can borrow either checked lexical place
+                // for this expression. The other operand never moves its owner.
+                if at == Type::String && matches!(op.as_str(), "==" | "!=")
+                    && (matches!(a.as_ref(), Expr::String(_)) || matches!(b.as_ref(), Expr::String(_)))
+                {
+                    let a = self.string_operand(a, env)?;
+                    let b = self.string_operand(b, env)?;
+                    return Ok(format!("(({a}) {op} ({b}))"));
+                }
                 let a = self.expr(a, env, Some(&at))?;
                 let b = self.expr(b, env, Some(&at))?;
                 if ["+", "-", "*"].contains(&op.as_str()) {
