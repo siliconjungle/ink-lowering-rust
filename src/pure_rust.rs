@@ -196,6 +196,21 @@ impl Emitter<'_> {
         let value = self.expr(e, env, want)?;
         Ok((format!("({value}).into_iter()"), false))
     }
+
+    fn fold_input(&mut self, input: &Expr, initial: &Expr, env: &Env, traverse_all: bool) -> LangResult<(String, bool)> {
+        // The initial accumulator may take ownership of the same lexical root.
+        // Preserve input evaluation order before beginning the traversal.
+        let aliases_initial = ink_core::collection_facts::lexical_projection(input)
+            .is_some_and(|(root, _)| {
+                references(initial, root)
+                    && env.get(root).is_some_and(|(binding, _)| !self.borrowed_bindings.contains(binding))
+            });
+        // A stopping fold must still materialise a computed input eagerly.
+        if aliases_initial || (!traverse_all && self.lexical_place(input, env).is_none()) {
+            return Ok((format!("({}).into_iter()", self.expr(input, env, None)?), false));
+        }
+        self.iterate(input, env, None)
+    }
     /// `receiver.zip(other, callback)` as an iterator of callback results.
     fn zip_iterator(&mut self, receiver: &Expr, args: &[Expr], env: &Env, out: &Type) -> LangResult<String> {
         let Type::List(inner) = self.infer(receiver, env, None)? else {
@@ -658,10 +673,11 @@ impl Emitter<'_> {
                             .as_ref(),
                     )?
                 };
-                // A literal comparison can borrow either checked lexical place
-                // for this expression. The other operand never moves its owner.
+                // Literals and lexical places do not move an owner while the
+                // other operand is borrowed. Computed operands may do so.
                 if at == Type::String && matches!(op.as_str(), "==" | "!=")
-                    && (matches!(a.as_ref(), Expr::String(_)) || matches!(b.as_ref(), Expr::String(_)))
+                    && (matches!(a.as_ref(), Expr::String(_)) || matches!(b.as_ref(), Expr::String(_))
+                        || (self.lexical_place(a, env).is_some() && self.lexical_place(b, env).is_some()))
                 {
                     let a = self.string_operand(a, env)?;
                     let b = self.string_operand(b, env)?;
@@ -956,7 +972,7 @@ impl Emitter<'_> {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
                     return Err("fold input".into());
                 };
-                let xs = self.expr(&args[0], env, None)?;
+                let (iterator, borrowed) = self.fold_input(&args[0], &args[1], env, false)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 // Each readonly formal can observe the original through a
                 // lexical loan. Consumed affine values retain eager copying.
@@ -964,28 +980,26 @@ impl Emitter<'_> {
                 let types=env.iter().map(|(name,(_,ty))|(name.clone(),ty.clone())).collect();
                 let loans=ink_core::local_collections::callback_parameter_loans(&args[2],&types,self.p,&params,&Type::Bool)?;
                 let (stopvars, stop) = self.lambda_borrows(&args[2],env,&params,&Type::Bool,&loans)?;
-                let (vs, body) = self.lambda(&args[3], env, &[*inner, t.clone()], &t)?;
+                let (vs, body) = self.lambda_mode(&args[3], env, &[*inner, t.clone()], &t, &[borrowed, false])?;
                 let body = self.carried_step(body, &t);
                 let list = self.fresh();
                 let acc = self.fresh();
                 let item = self.fresh();
                 let flag = self.fresh();
-                let observed_item=if loans[0]{format!("&{item}")}else{format!("{item}.clone()")};
+                let observed_item = match (borrowed, loans[0]) {
+                    (true, true) => item.clone(),
+                    (false, true) => format!("&{item}"),
+                    (true, false) => format!("(*{item}).clone()"),
+                    (false, false) => format!("{item}.clone()"),
+                };
                 let observed_acc=if loans[1]{format!("&{acc}")}else{format!("{acc}.clone()")};
-                format!("{{let {list}={xs};let mut {acc}={initial};for {item} in {list}.into_iter() {{let {}={observed_item};let {}={observed_acc};let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
+                format!("{{let {list}={iterator};let mut {acc}={initial};for {item} in {list} {{let {}={observed_item};let {}={observed_acc};let {flag}={stop};let {}={item};let {}={acc};{acc}={body};if {flag} {{break;}}}}{acc}}}",stopvars[0],stopvars[1],vs[0],vs[1])
             }
             Expr::Call(n, args) if n == "foldr" || n == "foldl" => {
                 let Type::List(inner) = self.infer(&args[0], env, None)? else {
                     return Err("fold input".into());
                 };
-                // The source takes the input value before evaluating the
-                // accumulator. An owning accumulator may consume that same
-                // root, so preserve a snapshot rather than retaining a loan.
-                let initial_alias=ink_core::collection_facts::lexical_projection(&args[0]).is_some_and(|(root,_)|
-                    references(&args[1],root)&&env.get(root).is_some_and(|(binding,_)|!self.borrowed_bindings.contains(binding)));
-                let (iterator,borrowed)=if initial_alias {
-                    (format!("({}).into_iter()",self.expr(&args[0],env,None)?),false)
-                } else {self.iterate(&args[0],env,None)?};
+                let (iterator, borrowed) = self.fold_input(&args[0], &args[1], env, true)?;
                 let initial = self.expr(&args[1], env, Some(&t))?;
                 let (vs, body) = self.lambda_mode(&args[2], env, &[*inner, t.clone()], &t, &[borrowed, false])?;
                 let body = self.carried_step(body, &t);
@@ -1135,14 +1149,39 @@ impl Emitter<'_> {
                     let left=self.expr(xs,env,Some(&t))?;let right=self.expr(&args[0],env,Some(&t))?;
                     let a=self.fresh();let b=self.fresh();return Ok(format!("{{let mut {a}={left};let mut {b}={right};{a}.append(&mut {b});{a}}}"));
                 }
+                let alias = ink_core::collection_facts::lexical_projection(xs)
+                    .is_some_and(|(root, _)| references(&args[0], root));
+                let right_lexical = self.lexical_place(&args[0], env);
+                let left_place = if alias && right_lexical.is_none() {
+                    // A computed right operand may move the left root.
+                    None
+                } else {
+                    self.borrowed_place(xs, env)
+                };
+                let right_place = self.borrowed_place(&args[0], env).or_else(||
+                    if alias && left_place.is_some() { right_lexical } else { None });
+                // An owning left operand already has a vector. Preserve its
+                // elements and consume an owning right operand as well.
+                if !self.reserved(e)
+                    && !ink_core::local_collections::owned(&t, self.p)
+                    && left_place.is_none()
+                {
+                    let left = self.expr(xs, env, Some(&t))?;
+                    let right = match right_place {
+                        Some(place) => format!("({place}).iter().cloned()"),
+                        None => self.expr(&args[0], env, Some(&t))?,
+                    };
+                    let out = self.fresh();
+                    return Ok(format!("{{let mut {out}={left};{out}.extend({right});{out}}}"));
+                }
                 // Borrow variable operands directly. Computed operands are evaluated
                 // once and their temporaries live through the two result copies.
-                let left = if let Some(place) = self.borrowed_place(xs, env) {
+                let left = if let Some(place) = left_place {
                     format!("&({place})")
                 } else {
                     format!("&({})", self.expr(xs, env, Some(&t))?)
                 };
-                let right = if let Some(place) = self.borrowed_place(&args[0], env) {
+                let right = if let Some(place) = right_place {
                     format!("&({place})")
                 } else {
                     format!("&({})", self.expr(&args[0], env, Some(&t))?)
@@ -1888,6 +1927,84 @@ assert_eq!(FALLBACKS.load(Ordering::Relaxed),3);
 #[cfg(test)]
 mod callback_ownership_tests {
     use super::*;
+    #[test]
+    fn stopping_fold_and_owned_concatenation_copy_only_escaping_items() {
+        let program = parse(r#"
+module ListLoans;
+record Row { key:String, payload:List<u32>, }
+fn has(xs:List<Row>,key:String)->Bool {
+    let found=fold_until(xs,false,fn(item)=>fn(old)=>item.key==key,
+        fn(item)=>fn(old)=>old || item.key==key);
+    return found && length(xs)>0;
+}
+fn picked(xs:List<Row>,key:String)->Option<Row> {
+    let empty:Option<Row>=None;
+    let found=fold_until(xs,empty,fn(item)=>fn(old)=>item.key==key,
+        fn(item)=>fn(old)=>if item.key==key {Some(item)} else {old});
+    return if length(xs)>0 {found} else {None};
+}
+fn joined(xs:List<Row>,ys:List<Row>,zs:List<Row>)->List<Row> {
+    return xs.concat(ys).concat(zs);
+}
+fn aliases(xs:List<Row>)->List<Row> {
+    return xs.concat(xs);
+}
+"#).unwrap();
+        check::check(&program).unwrap();
+        let mut code = String::from(r#"
+#![allow(non_camel_case_types,unused_variables,unused_parens,dead_code)]
+use std::sync::atomic::{AtomicUsize,Ordering};
+static COPIES:AtomicUsize=AtomicUsize::new(0);
+struct l_Row{l_key:String,l_payload:Vec<u32>}
+impl Clone for l_Row{
+    fn clone(&self)->Self{
+        COPIES.fetch_add(1,Ordering::Relaxed);
+        Self{l_key:self.l_key.clone(),l_payload:self.l_payload.clone()}
+    }
+}
+"#);
+        for function in &program.functions {
+            let args = function.params.iter().map(|(name, ty)|
+                format!("l_{name}:{}", crate::state_native::ty(ty).unwrap())).collect::<Vec<_>>().join(",");
+            let generated = body(&program, function).unwrap();
+            if function.name == "has" {
+                assert!(generated.contains(".as_str()"), "{generated}");
+            }
+            let ty = crate::state_native::ty(&function.result).unwrap();
+            code.push_str(&format!("fn {}({args})->{ty}{{{generated}}}\n", function.name));
+        }
+        code.push_str(r#"
+fn rows(count:u32)->Vec<l_Row>{
+    (0..count).map(|i|l_Row{l_key:i.to_string(),l_payload:vec![i;3]}).collect()
+}
+fn main(){
+    assert!(has(rows(8192),"1".into()));
+    assert!(!has(rows(8192),"missing".into()));
+    assert!(!has(rows(0),"1".into()));
+    assert_eq!(COPIES.swap(0,Ordering::Relaxed),0);
+    assert_eq!(picked(rows(8192),"1".into()).unwrap().l_payload,[1;3]);
+    assert_eq!(COPIES.swap(0,Ordering::Relaxed),1);
+    let out=joined(rows(3),rows(2),rows(1));
+    assert_eq!(out.iter().map(|r|r.l_payload[0]).collect::<Vec<_>>(),[0,1,2,0,1,0]);
+    assert_eq!(COPIES.swap(0,Ordering::Relaxed),0);
+    assert_eq!(aliases(rows(3)).len(),6);
+    assert_eq!(COPIES.swap(0,Ordering::Relaxed),6);
+}
+"#);
+        let dir = std::env::temp_dir().join(format!("ink-stopping-fold-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("main.rs");
+        let binary = dir.join("run");
+        std::fs::write(&source, code).unwrap();
+        let compile = std::process::Command::new("rustc").args(["--edition=2021", "-O"])
+            .arg(&source).arg("-o").arg(&binary).output().unwrap();
+        let run = compile.status.success().then(|| std::process::Command::new(&binary).output().unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(compile.status.success(), "{}", String::from_utf8_lossy(&compile.stderr));
+        let run = run.unwrap();
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    }
+
     #[test]
     fn owned_stop_observations_avoid_copies_and_keep_terminal_step() {
         let program=parse(r#"module StopLoans;
