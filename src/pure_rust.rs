@@ -919,7 +919,10 @@ impl Emitter<'_> {
                     }
                     "append" => format!("({xv}).append({})", self.expr(&args[0], env, Some(&xt))?),
                     "len" | "pop" | "freeze" => format!("({xv}).{n}()"),
-                    "keys"|"values" => format!("({xv}).{n}().into()"),
+                    "keys" | "values" => {
+                        let list = crate::state_native::ty(&t)?;
+                        format!("<{list}>::from(({xv}).{n}())")
+                    }
                     "at_or" | "get_or" => {
                         let k = self.expr(&args[0], env, Some(&key))?;
                         let fallback = self.expr(&args[1], env, Some(value))?;
