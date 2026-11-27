@@ -1056,10 +1056,16 @@ impl Emitter<'_> {
                 // can move, keep the owning call so a returned or transferred
                 // aggregate does not get cloned inside the borrowed helper.
                 let use_loans=args.iter().zip(&loans).any(|(arg,loan)|*loan&&!self.final_owned_argument(arg,env));
-                let loan_places:Vec<_>=args.iter().zip(&loans).map(|(e,loan)|{
+                let loan_places:Vec<_>=args.iter().zip(&loans).enumerate().map(|(i,(e,loan))|{
                     if !*loan{return None;}
-                    let (root,_)=ink_core::collection_facts::lexical_projection(e)?;
-                    if ink_core::local_collections::owned(&env.get(root)?.1,self.p){return None;}
+                    let (root,fields)=ink_core::collection_facts::lexical_projection(e)?;
+                    // An immutable field can be lent even if a sibling owns
+                    // temporary storage. A later use of that owner may move
+                    // it while evaluating the rest of the arguments.
+                    if ink_core::local_collections::owned(&env.get(root)?.1,self.p)
+                        && (fields.is_empty() || args[i+1..].iter().any(|arg| references(arg,root))) {
+                        return None;
+                    }
                     self.lexical_place(e,env)
                 }).collect();
                 let previous=self.live_loans.clone();
