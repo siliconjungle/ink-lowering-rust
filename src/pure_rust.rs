@@ -302,6 +302,17 @@ impl Emitter<'_> {
         Some(place)
     }
 
+    fn lookup_place(&self, receiver: &Expr, arguments: &[Expr], env: &Env) -> Option<String> {
+        let (root, _) = ink_core::collection_facts::lexical_projection(receiver)?;
+        let (binding, _) = env.get(root)?;
+        // An argument may move an owned root, but it can only read a shared
+        // parameter. Keep the receiver borrowed in the latter case as well.
+        if !self.borrowed_bindings.contains(binding) && arguments.iter().any(|arg| references(arg, root)) {
+            return None;
+        }
+        self.lexical_place(receiver, env)
+    }
+
     // Computed arguments already produce an owning value. A lexical argument
     // can transfer ownership only at a checked final use outside active loans.
     fn final_owned_argument(&self,e:&Expr,env:&Env)->bool{
@@ -327,8 +338,12 @@ impl Emitter<'_> {
         let field_ty=field_ty.clone();
         // Moving the receiver's root while computing the index needs an owning
         // snapshot; leave that case on the established literal path.
-        if ink_core::collection_facts::lexical_projection(receiver).is_some_and(|(root,_)|references(&args[0],root)){return Ok(None);}
-        let receiver_value=if let Some(place)=self.lexical_place(receiver,env){format!("&({place})")}else{self.expr(receiver,env,Some(&container))?};
+        let receiver_value = if ink_core::collection_facts::lexical_projection(receiver).is_some() {
+            let Some(place) = self.lookup_place(receiver, &args[..1], env) else { return Ok(None); };
+            format!("&({place})")
+        } else {
+            self.expr(receiver, env, Some(&container))?
+        };
         let index=self.expr(&args[0],env,Some(&Type::U32))?;
         let fallback=self.expr(&args[1],env,Some(row))?;
         let storage=self.fresh();let position=self.fresh();let selected=self.fresh();let missing=self.fresh();
@@ -1127,21 +1142,15 @@ impl Emitter<'_> {
                 let collection=crate::state_native::ty(&t)?;
                 match n.as_str() {
                     "at_or" => {
-                        let xs = self.expr(receiver, env, None)?;
+                        let xs = if let Some(place) = self.lookup_place(receiver, args, env) {
+                            format!("&({place})")
+                        } else {
+                            self.expr(receiver, env, None)?
+                        };
                         let index = self.expr(&args[0], env, Some(&Type::U32))?;
                         let fallback = self.expr(&args[1], env, Some(&t))?;
                         let list = self.fresh();
                         let i = self.fresh();
-                        // A lexical projection has no evaluation effects. Read
-                        // one element without copying its containing list. If
-                        // another argument uses the root, retain the ordinary
-                        // owned receiver: that argument may consume the root at
-                        // its final use while this lookup still needs the list.
-                        let xs = if let Some((root, _)) = ink_core::collection_facts::lexical_projection(receiver) {
-                            if args.iter().all(|arg| !references(arg, root)) {
-                                self.lexical_place(receiver, env).map(|place| format!("&({place})")).unwrap_or(xs)
-                            } else { xs }
-                        } else { xs };
                         if self.unchecked(e){format!("{{let {list}={xs};let {i}={index};unsafe{{{list}.get_unchecked({i} as usize).clone()}}}}") }else{format!("{{let {list}={xs};let {i}={index};match {list}.get({i} as usize){{Some(v)=>v.clone(),None=>{fallback}}}}}")}
                     }
                     "drop" | "take" => {
@@ -1786,6 +1795,8 @@ fn consume_list(xs:List<Item>)->u32{return length(xs)-1;}
 fn plain_index_consumes(xs:List<Item>)->Item{return xs.at_or(consume_list(xs),fallback());}
 fn identity(r:Outer)->Outer{return r;}
 fn computed(r:Outer)->Item{return identity(r).inner.items.at_or(1,fallback());}
+fn shared_pick(r:Outer)->Item{return r.inner.items.at_or(length(r.inner.items)-1,fallback());}
+fn shared_project(r:Outer)->u32{return r.inner.items.at_or(length(r.inner.items)-1,Item{value:length(r.inner.items)}).value;}
 fn fallback()->Item{return Item{value:99};}
 "#).unwrap();
         check::check(&p).unwrap();
@@ -1806,6 +1817,12 @@ fn function_l_identity(&self,r:l_Outer)->l_Outer{COMPUTED.fetch_add(1,Ordering::
 "#);
         for f in &p.functions {
             if ["fallback","identity"].contains(&f.name.as_str()){continue;}
+            if f.name.starts_with("shared_") {
+                let (body, _) = body_with_tasks_loans(&p, f, None, &[true]).unwrap();
+                code.push_str(&format!("fn function_l_{}(&self,l_r:&l_Outer)->{}{{{body}}}\n",
+                    f.name, crate::state_native::ty(&f.result).unwrap()));
+                continue;
+            }
             let params=f.params.iter().map(|(n,t)|format!("l_{n}:{}",crate::state_native::ty(t).unwrap())).collect::<Vec<_>>().join(",");
             code.push_str(&format!("fn function_l_{}(&self,{params})->{}{{{}}}\n",f.name,crate::state_native::ty(&f.result).unwrap(),body(&p,f).unwrap()));
         }
@@ -1828,6 +1845,15 @@ assert_eq!(state.function_l_fallback_consumes(record(3)).l_value,2);
 assert_eq!(state.function_l_plain_index_consumes(record(3).l_inner.l_items).l_value,12);
 assert_eq!(state.function_l_computed(record(3)).l_value,11);assert_eq!(COMPUTED.load(Ordering::Relaxed),1);
 assert_eq!(FALLBACKS.load(Ordering::Relaxed),2);
+COPIES.store(0,Ordering::Relaxed);
+let shared=record(4096);
+assert_eq!(state.function_l_shared_pick(&shared).l_value,4105);
+assert_eq!(COPIES.load(Ordering::Relaxed),1);
+assert_eq!(state.function_l_shared_project(&shared),4105);
+assert_eq!(state.function_l_shared_project(&record(0)),0);
+assert_eq!(COPIES.load(Ordering::Relaxed),1);
+assert_eq!(state.function_l_shared_pick(&record(0)).l_value,99);
+assert_eq!(FALLBACKS.load(Ordering::Relaxed),3);
 }
 "#);
         let dir=std::env::temp_dir().join(format!("ink-projected-list-reads-{}",std::process::id()));
