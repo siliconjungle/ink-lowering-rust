@@ -98,6 +98,15 @@ struct Emitter<'a> {
     lazy_done: bool,
 }
 
+struct StoredArgument<'e> {
+    root: &'e str,
+    key: &'e Expr,
+    default: &'e Expr,
+    key_type: Type,
+    row_type: Type,
+    value_type: Type,
+    fields: Vec<(&'e str, bool)>,
+}
 
 /// Retained derived values: immutable keeps and parameterless scalar queries keep
 /// their last result until a table they can observe is written. Reads are
@@ -184,12 +193,15 @@ impl Emitter<'_> {
     }
 
     // A value-state read is lowered by core to a table lookup with an eager
-    // default. The stored value and its fallback can both be lent to a pure
-    // helper for the duration of a single call.
-    fn stored_argument<'e>(&self, e: &'e Expr, env: &Env, expected: &Type)
-        -> Option<(&'e str, &'e Expr, &'e Expr, Type)>
-    {
-        let Expr::Method(lookup, unwrap, defaults) = e else { return None };
+    // default. The stored value, or a field of it, can be borrowed for a
+    // single observation without cloning the containing record.
+    fn stored_argument<'e>(&self, mut expr: &'e Expr, env: &Env) -> Option<StoredArgument<'e>> {
+        let mut fields = Vec::new();
+        while let Expr::Field(base, field) = expr {
+            fields.push(field.as_str());
+            expr = base;
+        }
+        let Expr::Method(lookup, unwrap, defaults) = expr else { return None };
         let ("unwrap_or", [default]) = (unwrap.as_str(), defaults.as_slice()) else { return None };
         let Expr::Method(root, get, keys) = lookup.as_ref() else { return None };
         let (Expr::Var(name), "get", [key]) = (root.as_ref(), get.as_str(), keys.as_slice()) else { return None };
@@ -197,8 +209,46 @@ impl Emitter<'_> {
             return None;
         }
         let state = self.p.states.iter().find(|state| state.name == *name)?;
-        let Type::Table(key_type, value_type) = &state.ty else { return None };
-        (value_type.as_ref() == expected).then(|| (name.as_str(), key, default, key_type.as_ref().clone()))
+        let Type::Table(key_type, row_type) = &state.ty else { return None };
+        let mut value_type = row_type.as_ref();
+        let mut projections = Vec::with_capacity(fields.len());
+        for field in fields.into_iter().rev() {
+            let Type::Named(owner) = value_type else { return None };
+            let (_, field_type) = self.p.records.get(owner)?.iter().find(|(name, _)| name == field)?;
+            projections.push((field, boxed_field(owner, field_type, self.p)));
+            value_type = field_type;
+        }
+        Some(StoredArgument {
+            root: name,
+            key,
+            default,
+            key_type: key_type.as_ref().clone(),
+            row_type: row_type.as_ref().clone(),
+            value_type: value_type.clone(),
+            fields: projections,
+        })
+    }
+
+    fn stored_projection(&mut self, arg: &StoredArgument<'_>, env: &Env, bindings: &mut String)
+        -> LangResult<String>
+    {
+        let key = self.expr(arg.key, env, Some(&arg.key_type))?.0;
+        let key_value = self.fresh();
+        let slot = self.fresh();
+        let fallback = self.fresh();
+        let default = self.expr(arg.default, env, Some(&arg.row_type))?.0;
+        let row = self.fresh();
+        let rt = ty(&arg.row_type)?;
+        writeln!(bindings, "let {key_value}={key};let {slot}=self.{}.get(&{key_value});", ident(arg.root)).unwrap();
+        write!(bindings, "let {fallback}:{rt}={default};let {row}={slot}.unwrap_or(&{fallback});").unwrap();
+        let mut place = format!("(*{row})");
+        for &(field, boxed) in &arg.fields {
+            place = format!("{place}.{}", ident(field));
+            if boxed {
+                place = format!("(*{place})");
+            }
+        }
+        Ok(place)
     }
 
     fn expr(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<(String, Type)> {
@@ -300,6 +350,11 @@ impl Emitter<'_> {
                             }
                         }
                     }
+                }
+                if let Some(arg) = self.stored_argument(e, env) {
+                    let mut bindings = String::new();
+                    let place = self.stored_projection(&arg, env, &mut bindings)?;
+                    return Ok((format!("{{{bindings}{place}.clone()}}"), arg.value_type));
                 }
                 let (b, t) = self.expr(base, env, None)?;
                 if let T::Vector(t, _) = t {
@@ -511,12 +566,12 @@ impl Emitter<'_> {
                     } else {
                         vec![false; params.len()]
                     };
-                    let mut stored = vec![None; args.len()];
+                    let mut stored: Vec<_> = (0..args.len()).map(|_| None).collect();
                     if loans.iter().any(|loan| *loan) {
                         let mut later_mutates = false;
                         for (index, (arg, (_, ty))) in args.iter().zip(params).enumerate().rev() {
                             if loans[index] && !later_mutates {
-                                stored[index] = self.stored_argument(arg, env, ty);
+                                stored[index] = self.stored_argument(arg, env).filter(|arg| &arg.value_type == ty);
                             }
                             later_mutates |= ownership::expr_mutates_state(self.p, arg);
                         }
@@ -525,17 +580,9 @@ impl Emitter<'_> {
                     let mut bindings = String::new();
                     let mut values = vec![];
                     for (index, (e, (_, t))) in args.iter().zip(params).enumerate() {
-                        if let Some((root, key, default, key_type)) = &stored[index] {
-                            let key = self.expr(key, env, Some(key_type))?.0;
-                            let key_value = self.fresh();
-                            let slot = self.fresh();
-                            let fallback = self.fresh();
-                            let default = self.expr(default, env, Some(t))?.0;
-                            let v = self.fresh();
-                            let rt = ty(t)?;
-                            writeln!(bindings, "let {key_value}={key};let {slot}=self.{}.get(&{key_value});", ident(root)).unwrap();
-                            write!(bindings, "let {fallback}:{rt}={default};let {v}={slot}.unwrap_or(&{fallback});").unwrap();
-                            values.push(v);
+                        if let Some(arg) = &stored[index] {
+                            let place = self.stored_projection(arg, env, &mut bindings)?;
+                            values.push(format!("&{place}"));
                         } else {
                             let (s, _) = self.expr(e, env, Some(t))?;
                             let v = self.fresh();
