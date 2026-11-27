@@ -12,6 +12,7 @@ pub fn expression(n: &str, a: &[String], first: Option<&ink_core::core::Type>) -
         "f64_from_f32"|"f64_from_u32"|"f64_from_u64"|"f64_from_i32" => format!("temporary::ink_f64(({x}) as f64)"),
         "f32_from_f64" => format!("temporary::ink_f32(({x}) as f32)"),
         "f64_from_int" => format!("ink_f64_from_int(&({x}))"),
+        "f64_from_decimal" => format!("({x}).parse::<f64>().ok().filter(|n|n.is_finite())"),
         "int_from_f64" => format!("ink_int_from_f64({x})"),
         "u32_from_f64"|"u64_from_f64"|"i32_from_f64" => format!("temporary::ink_{n}({x})"),
         "sqrt" => format!("temporary::ink_sqrt({})", uncanonical(x)),
